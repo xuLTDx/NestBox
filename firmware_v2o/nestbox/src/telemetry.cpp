@@ -29,6 +29,7 @@
 #include "canbus1.h"
 #include "ota.h"
 #include "nbread.h"
+#include "nbapn.h"
 
 #define PID_SD_DIGEST  0x398
 #define SD_DIGEST_MS   600000UL
@@ -63,14 +64,23 @@ static CellLink s_cell;
 static volatile bool s_cellOn;               // NVS CELL (default 0 until tested on 12 V)
 static volatile bool s_cellUp;
 static GnssFix s_fix;                        // last valid reading
+static char s_apn[40] = "internet";          // the CELL_APN in force (NVS), home operator 4ka
 static volatile uint32_t s_recS = 60;
 static volatile bool s_otaReq;
 
 void logNetEvent(const char* text) { s_log.logEvent(text); }
+static void loadApn()
+{
+  char a[40] = "";
+  size_t l = sizeof(a);
+  if (nvs_get_str(nvs, "CELL_APN", a, &l) == ESP_OK && a[0]) snprintf(s_apn, sizeof(s_apn), "%s", a);
+  else snprintf(s_apn, sizeof(s_apn), "internet");
+}
+void telemetryApnCommand(const char* arg) { nbApnCommand(nvs, arg, "internet"); }
 void telemetrySetCell(bool on) { s_cellOn = on; nvs_set_u8(nvs, "CELL", on ? 1 : 0); nvs_commit(nvs); }
 bool telemetryCell() { return s_cellOn; }
 void telemetrySetVehicle(const char* p) { carSetProfile(p); nvs_set_str(nvs, "VEH", carProfile()); nvs_commit(nvs); }
-void telemetrySetApn(const char* apn) { s_cell.setApn(apn); nvs_set_str(nvs, "CELL_APN", apn); nvs_commit(nvs); }
+void telemetrySetApn(const char* apn) { nvs_set_str(nvs, "CELL_APN", apn); nvs_commit(nvs); loadApn(); s_cell.setApn(s_apn); }
 void otaReadyRequested() { s_otaReq = true; otaRequest(); }   // server OTA_READY -> pull-OTA (ota.cpp)
 bool telemetryLogin() { return s_client.login; }
 uint32_t telemetryRecS() { return s_recS; }
@@ -189,6 +199,9 @@ static void makeRecord(int event = 0, time_t when = 0)
   uint8_t rd[3 + NB_READ_RECORD_MAX];   // READ result (nbread.h, PID 0x39D)
   int rn = nbReadForRecord(rd, sizeof(rd));
   if (rn) { r.wire.log(PID_READ_RESULT, rd, rn); s_log.log(PID_READ_RESULT, rd, rn); }
+  uint8_t ap[64];                  // APN trial outcome (nbapn.h), once
+  int an = nbApnTakeStatus(ap, sizeof(ap));
+  if (an) { r.wire.log(PID_APN_STATUS, ap, an); s_log.log(PID_APN_STATUS, ap, an); }
   uint8_t ota[64];                 // one pending OTA step line per record (v1F PID 0x399)
   int on = otaTakeStatus(ota, sizeof(ota));
   if (on) { r.wire.log(0x399, ota, on); s_log.log(0x399, ota, on); }
@@ -243,7 +256,10 @@ static void cellTask(void*)
     if (s_cellOn && !s_cellUp && (!lastTry || millis() - lastTry > 300000UL)) {
       lastTry = millis();
       logNetEvent("CELL START");
+      s_cell.setApn(nbApnPick(nvs, s_apn));   // a server APN= is tried first (nbapn.h)
       s_cellUp = s_cell.start();
+      // the data connection failed after registration (NETOPEN) = the APN's fault: counts for a trial
+      if (!s_cellUp && !strcmp(s_cell.status(), "NETOPEN failed")) { nbApnAfterLogin(nvs, false); loadApn(); }
       char m[120];
       snprintf(m, sizeof(m), "CELL %s apn_profile=%s", s_cell.status(), s_cell.storedApn());
       logNetEvent(m);
@@ -277,7 +293,9 @@ static void netTask(void*)
       continue;
     }
     if (!s_client.login) {
-      if (!s_client.connect()) { vTaskDelay(pdMS_TO_TICKS(10000)); continue; }
+      bool ok = s_client.connect();
+      if (cur == &s_cell) { nbApnAfterLogin(nvs, ok); loadApn(); }   // a trial APN: kept on login, dropped after 2 failures
+      if (!ok) { vTaskDelay(pdMS_TO_TICKS(10000)); continue; }
       Serial.printf("[NET] logged in as %s\n", devid);
     }
     int n = txqNextPacket(pkt, sizeof(pkt), devid);
@@ -313,10 +331,8 @@ void telemetryBegin(uint32_t bootId, bool sdOk)
   s_cellOn = c == 1;
   // APN of the home operator (4ka, as v1F CELL_APN "internet"); it stays the same in roaming -
   // only the visited network changes, the modem picks it. CELL_APN= overrides (stored).
-  char apn[40] = "internet";
-  size_t al = sizeof(apn);
-  nvs_get_str(nvs, "CELL_APN", apn, &al);
-  s_cell.setApn(apn);
+  loadApn();
+  s_cell.setApn(s_apn);
   s_cell.begin();
   genDeviceID(devid);
   Serial.printf("[TEL] device ID %s\n", devid);

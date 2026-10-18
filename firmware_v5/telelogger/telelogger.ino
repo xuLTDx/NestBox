@@ -39,6 +39,7 @@ extern UpdateClass Update;
 #include "sniff.h"
 #include "sdwriter.h"
 #include "nbread.h"          // READ command (libraries/NestBoxCommon)
+#include "nbapn.h"           // APN from the server, with fallback (libraries/NestBoxCommon)
 #if BOARD_HAS_PSRAM
 #include "esp32/himem.h"
 #endif
@@ -2305,6 +2306,9 @@ static void addSdDigest(CBuffer* b, bool now)
   uint8_t rd[3 + NB_READ_RECORD_MAX];   // READ command result (nbread.h), once
   int rn = nbReadForRecord(rd, sizeof(rd));
   if (rn) b->add(PID_READ_RESULT, ELEMENT_UINT8, rd, rn, rn);
+  uint8_t ap[64];                       // APN trial outcome (nbapn.h), once
+  int an = nbApnTakeStatus(ap, sizeof(ap));
+  if (an) b->add(PID_APN_STATUS, ELEMENT_UINT8, ap, an, an);
   uint8_t ota[64];
   int on = takeOtaStatus(ota, sizeof(ota));
   if (on) b->add(PID_OTA_STATUS, ELEMENT_UINT8, ota, on, on);
@@ -2962,11 +2966,13 @@ bool initCell(bool quick = false)
   Serial.print("IMEI:");
   Serial.println(teleClient.cell.IMEI);
   Serial.println("[CELL] Searching...");
-  if (*apn) {
+  // a server APN= is tried first (nbapn.h); else the box's own CELL_APN / build default
+  const char* useApn = nbApnPick(nvs, apn);
+  if (*useApn) {
     Serial.print("APN:");
-    Serial.println(apn);
+    Serial.println(useApn);
   }
-  if (teleClient.cell.setup(apn, APN_USERNAME, APN_PASSWORD)) {
+  if (teleClient.cell.setup(useApn, APN_USERNAME, APN_PASSWORD)) {
     netop = teleClient.cell.getOperatorName();
     if (netop.length()) {
       Serial.print("Operator:");
@@ -3307,7 +3313,13 @@ void telemetry(void* inst)
 #endif
       if (!state.check(STATE_WIFI_CONNECTED) && !state.check(STATE_CELL_CONNECTED)) {
         connErrors = 0;
-        if (!initCell() || !teleClient.connect()) {
+        bool cellUp = initCell();
+        bool cellLogin = cellUp && teleClient.connect();
+        if (cellUp) {
+          nbApnAfterLogin(nvs, cellLogin);  // a trial APN: kept on login, dropped after 2 failures
+          loadConfig();                     // apn[] = the CELL_APN that is now in force
+        }
+        if (!cellUp || !cellLogin) {
           teleClient.cell.end();
           state.clear(STATE_NET_READY | STATE_CELL_CONNECTED);
           Serial.println("[CELL] Deactivated");

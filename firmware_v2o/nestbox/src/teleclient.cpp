@@ -188,6 +188,10 @@ void TeleClientUDP::onMessage(char* msg, UdpRx* rx)
       Serial.printf("[UDP] CMD:SNIFF=%d,%u\n", on ? 1 : 0, (unsigned)min);
       logNetEvent(on ? "NET CMD_SNIFF_ON" : "NET CMD_SNIFF_OFF");
     }
+    if (cmdp && !strncmp(cmdp + 4, "APN=", 4)) {    // APN from the server, tried first (nbapn.h)
+      telemetryApnCommand(cmdp + 8);
+      logNetEvent("NET CMD_APN");
+    }
     if (cmdp && !strncmp(cmdp + 4, "READ=", 5)) {   // one read request into the car (nbread.h)
       uint32_t seq = 0;
       int r = nbReadSubmit(cmdp + 9, &seq);

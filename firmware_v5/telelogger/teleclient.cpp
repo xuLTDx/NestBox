@@ -22,6 +22,9 @@
 #include "config.h"
 #include "txqueue.h"
 #include "nbread.h"          // READ command (libraries/NestBoxCommon)
+#include "nbapn.h"           // APN from the server (libraries/NestBoxCommon)
+#include <nvs.h>
+extern nvs_handle_t nvs;
 #include "udpmsg.h"          // server messages in one received buffer (WiFi = cellular)
 
 extern int16_t rssi;
@@ -615,6 +618,11 @@ void TeleClientUDP::onMessage(char* msg, UdpRx* rx)
         }
         // SD file sent again (FleetNest found its fingerprint differs from the database):
         // CMD=RESEND=<file> - that file and the later ones, the server drops duplicates
+        // APN from the server: tried at the next modem start, kept only if the login works (nbapn.h)
+        if (cmdp && !strncmp(cmdp + 4, "APN=", 4)) {
+          nbApnCommand(nvs, cmdp + 8, CELL_APN);
+          logNetEvent("NET CMD_APN");
+        }
         // one read request into the car (nbread.h): CMD=READ=<bus>,<tx>,<rx>,<request hex>
         if (cmdp && !strncmp(cmdp + 4, "READ=", 5)) {
           uint32_t seq = 0;

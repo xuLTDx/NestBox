@@ -56,4 +56,5 @@ private:
 extern char devid[12];
 void genDeviceID(char* buf);
 void logNetEvent(const char* text);   // main.cpp: an "FE,NET ..." line in the SD data file
-void otaReadyRequested();             // main.cpp: server command OTA_READY
+void otaReadyRequested();             // telemetry.cpp: server command OTA_READY
+void telemetryApnCommand(const char* arg);   // telemetry.cpp: server APN= (nbapn.h)
