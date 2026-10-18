@@ -1,0 +1,94 @@
+flowchart TB
+  %% NestBox_v2O – logika firmvéru (návrh 2026-10-18). Zelené = kód z v1F overený v aute, oranžové = nové pre OVMS.
+
+  subgraph HW["Hardvér OVMS v3.3"]
+    CAN1["CAN1 – ESP32 TWAI<br/>OBD 6/14"]
+    CAN2["CAN2 – MCP2515<br/>OBD 3/8"]
+    CAN3["CAN3 – MCP2515<br/>(rozhodne sa)"]
+    GNSS["GNSS v modeme SIM7600<br/>anténa ANT1"]
+    ADC["12 V cez ADC"]
+    MAX["MAX7317<br/>napájanie modemu, vysielač CAN1"]
+    SD[("SD karta<br/>SDMMC 1-bit")]
+    MDM["Modem SIM7600G<br/>AT príkazy"]
+    WIFI["WiFi<br/>NTLIRIS / uLTD_ext"]
+  end
+
+  subgraph AUTO["Čítanie auta"]
+    DEC["Dekódovanie podľa auta<br/>K0: počúvanie 0x552 km, palivo, AdBlue, limit<br/>Passat: OBD + UDS dopyty"]
+    ENG{"Motor beží?<br/>CAN: RPM / stav motora"}
+    SNIFF["Sniff: všetky rámce<br/>všetkých zberníc"]
+  end
+
+  subgraph JADRO["Jadro (z v1F)"]
+    REC["Záznam každú ~1 s<br/>čas, poloha, hodnoty auta<br/>identita: boot + čas"]
+    EVT["Udalosť ŠTART / STOP<br/>PID 0x380 / 0x381"]
+    SDW["sdwriter: zápis + fsync<br/>potvrdená dĺžka, bez dier"]
+    DIG["Odtlačok SD súboru<br/>PID 0x398"]
+    TXQ["Fronta na odoslanie<br/>záznam ostáva, kým server nepotvrdí"]
+  end
+
+  subgraph SPOJ["Spojenie"]
+    NET{"WiFi v dosahu?"}
+    UDP["UDP správa<br/>protokol Freematics"]
+  end
+
+  subgraph SRV["FleetNest server"]
+    STORE["Uloženie do DB"]
+    ACK["ACK po uložení"]
+    CMD["Príkazy<br/>OTA_READY, SNIFF, RESEND"]
+    CHK["Kontrola SD = DB"]
+  end
+
+  subgraph STAV["Stav zariadenia"]
+    DRIVE(["JAZDA<br/>záznamy, odosielanie"])
+    PARK(["STÁTIE<br/>hlásenie polohy každé 3 h"])
+    SLEEP(["SPÁNOK ESP32<br/>prebudenie časovačom, kontrola 12 V / CAN"])
+  end
+
+  OTA["OTA: stiahnutie s pokračovaním<br/>SHA256, až potom zápis"]
+
+  CAN1 --> DEC
+  CAN2 --> DEC
+  CAN3 --> DEC
+  CAN1 & CAN2 & CAN3 --> SNIFF
+  SNIFF --> SDW
+  DEC --> ENG
+  DEC --> REC
+  GNSS --> REC
+  ADC --> REC
+  ENG -- "áno, predtým nie" --> EVT
+  ENG -- "nie, predtým áno" --> EVT
+  EVT --> REC
+  REC --> SDW
+  SDW --> SD
+  SDW -- "potvrdené na SD" --> TXQ
+  SDW --> DIG
+  DIG --> TXQ
+  TXQ --> NET
+  NET -- "áno" --> WIFI
+  NET -- "nie" --> MDM
+  MAX --> MDM
+  MAX --> CAN1
+  WIFI --> UDP
+  MDM --> UDP
+  UDP --> STORE
+  STORE --> ACK
+  ACK -- "zmaž z fronty" --> TXQ
+  STORE --> CHK
+  CHK -- "chýba na serveri" --> CMD
+  CMD -- "RESEND: znova zo SD" --> TXQ
+  CMD -- "SNIFF=min" --> SNIFF
+  CMD -- "OTA_READY" --> OTA
+
+  ENG -- "beží" --> DRIVE
+  DRIVE -- "motor stop" --> PARK
+  PARK -- "po čase bez motora" --> SLEEP
+  SLEEP -- "3 h / napätie / CAN" --> PARK
+  PARK -- "motor štart" --> DRIVE
+
+  classDef v1f fill:#2e6b3f,stroke:#57c27a,color:#e6ffe9
+  classDef nove fill:#7a4a12,stroke:#e0a040,color:#fff1dc
+  classDef srv fill:#3b4a63,stroke:#8ab4f8,color:#e3ecff
+  class REC,EVT,SDW,DIG,TXQ,UDP,NET,OTA,SNIFF,WIFI,DRIVE,PARK v1f
+  class CAN1,CAN2,CAN3,GNSS,ADC,MAX,SD,MDM,DEC,ENG,SLEEP nove
+  class STORE,ACK,CMD,CHK srv

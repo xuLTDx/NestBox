@@ -56,9 +56,32 @@ s počítaním každej straty. Bez modemu, bez servera.
 - **Napájanie z OBD (pin 16) cez DB9 9** – spotreba a správanie pri štarte motora nezmerané.
 - **Polarita RS / BFPCTRL** prevzatá z kódu OVMS, nie zmeraná.
 
-## 4. Ďalšie kroky (po jednom, každý po schválení)
+## 4. Celý firmvér (Vojtech 2026-10-18: „krok 2 by som už skúsil komplet, nie len sniff“)
 
-1b OTA (z v1F) · 2 modem SIM7600 + GPS (rozhodnúť AT vs. PPP) · 3 fronta s ACK + protokol
-FleetNest (z v1F) · 4 odtlačok SD (PID 0x398), RESEND · 5 STOP / státie / spánok (12 V cez ADC –
-OVMS `esp32adc`, NEOVERENÉ) · 6 dekódovanie K0 (tachometer 0x552 OVERENÉ, palivo, AdBlue,
-limit 0x1E9 – podľa nahrávok).
+Logika v obrázku: `LOGIKA.mmd` (diagram). Zásada: **všetko nad hardvérom je kód v1F** (overený
+v aute); vymieňa sa iba vrstva, ktorá v v1F volá dosku Freematics. Zmerané v kóde v1F (počet
+volaní): `sys.*` (GPS, linka ku koprocesoru, bzučiak), `obd.*` (OBD cez koprocesor, napätie,
+úsporný režim), `mems->*` (pohyb), `teleClient.wifi/cell` (WiFi a modem SIM7670), `SD.*` (SPI).
+
+| v1F (Freematics) | v2O (OVMS) | Stav |
+|---|---|---|
+| fronta s ACK, SD repl, odtlačok SD 0x398, RESEND, správy `udpmsg`, príkazy OTA_READY/SNIFF, OTA s pokračovaním + SHA256, STOP/ŠTART udalosti, hlásenie počas státia 3 h, webové API | **bez zmeny** (prenesené) | overené v aute (v1F) |
+| `sdwriter` SD cez SPI | SD_MMC 1-bit (piny 14/15/2) | nové pripojenie |
+| WiFi (`ClientWIFI`) | to isté – ESP32 | bez zmeny |
+| modem SIM7670 (`CellSIMCOM`, AT: UDP `CIP*`, HTTPS `CCH*`) | **SIM7600G** – rovnaký prístup cez AT príkazy, napájanie cez MAX7317 | AT príkazy SIM7600 vs. SIM7670 – **overiť na module** (NEOVERENÉ) |
+| GPS Freematics (`sys.gps*`) | GNSS v modeme SIM7600 (anténa ANT1) | nové |
+| OBD cez koprocesor (`obd.readPID`, ELM327) | priamo CAN1: OBD režim 01 cez ISO-TP (Passat), počúvanie (K0) | nové; UDS tachometer Passat už je (`canodo`) |
+| napätie (`obd.getVoltage`) | ADC ESP32 (OVMS `esp32adc`, kanál ADC1_0) | prepočet **zmerať** |
+| úsporný režim / prebudenie koprocesorom | ESP32 hlboký spánok + časovač (OVMS: `12v.wakeup_interval`) + kontrola napätia/CAN | **nový návrh – overiť odber** |
+| pohyb (MEMS) | OVMS **nemá** akcelerometer (v periférach nie je) | ŠTART/STOP podľa motora (CAN), nie pohybu |
+| motor beží (OBD RPM > 0) | CAN: Passat – OBD RPM; K0 – správa so stavom motora (vybrať z nahrávky) | K0 NEOVERENÉ |
+| bzučiak, LED | nie sú | vynechané |
+
+**Poradie (každý bod overený na stole / v aute pred ďalším):**
+1. hardvér: MAX7317, SD_MMC + `sdwriter`, CAN1 + MCP2515 (CAN2/3), sniff na všetkých zberniciach, WiFi + webové API, OTA (z v1F) – od tejto chvíle už bez USB;
+2. modem SIM7600 (AT) + GNSS; fronta s ACK + UDP do FleetNest; príkazy; odtlačok SD;
+3. motor / ŠTART–STOP / státie / spánok, napätie;
+4. dekódovanie áut: K0 (tachometer 0x552 OVERENÉ; palivo, AdBlue, limit 0x1E9 podľa nahrávok), Passat (OBD + UDS z v1F).
+
+**Pred testom Peugeota stačí bod 1** (sniff 3 zberníc); v aute zároveň v1F na 6/14 ako meradlo.
+FleetNest: OVMS sa hlási ako zariadenie typu NestBox_v2O (hodnota `ovms`) – vlastné ID z MAC.
