@@ -388,9 +388,140 @@ static int handlerPage(UrlHandlerParam* param)
   return FLAG_DATA_RAW;
 }
 
+// ---------------------------------------------------------- /DATA files ---
+// v1F dataserver.cpp handlerLogList / handlerLogFile / handlerLogEvents (SD_MMC here):
+// /api/list = the /DATA files, /api/log/<n> = one file (0 = the current), /api/events/<n> = its
+// "FE," event lines only
+uint32_t telemetryFileId();
+struct LogDataContext { File file; };
+
+static int handlerLogFile(UrlHandlerParam* param)
+{
+  LogDataContext* ctx = (LogDataContext*)param->hs->ptr;
+  param->contentType = HTTPFILETYPE_TEXT;
+  if (ctx) {
+    if (!param->pucBuffer) {
+      sdLock(); ctx->file.close(); sdUnlock();
+      delete ctx;
+      param->hs->ptr = 0;
+      return 0;
+    }
+  } else {
+    int id = param->pucRequest[0] == '/' ? atoi(param->pucRequest + 1) : 0;
+    sprintf(param->pucBuffer, "/DATA/%u.CSV", id == 0 ? (unsigned)telemetryFileId() : (unsigned)id);
+    ctx = new LogDataContext;
+    sdLock(); ctx->file = SD_MMC.open(param->pucBuffer, FILE_READ); sdUnlock();
+    if (!ctx->file) {
+      strcat(param->pucBuffer, " not found");
+      param->contentLength = strlen(param->pucBuffer);
+      delete ctx;
+      return FLAG_DATA_RAW;
+    }
+    param->hs->ptr = (void*)ctx;
+  }
+  sdLock();
+  bool more = ctx->file.available();
+  if (more) param->contentLength = ctx->file.readBytes(param->pucBuffer, param->bufSize);
+  sdUnlock();
+  if (!more) return 0;
+  return FLAG_DATA_STREAM;
+}
+
+static int handlerLogList(UrlHandlerParam* param)
+{
+  char* buf = param->pucBuffer;
+  int bufsize = param->bufSize;
+  uint32_t fileid = telemetryFileId();
+  sdLock();
+  File root = SD_MMC.open("/DATA");
+  int n = snprintf(buf, bufsize, "[");
+  if (root) {
+    const int reserve = 64;               // v1F 2026-09-12: never run past the buffer
+    File file;
+    while (n < bufsize - reserve && (file = root.openNextFile())) {
+      const char* fn = file.name();
+      const char* p = strrchr(fn, '/');
+      if (p) fn = p + 1;
+      unsigned id = atoi(fn), size = file.size();
+      if (id) {
+        n += snprintf(buf + n, bufsize - n, "{\"id\":%u,\"size\":%u%s},", id, size, id == fileid ? ",\"active\":true" : "");
+      }
+      file.close();
+    }
+    if (n > 0 && buf[n - 1] == ',') n--;
+    root.close();
+  }
+  sdUnlock();
+  n += snprintf(buf + n, bufsize - n, "]");
+  param->contentType = HTTPFILETYPE_JSON;
+  param->contentLength = n;
+  return FLAG_DATA_RAW;
+}
+
+static int handlerLogEvents(UrlHandlerParam* param)
+{
+  int id = param->pucRequest[0] == '/' ? atoi(param->pucRequest + 1) : 0;
+  char path[24];
+  sprintf(path, "/DATA/%u.CSV", id == 0 ? (unsigned)telemetryFileId() : (unsigned)id);
+  sdLock();
+  File file = SD_MMC.open(path, FILE_READ);
+  if (!file) {
+    sdUnlock();
+    param->contentLength = snprintf(param->pucBuffer, param->bufSize, "%s not found", path);
+    param->contentType = HTTPFILETYPE_TEXT;
+    return FLAG_DATA_RAW;
+  }
+  int n = 0, len = 0;
+  char line[160];
+  const int reserve = 8;
+  char block[256];                        // v1F 2026-09-14: block reads, yield - a byte at a time hung the httpd
+  int blockLen = 0, blockPos = 0;
+  uint32_t iterations = 0;
+  for (;;) {
+    if (blockPos >= blockLen) {
+      blockLen = file.readBytes(block, sizeof(block));
+      blockPos = 0;
+      if (blockLen <= 0) {
+        line[len] = 0;
+        if (len >= 3 && !strncmp(line, "FE,", 3) && n < param->bufSize - reserve)
+          n += snprintf(param->pucBuffer + n, param->bufSize - n, "%s\n", line + 3);
+        break;
+      }
+    }
+    char c = block[blockPos++];
+    if ((++iterations & 0x3FF) == 0) yield();
+    if (c == '\n') {
+      line[len] = 0;
+      if (len >= 3 && !strncmp(line, "FE,", 3) && n < param->bufSize - reserve)
+        n += snprintf(param->pucBuffer + n, param->bufSize - n, "%s\n", line + 3);
+      len = 0;
+      if (n >= param->bufSize - reserve) break;
+    } else if (len < (int)sizeof(line) - 1) {
+      line[len++] = c;
+    }
+  }
+  file.close();
+  sdUnlock();
+  param->contentLength = n;
+  param->contentType = HTTPFILETYPE_TEXT;
+  return FLAG_DATA_RAW;
+}
+
+int telemetryLive(char* buf, int size);
+static int handlerLive(UrlHandlerParam* param)
+{
+  param->contentLength = telemetryLive(param->pucBuffer, param->bufSize);
+  param->contentType = HTTPFILETYPE_JSON;
+  return FLAG_DATA_RAW;
+}
+
 static UrlHandler urlHandlerList[] = {
   {"", handlerPage},           // empty prefix = only "/" (httpd.c _mwCheckUrlHandlers)
   {"api/info", handlerInfo},
+  {"api/live", handlerLive},
+  {"api/list", handlerLogList},
+  {"api/log", handlerLogFile},
+  {"api/events", handlerLogEvents},
   {"api/control", handlerControl},
   {"api/ota", handlerOTA},
   {"api/sniff", handlerSniff},

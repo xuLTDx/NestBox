@@ -379,3 +379,24 @@ void readTick()
   Serial.println(line);
   s_log.logEvent(line);
 }
+
+// /api/live (web page): what the box sees now
+int telemetryLive(char* buf, int size)
+{
+  CarValues cv = carValues();
+  uint32_t ms = millis();
+  auto age = [&](uint32_t at) -> long { return at ? (long)(ms - at) : -1L; };
+  return snprintf(buf, size,
+      "{\"v\":%.2f,\"engine\":%d,\"veh\":\"%s\",\"rpm\":%.0f,\"rpm_age\":%ld,\"eng_state\":%u,\"odo\":%lu,\"odo_age\":%ld,"
+      "\"fuel\":%.1f,\"fuel_age\":%ld,\"urea_km\":%lu,\"urea_age\":%ld,"
+      "\"gps\":{\"fix\":%d,\"lat\":%.6f,\"lng\":%.6f,\"kph\":%.1f,\"sats\":%u,\"age\":%ld},"
+      "\"net\":{\"link\":\"%s\",\"login\":%d,\"cell\":\"%s\",\"tx\":%lu,\"bytes\":%lu},"
+      "\"can1\":{\"frames\":%lu,\"kbit\":%lu,\"found\":%d,\"last_age\":%ld},\"file\":%lu,\"pending\":%lu}",
+      read12V(), s_engineOn ? 1 : 0, carProfile(), cv.rpm, age(cv.rpmAt), cv.engState, (unsigned long)cv.odoKm, age(cv.odoAt),
+      cv.fuelL, age(cv.fuelAt), (unsigned long)cv.ureaKm, age(cv.ureaAt),
+      s_fix.valid ? 1 : 0, s_fix.lat, s_fix.lng, s_fix.kph, (unsigned)s_fix.sats, age(s_fix.at),
+      s_client.link ? s_client.link->name() : "-", s_client.login ? 1 : 0, s_cell.status(),
+      (unsigned long)s_client.txCount, (unsigned long)s_client.txBytes,
+      (unsigned long)can1Stats().frames, (unsigned long)can1Stats().kbit, can1Stats().speedFound ? 1 : 0,
+      age(can1Stats().lastFrameMs), (unsigned long)s_log.id(), (unsigned long)txqPending());
+}
