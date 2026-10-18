@@ -6,6 +6,11 @@
       "remote_name": "telelogger.bin",
       "token": "REPLACE_WITH_THIS_DEVICE_S_REGISTRY_JSON_TOKEN",
       "device_ip": "OPTIONAL - device's LAN IP, e.g. 192.168.0.39. When set, a build also auto-sets OTA_TOKEN on the device (best-effort, only if it's reachable on this LAN right now) - remove this line if you don't want that."
+    },
+    "ovms33": {
+      "remote_name": "nestbox_v2o.bin",
+      "type": "NestBox_v2O",
+      "_note": "type instead of token: every registry entry of this type gets the build; for one box only use its token and its own remote_name (e.g. nestbox_v2o_test_<ID>.bin)"
     }
   }
 }

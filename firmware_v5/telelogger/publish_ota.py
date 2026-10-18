@@ -117,10 +117,17 @@ def publish(source, target, env):  # noqa: ARG001
         print(f"[publish_ota] scp failed (exit {scp.returncode}) - target_build NOT updated")
         return
 
-    remote_cmd = (
-        f"cd {ota_dir} && python3 publish_receiver.py "
-        f"{profile['token']} '{build_str}'"
-    )
+    # one device (its token) or every device of a type (2026-10-18, publish_receiver.py)
+    if profile.get("type"):
+        remote_cmd = (
+            f"cd {ota_dir} && python3 publish_receiver.py "
+            f"type:{profile['type']} '{build_str}' {remote_path}"
+        )
+    else:
+        remote_cmd = (
+            f"cd {ota_dir} && python3 publish_receiver.py "
+            f"{profile['token']} '{build_str}'"
+        )
     receiver = subprocess.run(["ssh", host, remote_cmd])
     if receiver.returncode != 0:
         print(f"[publish_ota] publish_receiver.py failed (exit {receiver.returncode}) - "
@@ -131,7 +138,7 @@ def publish(source, target, env):  # noqa: ARG001
           f"target_build set, push-check triggered")
 
     device_ip = profile.get("device_ip")
-    if device_ip:
+    if device_ip and profile.get("token"):
         _provision_device_token(device_ip, profile["token"], pioenv)
 
 
