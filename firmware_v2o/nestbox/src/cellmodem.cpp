@@ -92,6 +92,13 @@ bool CellLink::start()
     }
   }
   if (!reg) { snprintf(m_status, sizeof(m_status), "not registered"); return false; }
+  // what the modem itself has stored as APN (its own profile) - logged, not changed
+  if (at("AT+CGDCONT?\r", 1000)) {
+    char* p = strstr(m_buf, "+CGDCONT:");
+    char* e = p ? strpbrk(p, "\r\n") : nullptr;
+    if (p && e) { *e = 0; snprintf(m_cgdcont, sizeof(m_cgdcont), "%s", p + 9); }
+    Serial.printf("[CELL] stored APN profile: %s\n", m_cgdcont);
+  }
   if (m_apn[0]) {
     char c[80];
     snprintf(c, sizeof(c), "AT+CGSOCKCONT=1,\"IP\",\"%s\"\r", m_apn);

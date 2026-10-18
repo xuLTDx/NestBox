@@ -50,6 +50,7 @@ public:
   bool alive_() { return m_alive; }
   int rssi();                  // dBm, 0 = unknown
   const char* status() { return m_status; }
+  const char* storedApn() { return m_cgdcont; }
   void setApn(const char* apn);
 private:
   bool at(const char* cmd, unsigned int timeoutMs = 1000, const char* expect = nullptr);
@@ -67,5 +68,6 @@ private:
   uint16_t m_port = 0;
   char m_apn[40] = "";
   char m_status[96] = "off";
+  char m_cgdcont[80] = "";       // the modem's stored PDP profile (AT+CGDCONT?), for the log
   SemaphoreHandle_t m_mux = nullptr;
 };

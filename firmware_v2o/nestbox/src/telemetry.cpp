@@ -157,7 +157,7 @@ static void cellTask(void*)
       logNetEvent("CELL START");
       s_cellUp = s_cell.start();
       char m[120];
-      snprintf(m, sizeof(m), "CELL %s", s_cell.status());
+      snprintf(m, sizeof(m), "CELL %s apn_profile=%s", s_cell.status(), s_cell.storedApn());
       logNetEvent(m);
     }
     if (!s_cellOn && s_cellUp) { s_cellUp = false; s_cell.stop(); logNetEvent("CELL OFF"); }
