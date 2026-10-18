@@ -1,6 +1,7 @@
 // Local HTTP API - NestBox_v2O step 1. The handlers are NestBox_v1F's
 // (firmware_v5/telelogger/dataserver.cpp: /api/control, /api/ota, /api/sniff),
 // the same MiniWeb server (libraries/httpd); SD through SD_MMC instead of SD.
+//   /                           status page (page.h)
 //   /api/info                   device, firmware, uptime, SD, sniff, buses (JSON)
 //   /api/control?cmd=...        SNIFF=1[,<min>] | SNIFF=0 | SNIFF? | SNIFF_VEH=<tag> |
 //                               SNIFF_BUSES=<mask 1-7> | SNIFF_PURGE | SDW? | RESTART
@@ -15,6 +16,7 @@
 #include <httpd.h>
 #include "sniff.h"
 #include "sdwriter.h"
+#include "page.h"
 
 extern const char FW_BUILD_STR[];
 uint32_t bootId();
@@ -327,7 +329,16 @@ static int handlerSniff(UrlHandlerParam* param)
   return FLAG_DATA_STREAM;
 }
 
+static int handlerPage(UrlHandlerParam* param)
+{
+  param->pucBuffer = (char*)PAGE_HTML;
+  param->contentLength = sizeof(PAGE_HTML) - 1;
+  param->contentType = HTTPFILETYPE_HTML;
+  return FLAG_DATA_RAW;
+}
+
 static UrlHandler urlHandlerList[] = {
+  {"", handlerPage},           // empty prefix = only "/" (httpd.c _mwCheckUrlHandlers)
   {"api/info", handlerInfo},
   {"api/control", handlerControl},
   {"api/ota", handlerOTA},
