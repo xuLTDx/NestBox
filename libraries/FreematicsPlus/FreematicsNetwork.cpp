@@ -1942,13 +1942,13 @@ int CellHTTP::cchRecvRaw(char* buf, int maxLen, unsigned int timeout)
     ll = 0;
     if (!strncmp(line, "+CCHRECV: DATA,", 15) || !strncmp(line, "+CCHRECV:DATA,", 14)) {
       int len = atoi(strrchr(line, ',') + 1);
-      if (len <= 0 || len > maxLen - total) return -1;  // never asked for this much
+      if (len <= 0 || len > maxLen - total) { m_lastRecvErr = 2; return -1; }  // never asked for this much
       int got = 0;
       while (got < len && millis() - t < timeout) {
         int n = m_device->xbRead(buf + total + got, len - got, 200);
         if (n > 0) got += n;
       }
-      if (got < len) return -1;
+      if (got < len) { m_lastRecvErr = 3; return -1; }
       total += len;
       sawData = true;
     } else if (!strncmp(line, "+CCHRECV: 0,", 12) || !strncmp(line, "+CCHRECV:0,", 11)) {
@@ -1965,7 +1965,12 @@ int CellHTTP::cchRecvRaw(char* buf, int maxLen, unsigned int timeout)
     }
     // anything else (OK, blank lines, +CCHEVENT/+CIPRXGET URCs) is ignored
   }
-  return sawData ? total : -1;
+  if (sawData) return total;
+  // 2026-10-14: the modem answered nothing at all within `timeout` - seen on a real cellular OTA
+  // (stalls after 24 KB, 145 KB, 297 KB ... each attempt). Not corrupt data: report "nothing yet"
+  // (0) so receiveBodyBytes() keeps polling until ITS timeout instead of aborting the download.
+  m_lastRecvErr = 1;
+  return 0;
 }
 
 static char* findHeaderEnd(char* data, int len)
@@ -2145,8 +2150,10 @@ int CellHTTP::receiveBodyBytes(char* buf, int maxLen, unsigned int timeout)
     // Cache mode: an empty cache just means the next bytes haven't reached
     // the modem yet (weak signal) - keep polling until `timeout`.
     uint32_t t = millis();
+    m_lastRecvErr = 0;
     for (;;) {
       int n = cchRecvRaw(buf, maxLen, 5000);
+      if (n > 0) m_lastRecvErr = 0;
       if (n != 0) return n;  // data, or -1 = garbled read (caller aborts, resume + SHA256 cover it)
       if (m_state == HTTP_DISCONNECTED) return 0;
       if (millis() - t >= timeout) {

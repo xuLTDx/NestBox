@@ -5002,8 +5002,9 @@ bool performPullOtaCheck()
 #if STORAGE != STORAGE_NONE
         if (state.check(STATE_STORAGE_READY)) {
           char m[64];  // how far it got (the rest resumes with Range at the next check)
-          snprintf(m, sizeof(m), "OTA-PULL ERR=CELL_RECV %u/%u from %u in %ums", (unsigned)written,
-                   (unsigned)fwSize, (unsigned)resumeFrom, (unsigned)(millis() - dlStart));
+          snprintf(m, sizeof(m), "OTA-PULL ERR=CELL_RECV %u/%u from %u in %ums why=%d", (unsigned)written,
+                   (unsigned)fwSize, (unsigned)resumeFrom, (unsigned)(millis() - dlStart),
+                   otaCellClient.lastRecvError());
           otaLog(m);
         }
 #endif

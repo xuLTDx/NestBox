@@ -299,6 +299,9 @@ public:
     // Returns the number of bytes written to buf (> 0), 0 at end-of-stream,
     // or -1 on error / unsupported modem type.
     int receiveBodyBytes(char* buf, int maxLen, unsigned int timeout = HTTP_CONN_TIMEOUT);
+    // why the last SIM7670 cache read failed (2026-10-14): 0 none, 1 modem silent (no reply within
+    // the read timeout - retried until the caller's timeout), 2 more data than asked, 3 data cut short
+    int lastRecvError() const { return m_lastRecvErr; }
     // Call whenever the modem was powered off/on (e.g. a sibling object's
     // end()/begin()): the CCH service started by init() is gone with it.
     void resetCch() { m_cchStarted = false; }
@@ -313,6 +316,7 @@ private:
     // Both are reset to 0 at the start of each receiveHeaders() call.
     int m_streamBodyLen = 0;
     int m_streamBodyPos = 0;
+    int m_lastRecvErr = 0;
     // 2026-09-23: AT+CCHSTART opens the whole CCH SSL *service*, not a
     // per-connection session (AT+CCHOPEN/AT+CCHCLOSE are the per-connection
     // pair, already called each connection by open()/close()). init() used
