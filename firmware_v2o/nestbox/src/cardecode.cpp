@@ -34,6 +34,18 @@ void carDecode(uint32_t id, bool ext, uint8_t dlc, const uint8_t* d)
       s_v.fuelRaw = d[3]; s_v.fuelL = d[3] * 0.5f; s_v.fuelAt = now;
       portEXIT_CRITICAL(&s_mux);
     }
+  } else if (id == 0x208 && dlc >= 2) {
+    uint16_t raw = ((uint16_t)d[0] << 8) | d[1];
+    if (raw != 0xFFFF) {
+      portENTER_CRITICAL(&s_mux);
+      s_v.rpm = raw * 0.125f; s_v.rpmAt = now;
+      if (raw) s_v.rpmPosAt = now;
+      portEXIT_CRITICAL(&s_mux);
+    }
+  } else if (id == 0x348 && dlc >= 6) {
+    portENTER_CRITICAL(&s_mux);
+    s_v.engState = d[5] & 0x0F; s_v.engAt = now;
+    portEXIT_CRITICAL(&s_mux);
   } else if (id == 0x5A8 && dlc >= 8) {
     portENTER_CRITICAL(&s_mux);
     s_v.ureaKm = ((uint32_t)d[0] << 7) | (d[1] >> 1);

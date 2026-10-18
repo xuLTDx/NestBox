@@ -8,6 +8,9 @@
 //   0x5A8 urea data          bytes 1-2 (15 bits) = AdBlue range before start
 //                            inhibit, km             NOT VERIFIED (S19: 5000); the raw
 //                            8 bytes are sent too (tank-volume field jumps 19/30/0)
+//   0x208 ENGINE_SPEED       bytes 1-2 x 0.125 = rpm  (S19: 0, then ~900 idle after the start)
+//   0x348 ENGINE_RUNNING     byte 6 bits 3-0: 1 off, 2 starting, 3 running, 4 stopped (stop-start),
+//                            7 preparing (S19: 1, 2, 3, 7 - consistent with the engine start)
 // Each value is kept with the time it came; a record takes only fresh ones.
 #pragma once
 #include <Arduino.h>
@@ -16,6 +19,8 @@ struct CarValues {
   uint32_t odoKm;   uint32_t odoAt;
   float fuelL;      uint8_t fuelRaw;    uint32_t fuelAt;
   uint32_t ureaKm;  uint8_t urea[8];    uint32_t ureaAt;
+  float rpm;        uint32_t rpmAt;     uint32_t rpmPosAt;   // rpmPosAt: last rpm > 0
+  uint8_t engState; uint32_t engAt;
 };
 
 void carSetProfile(const char* p);    // "K0" or "" (none)

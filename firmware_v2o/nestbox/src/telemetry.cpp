@@ -6,7 +6,9 @@
 //
 // Step 2b: the SIM7600 modem (cellmodem.cpp) as the fallback link and its
 // GNSS in every record - OFF until CELL=1 (/api/control), not tested yet.
-// Not yet (later steps): engine START/STOP
+// Step B: engine START/STOP from the car's rpm (K0 0x208) as v1F, a record
+// every second while the engine runs.
+// Not yet (later steps):
 // and standby (step 3), car values (step 4). Until then a record every
 // REC_S seconds (default 60, /api/control REC_S=) carries the clock time
 // (system clock from NTP / the server's login reply, as v1F does for engine
@@ -36,7 +38,16 @@
 #define PID_CAN_FRAMES 0x389     // CAN frames received (v1F: CAN - prijate ramce) - here: CAN1 since the last record
 #define PID_UREA_KM    0x39A     // NEW: AdBlue range before start inhibit, km (candidate)
 #define PID_UREA_RAW   0x39B     // NEW: 0x5A8 raw, 8 bytes
+#define PID_RPM        0x10C     // rpm (v1F: OBD 0x0C | 0x100)
+#define PID_ENG_STATE  0x39C     // NEW: K0 0x348 engine running state (1 off, 3 running, 4 stop-start ...)
+#define PID_ENGINE_EVENT      0x380   // v1F: 1 = START, 2 = STOP
+#define PID_ENGINE_EVENT_TIME 0x381   // v1F: unix time of the event
 #define CAR_FRESH_MS   5000
+// engine (v1F engineTick rules): START = rpm > 0 within 3 s; STOP = the engine ECU silent
+// (no 0x208 for ENGINE_SILENT_MS = ignition off), timed at the last rpm > 0; rpm 0 with the
+// ECU on the bus (stop-start at a light) is NOT a stop
+#define ENGINE_SILENT_MS 10000
+#define DRIVE_REC_MS     1000     // a record every second while the engine runs (v1F)
 #define ADC_12V_PIN    36        // ADC1 channel 0 (OVMS esp32adc)
 #define ADC_12V_FACTOR 195.7f    // raw / factor = volts (OVMS default system.adc factor12v; this unit NOT calibrated)
 
@@ -99,16 +110,34 @@ struct Rec {
   }
 };
 
-static void makeRecord()
+static volatile bool s_engineOn;
+bool telemetryEngineOn() { return s_engineOn; }
+
+// event: 0 = a regular record, 1 = START, 2 = STOP (timed at `when`, the record's own time)
+static void makeRecord(int event = 0, time_t when = 0)
 {
   static Rec r;
   static uint32_t lastDigest;
   uint32_t ts = millis();
   r.begin(ts);
+  if (event) {
+    r.u32(PID_ENGINE_EVENT, event);
+    if (when > 1735689600) {
+      r.u32(PID_ENGINE_EVENT_TIME, (uint32_t)when);
+      struct tm u;
+      gmtime_r(&when, &u);
+      r.u32(0x10, (uint32_t)u.tm_hour * 1000000 + u.tm_min * 10000 + u.tm_sec * 100);
+      r.u32(0x11, (uint32_t)u.tm_mday * 10000 + (u.tm_mon + 1) * 100 + (u.tm_year % 100));
+    }
+  }
   GnssFix g;
   if (s_cellOn && s_cell.gnss(&g)) s_fix = g;
   bool fresh = s_fix.valid && millis() - s_fix.at < 5000;
-  if (fresh) {                   // as v1F processGPS(): the GNSS time also sets the clock
+  if (fresh && event) {          // an event record carries the event's time (above), the position only
+    r.f(PID_GPS_LATITUDE, s_fix.lat, "%f");
+    r.f(PID_GPS_LONGITUDE, s_fix.lng, "%f");
+    if (s_fix.sats) r.u32(PID_GPS_SAT_COUNT, s_fix.sats);
+  } else if (fresh) {                   // as v1F processGPS(): the GNSS time also sets the clock
     struct tm t = {};
     t.tm_mday = s_fix.date / 10000; t.tm_mon = (s_fix.date / 100) % 100 - 1; t.tm_year = s_fix.date % 100 + 100;
     t.tm_hour = s_fix.time / 1000000; t.tm_min = (s_fix.time / 10000) % 100; t.tm_sec = (s_fix.time / 100) % 100;
@@ -125,7 +154,7 @@ static void makeRecord()
     if (s_fix.hdop > 0) r.u32(PID_GPS_HDOP, (uint32_t)(s_fix.hdop + 0.5f));
   }
   time_t now = time(nullptr);
-  if (!fresh && now > 1735689600) {   // no fix: date and time from the clock as v1F addTimeOf()
+  if (!fresh && !event && now > 1735689600) {   // no fix: date and time from the clock as v1F addTimeOf()
     struct tm u;
     gmtime_r(&now, &u);
     r.u32(0x10, (uint32_t)u.tm_hour * 1000000 + u.tm_min * 10000 + u.tm_sec * 100);
@@ -143,6 +172,8 @@ static void makeRecord()
   CarValues cv = carValues();
   uint32_t ms = millis();
   if (cv.odoAt && ms - cv.odoAt < CAR_FRESH_MS) r.u32(PID_ODOMETER, cv.odoKm);
+  if (cv.rpmAt && ms - cv.rpmAt < CAR_FRESH_MS) r.u32(PID_RPM, (uint32_t)(cv.rpm + 0.5f));
+  if (cv.engAt && ms - cv.engAt < CAR_FRESH_MS) r.u32(PID_ENG_STATE, cv.engState);
   if (cv.fuelAt && ms - cv.fuelAt < CAR_FRESH_MS) {
     r.u32(PID_FUEL_CAND, (uint32_t)(cv.fuelL * 10 + 0.5f));
     r.u32(PID_FUEL_RAW, cv.fuelRaw);
@@ -163,15 +194,36 @@ static void makeRecord()
   r.push(ts);
 }
 
+static void engineTick()
+{
+  CarValues cv = carValues();
+  uint32_t ms = millis();
+  time_t now = time(nullptr);
+  if (!s_engineOn) {
+    if (cv.rpmPosAt && ms - cv.rpmPosAt < 3000) {
+      s_engineOn = true;
+      logNetEvent("ENGINE START");
+      makeRecord(1, now);
+    }
+  } else if (!cv.rpmAt || ms - cv.rpmAt > ENGINE_SILENT_MS) {
+    s_engineOn = false;
+    time_t when = now - (time_t)((ms - cv.rpmPosAt) / 1000);   // the last rpm > 0
+    logNetEvent("ENGINE STOP");
+    makeRecord(2, when);
+  }
+}
+
 static void recordTask(void*)
 {
   uint32_t last = 0;
   for (;;) {
-    if (!last || millis() - last >= s_recS * 1000UL) {
+    engineTick();
+    uint32_t every = s_engineOn ? DRIVE_REC_MS : s_recS * 1000UL;
+    if (!last || millis() - last >= every) {
       last = millis();
       makeRecord();
     }
-    vTaskDelay(pdMS_TO_TICKS(200));
+    vTaskDelay(pdMS_TO_TICKS(100));
   }
 }
 
