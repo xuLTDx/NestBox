@@ -4,7 +4,7 @@
 #include "sniff.h"
 #include <SD_MMC.h>
 #include <Preferences.h>
-#include "driver/twai.h"
+#include "canbus1.h"
 #include "esp_timer.h"
 #include "sdwriter.h"
 #include "mcp2515.h"
@@ -56,7 +56,6 @@ static uint8_t s_busMask = 0x07;
 static Mcp2515 s_mcp1(2, HW_MCP1_CS, HW_MCP1_INT), s_mcp2(3, HW_MCP2_CS, HW_MCP2_INT);
 static Mcp2515* mcpFor(int i) { return i == 1 ? &s_mcp1 : i == 2 ? &s_mcp2 : nullptr; }
 
-static volatile bool s_twaiRunning, s_pauseRx, s_rxPaused;
 static SemaphoreHandle_t s_canMux;
 
 static volatile bool s_active;
@@ -113,65 +112,19 @@ static void onMcpFrame(uint8_t bus, const CanRx& r)
   pushFrame(f);
 }
 
-// ----------------------------------------------------------- CAN1 TWAI ----
-static twai_timing_config_t timingFor(uint32_t kbit)
+// ----------------------------------------------------------------- CAN1 ----
+// CAN1 runs all the time (canbus1.cpp); while the sniff is on its frames come here
+static void onCan1Frame(int64_t us, uint32_t id, bool ext, uint8_t dlc, const uint8_t* data)
 {
-  switch (kbit) {
-    case 250: return TWAI_TIMING_CONFIG_250KBITS();
-    case 125: return TWAI_TIMING_CONFIG_125KBITS();
-    default:  return TWAI_TIMING_CONFIG_500KBITS();
-  }
-}
-
-static bool twaiStart()
-{
-  mx7317Out(MX_CAN1_RS, 1);                   // transceiver transmitter off (listen only)
-  twai_general_config_t g = TWAI_GENERAL_CONFIG_DEFAULT((gpio_num_t)HW_CAN1_TX, (gpio_num_t)HW_CAN1_RX,
-                                                        TWAI_MODE_LISTEN_ONLY);
-  g.rx_queue_len = 128;
-  g.tx_queue_len = 0;
-  twai_timing_config_t t = timingFor(s_speeds[s_bus[0].speedIdx]);
-  twai_filter_config_t f = TWAI_FILTER_CONFIG_ACCEPT_ALL();
-  if (twai_driver_install(&g, &t, &f) != ESP_OK) return false;
-  if (twai_start() != ESP_OK) { twai_driver_uninstall(); return false; }
-  s_twaiRunning = true;
-  return true;
-}
-
-static void twaiStop()
-{
-  if (!s_twaiRunning) return;
-  s_twaiRunning = false;
-  twai_stop();
-  twai_driver_uninstall();
-}
-
-static void twaiRxTask(void*)
-{
-  for (;;) {
-    if (s_pauseRx || !s_twaiRunning) {
-      s_rxPaused = true;
-      vTaskDelay(pdMS_TO_TICKS(5));
-      continue;
-    }
-    s_rxPaused = false;
-    twai_message_t m;
-    if (twai_receive(&m, pdMS_TO_TICKS(20)) != ESP_OK) continue;
-    Frame f = {};
-    f.us = esp_timer_get_time();
-    f.id = m.identifier;
-    f.bus = 1;
-    f.ext = m.extd;
-    f.dlc = m.data_length_code > 8 ? 8 : m.data_length_code;
-    memcpy(f.data, m.data, f.dlc);
-    pushFrame(f);
-  }
-}
-
-static void pauseRx()
-{
-  s_pauseRx = true;
-  for (int i = 0; i < 100 && !s_rxPaused; i++) delay(2);
+  if (!s_active || !s_queue) return;
+  Frame f = {};
+  f.us = us;
+  f.id = id;
+  f.bus = 1;
+  f.ext = ext;
+  f.dlc = dlc;
+  memcpy(f.data, data, dlc);
+  pushFrame(f);
 }
 
 #ifdef TEST_SNIFF_LOAD
@@ -200,15 +153,16 @@ static void loadTask(void*)
 #endif
 
 // --------------------------------------------------------------- buses ----
+// CAN2 / CAN3 only - CAN1 is never started or stopped here
 static bool busStart(int i)
 {
-  if (i == 0) return twaiStart();
+  if (i == 0) { can1SetSniffHook(onCan1Frame); return true; }
   return mcpFor(i)->start(s_speeds[s_bus[i].speedIdx]);
 }
 
 static void busStop(int i)
 {
-  if (i == 0) twaiStop();
+  if (i == 0) can1SetSniffHook(nullptr);
   else mcpFor(i)->stop();
 }
 
@@ -249,15 +203,14 @@ static void statsLine(char* line, int cap)
   for (int i = 0; i < SNIFF_BUSES && n < cap - 80; i++) {
     const BusState& b = s_bus[i];
     if (!b.on) continue;
-    n += snprintf(line + n, cap - n, " | can%d f=%lu %lu%s", i + 1, (unsigned long)b.frames,
-                  (unsigned long)s_speeds[b.speedIdx], b.speedFound ? "k" : "k?");
     if (i == 0) {
-      twai_status_info_t st = {};
-      if (s_twaiRunning) twai_get_status_info(&st);
-      n += snprintf(line + n, cap - n, " rx_missed=%lu rx_overrun=%lu bus_err=%lu",
-                    (unsigned long)st.rx_missed_count, (unsigned long)st.rx_overrun_count,
-                    (unsigned long)st.bus_error_count);
+      Can1Stats st = can1Stats();
+      n += snprintf(line + n, cap - n, " | can1 f=%lu %lu%s rx_missed=%lu rx_overrun=%lu bus_err=%lu",
+                    (unsigned long)b.frames, (unsigned long)st.kbit, st.speedFound ? "k" : "k?",
+                    (unsigned long)st.rxMissed, (unsigned long)st.rxOverrun, (unsigned long)st.busErr);
     } else {
+      n += snprintf(line + n, cap - n, " | can%d f=%lu %lu%s", i + 1, (unsigned long)b.frames,
+                    (unsigned long)s_speeds[b.speedIdx], b.speedFound ? "k" : "k?");
       McpStats st = mcpFor(i)->stats();
       n += snprintf(line + n, cap - n, " rx_overflow=%lu err_irq=%lu eflg=%02X rec=%u",
                     (unsigned long)st.rxOverflow, (unsigned long)st.errIrq, st.eflg, st.rec);
@@ -456,7 +409,6 @@ static void makeTasks()
     s_queueCap = 512;
   }
   Serial.printf("[SNIFF] queue %lu frames\n", (unsigned long)s_queueCap);
-  xTaskCreatePinnedToCore(twaiRxTask, "can1rx", 3072, nullptr, 10, nullptr, 0);
 #ifdef TEST_SNIFF_LOAD
   xTaskCreate(loadTask, "sniffload", 2048, nullptr, 5, nullptr);
 #endif
@@ -510,9 +462,7 @@ static bool startNow(uint16_t minutes)
 static void stopBuses()
 {
   xSemaphoreTake(s_canMux, portMAX_DELAY);
-  pauseRx();
   for (int i = 0; i < SNIFF_BUSES; i++) if (s_bus[i].on) busStop(i);
-  s_pauseRx = false;
   xSemaphoreGive(s_canMux);
 }
 
@@ -543,7 +493,7 @@ uint8_t sniffBuses() { return s_busMask; }
 // per bus: no frame within SPEED_PROBE_MS -> the next speed
 static void speedTick()
 {
-  for (int i = 0; i < SNIFF_BUSES; i++) {
+  for (int i = 1; i < SNIFF_BUSES; i++) {    // CAN1: canbus1.cpp probes its own speed
     BusState& b = s_bus[i];
     if (!b.on || b.speedFound) continue;
     if (b.frames > b.probeFrames) {
@@ -556,13 +506,11 @@ static void speedTick()
     }
     if (millis() - b.probeStart < SPEED_PROBE_MS) continue;
     xSemaphoreTake(s_canMux, portMAX_DELAY);
-    if (i == 0) pauseRx();
     busStop(i);
     b.speedIdx = (b.speedIdx + 1) % (sizeof(s_speeds) / sizeof(s_speeds[0]));
     busStart(i);
     b.probeFrames = b.frames;
     b.probeStart = millis();
-    s_pauseRx = false;
     xSemaphoreGive(s_canMux);
   }
 }
@@ -639,16 +587,18 @@ int sniffStatus(char* buf, int size)
       (unsigned long)s_sdErrors, (unsigned long)s_sdLost, (unsigned long)s_dropped, s_vehicle.c_str());
   for (int i = 0; i < SNIFF_BUSES && n < size - 160; i++) {
     const BusState& b = s_bus[i];
-    n += snprintf(buf + n, size - n, "%s{\"bus\":%d,\"present\":%d,\"on\":%d,\"speed\":%lu,\"found\":%d,\"frames\":%lu",
-                  i ? "," : "", i + 1, b.present ? 1 : 0, b.on ? 1 : 0, (unsigned long)s_speeds[b.speedIdx],
+    if (i == 0) {               // CAN1 always runs: its own speed and counters, frames = since boot
+      Can1Stats st = can1Stats();
+      n += snprintf(buf + n, size - n, "{\"bus\":1,\"present\":1,\"on\":%d,\"speed\":%lu,\"found\":%d,\"frames\":%lu,"
+                    "\"missed\":%lu,\"overrun\":%lu,\"buserr\":%lu}", st.running ? 1 : 0, (unsigned long)st.kbit,
+                    st.speedFound ? 1 : 0, (unsigned long)st.frames, (unsigned long)st.rxMissed,
+                    (unsigned long)st.rxOverrun, (unsigned long)st.busErr);
+      continue;
+    }
+    n += snprintf(buf + n, size - n, ",{\"bus\":%d,\"present\":%d,\"on\":%d,\"speed\":%lu,\"found\":%d,\"frames\":%lu",
+                  i + 1, b.present ? 1 : 0, b.on ? 1 : 0, (unsigned long)s_speeds[b.speedIdx],
                   b.speedFound ? 1 : 0, (unsigned long)b.frames);
-    if (i == 0) {
-      twai_status_info_t st = {};
-      if (s_twaiRunning) twai_get_status_info(&st);
-      n += snprintf(buf + n, size - n, ",\"missed\":%lu,\"overrun\":%lu,\"buserr\":%lu}",
-                    (unsigned long)st.rx_missed_count, (unsigned long)st.rx_overrun_count,
-                    (unsigned long)st.bus_error_count);
-    } else {
+    {
       McpStats st = mcpFor(i)->stats();
       n += snprintf(buf + n, size - n, ",\"overflow\":%lu,\"errirq\":%lu,\"eflg\":%u,\"rec\":%u}",
                     (unsigned long)st.rxOverflow, (unsigned long)st.errIrq, st.eflg, st.rec);

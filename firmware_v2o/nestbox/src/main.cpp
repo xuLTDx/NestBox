@@ -11,6 +11,7 @@
 #include "max7317.h"
 #include "sdwriter.h"
 #include "sniff.h"
+#include "canbus1.h"
 
 extern const char FW_BUILD_STR[] = __DATE__ " " __TIME__;
 
@@ -121,6 +122,7 @@ void setup()
     Serial.println("[SD] NO CARD - sniff cannot start");
   }
 
+  can1Begin();                                // CAN1 listens all the time (car values; sniff takes its frames)
   sniffInit();
   telemetryBegin(s_bootId, s_sdOk);
 
@@ -133,6 +135,7 @@ void setup()
 void loop()
 {
   webProcess(20);
+  can1Tick();
   int ev = sniffTick();
   if (ev == SNIFF_EV_STARTED) Serial.println("[SNIFF] started");
   wifiTick();

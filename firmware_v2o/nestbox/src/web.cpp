@@ -5,7 +5,7 @@
 //   /api/info                   device, firmware, uptime, SD, sniff, buses (JSON)
 //   /api/control?cmd=...        SNIFF=1[,<min>] | SNIFF=0 | SNIFF? | SNIFF_VEH=<tag> |
 //                               SNIFF_BUSES=<mask 1-7> | SNIFF_PURGE | SDW? | RESTART |
-//                               TEL? | REC_S=<s> | CELL=0|1 | CELL_APN=<apn>
+//                               TEL? | REC_S=<s> | CELL=0|1 | CELL_APN=<apn> | VEH=K0 | CAR?
 //   /api/ota                    raw firmware POST (v1F handlerOTA)
 //   /api/sniff, /api/sniff/live?id=&mask=, /api/sniff/list, /api/sniff/<n>[?from=&to=]
 #include <Arduino.h>
@@ -18,6 +18,7 @@
 #include "sniff.h"
 #include "sdwriter.h"
 #include "page.h"
+#include "cardecode.h"
 
 extern const char FW_BUILD_STR[];
 uint32_t bootId();
@@ -32,6 +33,7 @@ extern char devid[12];
 void telemetrySetCell(bool on);
 bool telemetryCell();
 void telemetrySetApn(const char* apn);
+void telemetrySetVehicle(const char* p);
 
 static HttpParam httpParam;
 
@@ -107,6 +109,16 @@ static int handlerControl(UrlHandlerParam* param)
   } else if (!strncmp(cmd, "REC_S=", 6)) {          // seconds between records (>= 10)
     telemetrySetRecS(strtoul(cmd + 6, nullptr, 10));
     n = snprintf(buf, bufsize, "OK rec_s=%lu", (unsigned long)telemetryRecS());
+  } else if (!strncmp(cmd, "VEH=", 4)) {            // car profile for the CAN1 values: K0 or empty
+    telemetrySetVehicle(cmd + 4);
+    n = snprintf(buf, bufsize, "OK veh=%s", carProfile());
+  } else if (!strncmp(cmd, "CAR?", 4)) {
+    CarValues v = carValues();
+    uint32_t ms = millis();
+    n = snprintf(buf, bufsize, "veh=%s odo=%lu km (%ld ms ago) fuel=%.1f L raw=%u (%ld ms ago) urea=%lu km raw=%02X%02X%02X%02X%02X%02X%02X%02X (%ld ms ago)",
+                 carProfile(), (unsigned long)v.odoKm, v.odoAt ? (long)(ms - v.odoAt) : -1L, v.fuelL, v.fuelRaw,
+                 v.fuelAt ? (long)(ms - v.fuelAt) : -1L, (unsigned long)v.ureaKm, v.urea[0], v.urea[1], v.urea[2],
+                 v.urea[3], v.urea[4], v.urea[5], v.urea[6], v.urea[7], v.ureaAt ? (long)(ms - v.ureaAt) : -1L);
   } else if (!strncmp(cmd, "CELL=", 5)) {           // modem on/off (stored)
     telemetrySetCell(cmd[5] == '1');
     n = snprintf(buf, bufsize, "OK cell=%d", telemetryCell() ? 1 : 0);

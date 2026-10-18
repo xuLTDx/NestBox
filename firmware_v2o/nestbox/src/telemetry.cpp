@@ -23,10 +23,20 @@
 #include "teleclient.h"
 #include "sniff.h"
 #include "cellmodem.h"
+#include "cardecode.h"
+#include "canbus1.h"
 
 #define PID_SD_DIGEST  0x398
 #define SD_DIGEST_MS   600000UL
 #define PID_SNIFF_LEFT 0x393     // sniff minutes left (v1F: the server sees the sniff state)
+// car values (cardecode.cpp); PID numbers as v1F / FleetNest apps/telemetry/pids.py where they exist
+#define PID_ODOMETER   0x1A6     // km (v1F: OBD 0xA6 | 0x100)
+#define PID_FUEL_CAND  0x391     // fuel candidate, 0.1 L (v1F)
+#define PID_FUEL_RAW   0x392     // fuel, raw byte (v1F)
+#define PID_CAN_FRAMES 0x389     // CAN frames received (v1F: CAN - prijate ramce) - here: CAN1 since the last record
+#define PID_UREA_KM    0x39A     // NEW: AdBlue range before start inhibit, km (candidate)
+#define PID_UREA_RAW   0x39B     // NEW: 0x5A8 raw, 8 bytes
+#define CAR_FRESH_MS   5000
 #define ADC_12V_PIN    36        // ADC1 channel 0 (OVMS esp32adc)
 #define ADC_12V_FACTOR 195.7f    // raw / factor = volts (OVMS default system.adc factor12v; this unit NOT calibrated)
 
@@ -46,6 +56,7 @@ static volatile bool s_otaReq;
 void logNetEvent(const char* text) { s_log.logEvent(text); }
 void telemetrySetCell(bool on) { s_cellOn = on; nvs_set_u8(nvs, "CELL", on ? 1 : 0); nvs_commit(nvs); }
 bool telemetryCell() { return s_cellOn; }
+void telemetrySetVehicle(const char* p) { carSetProfile(p); nvs_set_str(nvs, "VEH", carProfile()); nvs_commit(nvs); }
 void telemetrySetApn(const char* apn) { s_cell.setApn(apn); nvs_set_str(nvs, "CELL_APN", apn); nvs_commit(nvs); }
 void otaReadyRequested() { s_otaReq = true; }   // pull-OTA (v1F) not ported yet: logged only
 bool telemetryLogin() { return s_client.login; }
@@ -125,6 +136,23 @@ static void makeRecord()
   if (WiFi.status() == WL_CONNECTED) r.i32(PID_CSQ, WiFi.RSSI());
   else if (s_cellUp) { int q = s_cell.rssi(); if (q) r.i32(PID_CSQ, q); }
   if (sniffActive()) r.u32(PID_SNIFF_LEFT, sniffMinutesLeft());
+  static uint32_t lastFrames;
+  Can1Stats cs = can1Stats();
+  r.u32(PID_CAN_FRAMES, cs.frames - lastFrames);
+  lastFrames = cs.frames;
+  CarValues cv = carValues();
+  uint32_t ms = millis();
+  if (cv.odoAt && ms - cv.odoAt < CAR_FRESH_MS) r.u32(PID_ODOMETER, cv.odoKm);
+  if (cv.fuelAt && ms - cv.fuelAt < CAR_FRESH_MS) {
+    r.u32(PID_FUEL_CAND, (uint32_t)(cv.fuelL * 10 + 0.5f));
+    r.u32(PID_FUEL_RAW, cv.fuelRaw);
+  }
+  if (cv.ureaAt && ms - cv.ureaAt < CAR_FRESH_MS) {
+    r.u32(PID_UREA_KM, cv.ureaKm);
+    uint8_t* u = cv.urea;
+    r.wire.log(PID_UREA_RAW, u, 8);
+    s_log.log(PID_UREA_RAW, u, 8);
+  }
   uint32_t v[6];
   if (txqSdDigestClosed(v)) {
     r.u32n(PID_SD_DIGEST, v, 6);
@@ -216,6 +244,10 @@ void telemetryBegin(uint32_t bootId, bool sdOk)
   if (nvs_open("storage", NVS_READWRITE, &nvs) != ESP_OK) Serial.println("[NVS] storage not open");
   uint32_t r = 60;
   if (nvs_get_u32(nvs, "REC_S", &r) == ESP_OK && r >= 10) s_recS = r;
+  char veh[8] = "K0";
+  size_t vl = sizeof(veh);
+  nvs_get_str(nvs, "VEH", veh, &vl);
+  carSetProfile(veh);
   uint8_t c = 0;
   nvs_get_u8(nvs, "CELL", &c);
   s_cellOn = c == 1;
