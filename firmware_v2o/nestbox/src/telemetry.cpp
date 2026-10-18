@@ -27,6 +27,7 @@
 #include "cellmodem.h"
 #include "cardecode.h"
 #include "canbus1.h"
+#include "ota.h"
 
 #define PID_SD_DIGEST  0x398
 #define SD_DIGEST_MS   600000UL
@@ -69,7 +70,7 @@ void telemetrySetCell(bool on) { s_cellOn = on; nvs_set_u8(nvs, "CELL", on ? 1 :
 bool telemetryCell() { return s_cellOn; }
 void telemetrySetVehicle(const char* p) { carSetProfile(p); nvs_set_str(nvs, "VEH", carProfile()); nvs_commit(nvs); }
 void telemetrySetApn(const char* apn) { s_cell.setApn(apn); nvs_set_str(nvs, "CELL_APN", apn); nvs_commit(nvs); }
-void otaReadyRequested() { s_otaReq = true; }   // pull-OTA (v1F) not ported yet: logged only
+void otaReadyRequested() { s_otaReq = true; otaRequest(); }   // server OTA_READY -> pull-OTA (ota.cpp)
 bool telemetryLogin() { return s_client.login; }
 uint32_t telemetryRecS() { return s_recS; }
 void telemetrySetRecS(uint32_t s) { s_recS = s < 10 ? 10 : s; nvs_set_u32(nvs, "REC_S", s_recS); nvs_commit(nvs); }
@@ -184,6 +185,9 @@ static void makeRecord(int event = 0, time_t when = 0)
     r.wire.log(PID_UREA_RAW, u, 8);
     s_log.log(PID_UREA_RAW, u, 8);
   }
+  uint8_t ota[64];                 // one pending OTA step line per record (v1F PID 0x399)
+  int on = otaTakeStatus(ota, sizeof(ota));
+  if (on) { r.wire.log(0x399, ota, on); s_log.log(0x399, ota, on); }
   uint32_t v[6];
   if (txqSdDigestClosed(v)) {
     r.u32n(PID_SD_DIGEST, v, 6);

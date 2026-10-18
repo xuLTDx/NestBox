@@ -12,6 +12,7 @@
 #include "sdwriter.h"
 #include "sniff.h"
 #include "canbus1.h"
+#include "ota.h"
 
 extern const char FW_BUILD_STR[] = __DATE__ " " __TIME__;
 
@@ -125,6 +126,7 @@ void setup()
   can1Begin();                                // CAN1 listens all the time (car values; sniff takes its frames)
   sniffInit();
   telemetryBegin(s_bootId, s_sdOk);
+  otaBegin();                                 // pull-OTA (needs the NVS handle opened by telemetryBegin)
 
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
