@@ -94,3 +94,27 @@ FleetNest: OVMS sa hlási ako zariadenie typu NestBox_v2O (hodnota `ovms`) – v
 | 2a záznamy do FleetNest cez WiFi (fronta + ACK z v1F) | hotový | nie (na module zajtra; zariadenie treba pridať vo FleetNest) |
 | 2b modem SIM7600G + GNSS | hotový, **vypnutý** (`CELL=1` zapne) | nie – na USB modem možno nenaštartuje, test v aute |
 | pull-OTA (v1F), štart/stop motora, státie, spánok, dekódovanie áut | – | – |
+
+## 6. Spánok a prebúdzanie – NÁVRH na rozhodnutie po teste Peugeota
+
+**Čo platí dnes (overené v kóde):**
+- **v1F** (`telelogger.ino`, `config.h`): po STOP a nehybnosti (`STATIONARY_TIME_TABLE` 10/60/180 s) ide do standby –
+  koprocesor do úsporného režimu, ESP32 meria napätie (prah `ENGINE_OFF_VOLTAGE` 12,8 V) a pri jeho stúpnutí (motor
+  nabíja) sa zobudí; hlásenie polohy každé 3 h (`STANDBY_REPORT_INTERVAL`), voliteľne hlboký spánok s časovačom.
+- **OVMS** (`main/ovms_boot.cpp`): hlboký spánok ESP32 **iba s budením časovačom** (iný zdroj budenia v kóde nie je);
+  hneď po prebudení v zavádzači zmeria 12 V (ADC1 kanál 0 / 195,7) a pod nastavenou hranicou spí znova.
+- **v2O dnes nespí vôbec** – v aute by bežal nepretržite (odber z autobatérie NEMERANÝ).
+
+**Návrh pre v2O (podľa v1F, prebúdzanie podľa toho, čo doska OVMS vie):**
+1. STOP motora (0x208 ticho 10 s) → ešte X minút bdie (dohnať frontu na server, odtlačok SD, uzavrieť súbor).
+2. Spánok: modem vypnúť (AT+CPOF), CAN1 vysielač už je vypnutý, MCP2515 do sleep, SD odpojiť, ESP32 hlboký spánok.
+3. **Prebudenie** – kandidáti (každý treba overiť na doske):
+   - **časovač** (ako OVMS): každých N minút krátko zobudiť, zmerať 12 V a pozrieť CAN1 – je auto hore?; každé 3 h
+     hlásenie polohy (ako v1F);
+   - **napätie** 12 V nad prahom (motor nabíja) – iba pri prebudení časovačom (ESP32 v spánku ADC nesleduje);
+   - **prevádzka na CAN** – MCP2515 má budenie zo spánku pri aktivite na zbernici a jeho INT je na GPIO 34/35, ktoré
+     vedia budiť ESP32 (NEOVERENÉ: dátový list MCP2515 ani zapojenie som v tomto rozhovore nečítal) – na CAN2 by
+     muselo byť niečo, čo sa pri odomknutí auta zobudí;
+4. Odber v spánku a pri krátkom prebúdzaní **zmerať** (USB merač / v aute) – podľa toho interval N.
+
+**Na rozhodnutie po teste:** ktorá zbernica sa v Peugeote budí prvá (odomknutie, dvere) – ukáže nahrávka 3/8 a 6/14.
