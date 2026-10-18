@@ -1,6 +1,6 @@
 // Pull-OTA - NestBox_v2O step C. The v1F way (telelogger.ino performPullOtaCheck /
-// performPullOtaFlash, server freematics-ota ota_server.py):
-//   GET https://<host>:<port>/api/freematics/ota_pull/<token>/meta.json?build=<build>&variant=NestBox_v2O
+// performPullOtaFlash, server nestbox-ota ota_server.py, was freematics-ota):
+//   GET https://<host>:<port>/api/nestbox/ota/<token>/meta.json?build=<build>&variant=NestBox_v2O
 //     -> {"available":true,"size":N,"sha256":"..."} when the registry's target build is newer;
 //   GET .../firmware.bin (Range: bytes=N- to resume) into /ota_fw.bin on SD, SHA256 over the
 //     whole file, /ota_resume.txt "<size>\n<sha256>" identifies a partial download;

@@ -151,7 +151,7 @@ static void check()
   if (WiFi.status() != WL_CONNECTED) { otaLog("OTA-PULL STOP no wifi (cell OTA not yet in v2O)"); return; }
   if (s_staged) { otaLog("OTA-PULL STAGED waits for engine off"); return; }
   char path[300];
-  snprintf(path, sizeof(path), "/api/freematics/ota_pull/%s/meta.json?build=%s&variant=%s", s_token,
+  snprintf(path, sizeof(path), "/api/nestbox/ota/%s/meta.json?build=%s&variant=%s", s_token,
            urlBuild().c_str(), OTA_VARIANT);
   WiFiClientSecure c;
   long len = 0;
@@ -220,7 +220,7 @@ static void check()
     snprintf(m, sizeof(m), "OTA-PULL RESUME from %u", (unsigned)from);
     otaLog(m);
   }
-  snprintf(path, sizeof(path), "/api/freematics/ota_pull/%s/firmware.bin", s_token);
+  snprintf(path, sizeof(path), "/api/nestbox/ota/%s/firmware.bin", s_token);
   code = httpGet(c, path, from, &len);
   size_t written = from;
   uint32_t t0 = millis();
@@ -273,7 +273,7 @@ static void check()
   File mf = SD.open(OTA_META_PATH, FILE_WRITE);
   if (mf) { mf.printf("%u\n", (unsigned)size); mf.close(); }
   sdUnlock();
-  snprintf(path, sizeof(path), "/api/freematics/ota_pull/%s/ota_confirm?size=%u&sha256=%.16s", s_token,
+  snprintf(path, sizeof(path), "/api/nestbox/ota/%s/ota_confirm?size=%u&sha256=%.16s", s_token,
            (unsigned)size, hex);
   if (httpGet(c, path, 0, &len) == 200) otaLog("OTA-PULL CONFIRMED");
   c.stop();

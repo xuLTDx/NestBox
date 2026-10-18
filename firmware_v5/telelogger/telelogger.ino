@@ -448,14 +448,14 @@ static bool syncKnownLocations()
   if (!otaToken[0] || !otaHost[0]) return false;
   if (!WiFi.isConnected()) return false;
 
-  // 2026-09-22: was char path[80] - too small. "/api/freematics/ota_pull/"
+  // 2026-09-22: was char path[80] - too small. "/api/nestbox/ota/"
   // (26) + otaToken (up to 67, see its declaration) + "/locations.csv" (14)
   // + null needs up to 108 bytes; snprintf silently truncated the token/
   // suffix to fit 80, producing a malformed path the server's path parser
   // rejected with 404 - confirmed live (first WiFi sync attempt after
   // deploying this feature got exactly that 404).
   char path[128];
-  snprintf(path, sizeof(path), "/api/freematics/ota_pull/%s/locations.csv", otaToken);
+  snprintf(path, sizeof(path), "/api/nestbox/ota/%s/locations.csv", otaToken);
 
   if (!otaWifiClient.open(otaHost, otaPort)) {
     // TEMP 2026-09-22 diagnostic: "Cannot connect" reproduced 3x in a row
@@ -4539,11 +4539,11 @@ bool performPullOtaCheck()
     }
     buildEnc[bi] = 0;
     snprintf(metaPath, sizeof(metaPath),
-             "/api/freematics/ota_pull/%s/meta.json?build=%s&variant=%s",
+             "/api/nestbox/ota/%s/meta.json?build=%s&variant=%s",
              otaToken, buildEnc, FIRMWARE_VERSION);
   }
 
-  Serial.printf("[OTA-PULL] URL: https://%s:%u/api/freematics/ota_pull/%.8s.../meta.json\n",
+  Serial.printf("[OTA-PULL] URL: https://%s:%u/api/nestbox/ota/%.8s.../meta.json\n",
                 _maskOtaHost(otaHost).c_str(), (unsigned)otaPort, otaToken);
 
   char metaBuf[2048];
@@ -4880,7 +4880,7 @@ bool performPullOtaCheck()
   // ---- Step 2: Download firmware ------------------------------------------
   char fwPath[384];
   snprintf(fwPath, sizeof(fwPath),
-           "/api/freematics/ota_pull/%s/firmware.bin", otaToken);
+           "/api/nestbox/ota/%s/firmware.bin", otaToken);
 
 #if STORAGE == STORAGE_SD
   // --- SD-staging path (default): download to /ota_fw.bin, flash at standby -
@@ -5204,7 +5204,7 @@ bool performPullOtaCheck()
     {
       char _confirmPath[160];
       snprintf(_confirmPath, sizeof(_confirmPath),
-               "/api/freematics/ota_pull/%s/ota_confirm?size=%u&sha256=%.16s",
+               "/api/nestbox/ota/%s/ota_confirm?size=%u&sha256=%.16s",
                otaToken, (unsigned)fwSize, fwSha256Hex[0] ? fwSha256Hex : "-");
       int _confirmCode = -1;
       if (useCell) {
@@ -5466,7 +5466,7 @@ bool performPullOtaCheck()
   {
     char _confirmPath[160];
     snprintf(_confirmPath, sizeof(_confirmPath),
-             "/api/freematics/ota_pull/%s/ota_confirm?size=%u&sha256=%.16s",
+             "/api/nestbox/ota/%s/ota_confirm?size=%u&sha256=%.16s",
              otaToken, (unsigned)written, fwSha256Hex[0] ? fwSha256Hex : "-");
     if (otaWifiClient.open(otaHost, otaPort) &&
         otaWifiClient.send(METHOD_GET, _confirmPath)) {
