@@ -1,4 +1,7 @@
-# Freematics telelogger — firmware architecture
+# NestBox_v1F (Freematics telelogger) — firmware architecture
+
+**Name since 2026-10-18: NestBox_v1F** (our firmware on Freematics ONE+ hardware; repo `xuLTDx/NestBox`,
+before `xuLTDx/Freematics-test`). "Freematics" below means the hardware or the original upstream code.
 
 `firmware_v5/telelogger/` (ESP32, Freematics ONE+, VW Passat B8). Part A is
 the full firmware — every subsystem, not just the ones touched this

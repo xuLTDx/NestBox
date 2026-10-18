@@ -15,6 +15,9 @@
 * THE SOFTWARE.
 ******************************************************************************/
 
+// NestBox_v1F (2026-10-18): this firmware for Freematics ONE+ hardware, heavily reworked for
+// FleetNest - see ARCHITECTURE.md. The original header above is kept (BSD license).
+
 #include <Arduino.h>
 #include <Update.h>
 #include <SPIFFS.h>

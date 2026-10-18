@@ -1,9 +1,17 @@
-# Freematics ONE+ telelogger — Traccar fork
+# NestBox
 
-Firmware for a [Freematics ONE+](https://freematics.com/products/freematics-one-plus/)
-running in a VW Passat B8. It logs OBD, GPS and device data to the SD card, sends it
-live to a self-hosted [Traccar](https://www.traccar.org) server, and updates itself
-over WiFi or cellular from a self-hosted OTA server.
+In-car device firmware for the **FleetNest** fleet system (`xuLTDx/FleetNest`).
+Name: generation + hardware letter.
+
+| Name | Hardware | State |
+|---|---|---|
+| **NestBox_v1F** | [Freematics ONE+](https://freematics.com/products/freematics-one-plus/) | in use (VW Passat B8), this repo's `firmware_v5/telelogger/` |
+| **NestBox_v2O** | OVMS v3 | planned: only the v1F skeleton and our verified code (delivery queue + server ACK, SD digest, server messages, resumable OTA, sniff), features added one at a time; OVMS code only as a reference for drivers |
+
+NestBox_v1F logs OBD, GPS and device data to the SD card, sends it live to FleetNest
+(UDP, the Freematics message format) and updates itself over WiFi or cellular from a
+self-hosted OTA server. Until 2026-10-14 the server was a Traccar fork; some text below
+still says Traccar where FleetNest now does the same job.
 
 The firmware lives in [`firmware_v5/telelogger/`](firmware_v5/telelogger/). How it works
 internally, subsystem by subsystem: [`firmware_v5/telelogger/ARCHITECTURE.md`](firmware_v5/telelogger/ARCHITECTURE.md).
@@ -28,7 +36,7 @@ internally, subsystem by subsystem: [`firmware_v5/telelogger/ARCHITECTURE.md`](f
 - **Local HTTP API and web page** (port 80, also over the device's own fallback access
   point): live sensor values (`/api/live`, `live.html`), runtime settings
   (`/api/control?cmd=KEY=value`), SD log files (`/api/list`, `/api/log`, …).
-- **Bluetooth** configuration service (NimBLE).
+- **No Bluetooth** since 2026-10-12 (removed, see `platformio.ini`).
 
 ## Hardware
 
@@ -60,7 +68,9 @@ pio run -t uploadfs      # web files in dashboard/ (live.html, …)
 
 Kept in separate repositories:
 
-- **Traccar fork**: receives the device's UDP protocol and adds a Slovak trip logbook
+- **FleetNest** (since 2026-10-14): receives the UDP protocol (ACK after storage),
+  commands (OTA_READY, SNIFF, RESEND), SD = database check (PID 0x398).
+- **Traccar fork** (until 2026-10-14, stopped): received the device's UDP protocol and adds a Slovak trip logbook
   (*Kniha jázd*), business addresses, and odometer calibration from GPS distance.
 - **freematics-ota**: small HTTPS service that serves firmware to the device
   (`meta.json`, `firmware.bin` with resume support), tells it when to update, and
