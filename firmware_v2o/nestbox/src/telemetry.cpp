@@ -311,9 +311,12 @@ void telemetryBegin(uint32_t bootId, bool sdOk)
   uint8_t c = 0;
   nvs_get_u8(nvs, "CELL", &c);
   s_cellOn = c == 1;
-  char apn[40] = "";
+  // APN of the home operator (4ka, as v1F CELL_APN "internet"); it stays the same in roaming -
+  // only the visited network changes, the modem picks it. CELL_APN= overrides (stored).
+  char apn[40] = "internet";
   size_t al = sizeof(apn);
-  if (nvs_get_str(nvs, "CELL_APN", apn, &al) == ESP_OK) s_cell.setApn(apn);   // empty = the network's default APN
+  nvs_get_str(nvs, "CELL_APN", apn, &al);
+  s_cell.setApn(apn);
   s_cell.begin();
   genDeviceID(devid);
   Serial.printf("[TEL] device ID %s\n", devid);

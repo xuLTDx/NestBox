@@ -167,6 +167,7 @@ static inline int nbReadLine(char* out, int cap, uint32_t seq, const NbRead* r, 
 #ifdef ARDUINO
 #include <Arduino.h>
 
+#define NB_READ_RESULT_Q 8             // results waiting for records (one per record, oldest first)
 struct NbReadState {
   portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
   char lastCmd[48] = "";
@@ -175,22 +176,27 @@ struct NbReadState {
   bool pending = false;          // a request waits for the bus owner
   NbRead req;
   uint32_t reqSeq = 0;
-  bool resultReady = false;      // a result waits for the next record
-  uint8_t rec[3 + NB_READ_RECORD_MAX];
-  int recLen = 0;
+  // results for the records: a queue - several commands can come within one record interval
+  // (2026-10-18 desk test: with one slot #1 and #2 were overwritten by #3 before a record went)
+  uint8_t rec[NB_READ_RESULT_Q][3 + NB_READ_RECORD_MAX];
+  int recLen[NB_READ_RESULT_Q];
+  uint8_t head = 0, count = 0;
 };
 extern NbReadState g_nbRead;   // the one instance: nbread.cpp
 
 static inline void nbReadSetResult(uint32_t seq, int result, uint8_t nrc, const uint8_t* resp, int len)
 {
   portENTER_CRITICAL(&g_nbRead.mux);
-  g_nbRead.rec[0] = (uint8_t)seq;
-  g_nbRead.rec[1] = (uint8_t)result;
-  g_nbRead.rec[2] = nrc;
+  uint8_t slot = (g_nbRead.head + g_nbRead.count) % NB_READ_RESULT_Q;
+  if (g_nbRead.count == NB_READ_RESULT_Q) g_nbRead.head = (g_nbRead.head + 1) % NB_READ_RESULT_Q;  // full: drop the oldest
+  else g_nbRead.count++;
+  uint8_t* r = g_nbRead.rec[slot];
+  r[0] = (uint8_t)seq;
+  r[1] = (uint8_t)result;
+  r[2] = nrc;
   int n = len < NB_READ_RECORD_MAX ? len : NB_READ_RECORD_MAX;
-  if (n > 0) memcpy(g_nbRead.rec + 3, resp, n);
-  g_nbRead.recLen = 3 + (n > 0 ? n : 0);
-  g_nbRead.resultReady = true;
+  if (n > 0) memcpy(r + 3, resp, n);
+  g_nbRead.recLen[slot] = 3 + (n > 0 ? n : 0);
   portEXIT_CRITICAL(&g_nbRead.mux);
 }
 
@@ -227,15 +233,17 @@ static inline bool nbReadTake(NbRead* r, uint32_t* seq)
   return got;
 }
 
-// the record's PID 0x39D bytes; 0 = nothing new
+// the record's PID 0x39D bytes, the oldest waiting result; 0 = nothing new
 static inline int nbReadForRecord(uint8_t* out, int cap)
 {
   int n = 0;
   portENTER_CRITICAL(&g_nbRead.mux);
-  if (g_nbRead.resultReady) {
-    n = g_nbRead.recLen < cap ? g_nbRead.recLen : cap;
-    memcpy(out, g_nbRead.rec, n);
-    g_nbRead.resultReady = false;
+  if (g_nbRead.count) {
+    int l = g_nbRead.recLen[g_nbRead.head];
+    n = l < cap ? l : cap;
+    memcpy(out, g_nbRead.rec[g_nbRead.head], n);
+    g_nbRead.head = (g_nbRead.head + 1) % NB_READ_RESULT_Q;
+    g_nbRead.count--;
   }
   portEXIT_CRITICAL(&g_nbRead.mux);
   return n;
