@@ -5,7 +5,7 @@
 //   /api/info                   device, firmware, uptime, SD, sniff, buses (JSON)
 //   /api/control?cmd=...        SNIFF=1[,<min>] | SNIFF=0 | SNIFF? | SNIFF_VEH=<tag> |
 //                               SNIFF_BUSES=<mask 1-7> | SNIFF_PURGE | SDW? | RESTART |
-//                               TEL? | REC_S=<s>
+//                               TEL? | REC_S=<s> | CELL=0|1 | CELL_APN=<apn>
 //   /api/ota                    raw firmware POST (v1F handlerOTA)
 //   /api/sniff, /api/sniff/live?id=&mask=, /api/sniff/list, /api/sniff/<n>[?from=&to=]
 #include <Arduino.h>
@@ -29,6 +29,9 @@ void telemetrySetRecS(uint32_t s);
 uint32_t telemetryRecS();
 bool telemetryLogin();
 extern char devid[12];
+void telemetrySetCell(bool on);
+bool telemetryCell();
+void telemetrySetApn(const char* apn);
 
 static HttpParam httpParam;
 
@@ -104,6 +107,12 @@ static int handlerControl(UrlHandlerParam* param)
   } else if (!strncmp(cmd, "REC_S=", 6)) {          // seconds between records (>= 10)
     telemetrySetRecS(strtoul(cmd + 6, nullptr, 10));
     n = snprintf(buf, bufsize, "OK rec_s=%lu", (unsigned long)telemetryRecS());
+  } else if (!strncmp(cmd, "CELL=", 5)) {           // modem on/off (stored)
+    telemetrySetCell(cmd[5] == '1');
+    n = snprintf(buf, bufsize, "OK cell=%d", telemetryCell() ? 1 : 0);
+  } else if (!strncmp(cmd, "CELL_APN=", 9)) {       // empty = the network's default
+    telemetrySetApn(cmd + 9);
+    n = snprintf(buf, bufsize, "OK apn=%s (next modem start)", cmd + 9);
   } else if (!strcmp(cmd, "SDW?")) {
     n = sdwStatus(buf, bufsize);
   } else if (!strcmp(cmd, "RESTART")) {

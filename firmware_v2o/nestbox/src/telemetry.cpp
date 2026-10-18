@@ -4,7 +4,9 @@
 // in packets and drops a record only after the server's ACK (stored).
 // Identity of a record = (boot, PID 0 = ms since boot), as v1F.
 //
-// Not yet (later steps): GNSS position (modem, step 2b), engine START/STOP
+// Step 2b: the SIM7600 modem (cellmodem.cpp) as the fallback link and its
+// GNSS in every record - OFF until CELL=1 (/api/control), not tested yet.
+// Not yet (later steps): engine START/STOP
 // and standby (step 3), car values (step 4). Until then a record every
 // REC_S seconds (default 60, /api/control REC_S=) carries the clock time
 // (system clock from NTP / the server's login reply, as v1F does for engine
@@ -20,6 +22,7 @@
 #include "sdwriter.h"
 #include "teleclient.h"
 #include "sniff.h"
+#include "cellmodem.h"
 
 #define PID_SD_DIGEST  0x398
 #define SD_DIGEST_MS   600000UL
@@ -33,10 +36,17 @@ nvs_handle_t nvs;                // txqueue.cpp uses it (v1F: the same "storage"
 static DataLog s_log;
 static TeleClientUDP s_client;
 static WifiLink s_wifi;
+static CellLink s_cell;
+static volatile bool s_cellOn;               // NVS CELL (default 0 until tested on 12 V)
+static volatile bool s_cellUp;
+static GnssFix s_fix;                        // last valid reading
 static volatile uint32_t s_recS = 60;
 static volatile bool s_otaReq;
 
 void logNetEvent(const char* text) { s_log.logEvent(text); }
+void telemetrySetCell(bool on) { s_cellOn = on; nvs_set_u8(nvs, "CELL", on ? 1 : 0); nvs_commit(nvs); }
+bool telemetryCell() { return s_cellOn; }
+void telemetrySetApn(const char* apn) { s_cell.setApn(apn); nvs_set_str(nvs, "CELL_APN", apn); nvs_commit(nvs); }
 void otaReadyRequested() { s_otaReq = true; }   // pull-OTA (v1F) not ported yet: logged only
 bool telemetryLogin() { return s_client.login; }
 uint32_t telemetryRecS() { return s_recS; }
@@ -44,8 +54,9 @@ void telemetrySetRecS(uint32_t s) { s_recS = s < 10 ? 10 : s; nvs_set_u32(nvs, "
 uint32_t telemetryFileId() { return s_log.id(); }
 int telemetryStatus(char* buf, int size)
 {
-  int n = snprintf(buf, size, "devid=%s login=%d link=%s tx=%lu txB=%lu rxB=%lu file=%lu rec_s=%lu ota_req=%d ",
-                   devid, s_client.login ? 1 : 0, s_wifi.up() ? "WIFI" : "-", (unsigned long)s_client.txCount,
+  int n = snprintf(buf, size, "devid=%s login=%d link=%s cell=%d/%s fix=%d sats=%u tx=%lu txB=%lu rxB=%lu file=%lu rec_s=%lu ota_req=%d ",
+                   devid, s_client.login ? 1 : 0, s_client.link ? s_client.link->name() : "-", s_cellOn ? 1 : 0,
+                   s_cell.status(), s_fix.valid ? 1 : 0, (unsigned)s_fix.sats, (unsigned long)s_client.txCount,
                    (unsigned long)s_client.txBytes, (unsigned long)s_client.rxBytes, (unsigned long)s_log.id(),
                    (unsigned long)s_recS, s_otaReq ? 1 : 0);
   txqStatus(buf + n, size - n);
@@ -83,8 +94,27 @@ static void makeRecord()
   static uint32_t lastDigest;
   uint32_t ts = millis();
   r.begin(ts);
+  GnssFix g;
+  if (s_cellOn && s_cell.gnss(&g)) s_fix = g;
+  bool fresh = s_fix.valid && millis() - s_fix.at < 5000;
+  if (fresh) {                   // as v1F processGPS(): the GNSS time also sets the clock
+    struct tm t = {};
+    t.tm_mday = s_fix.date / 10000; t.tm_mon = (s_fix.date / 100) % 100 - 1; t.tm_year = s_fix.date % 100 + 100;
+    t.tm_hour = s_fix.time / 1000000; t.tm_min = (s_fix.time / 10000) % 100; t.tm_sec = (s_fix.time / 100) % 100;
+    time_t gnow = mktime(&t), now0 = time(nullptr);
+    if (gnow > 1735689600 && (now0 > gnow + 2 || now0 < gnow - 2)) { struct timeval tv = {gnow, 0}; settimeofday(&tv, nullptr); }
+    r.u32(0x10, s_fix.time);
+    r.u32(0x11, s_fix.date);
+    r.f(PID_GPS_LATITUDE, s_fix.lat, "%f");
+    r.f(PID_GPS_LONGITUDE, s_fix.lng, "%f");
+    r.f(PID_GPS_ALTITUDE, s_fix.alt, "%.1f");
+    r.f(PID_GPS_SPEED, s_fix.kph, "%.1f");
+    r.u32(PID_GPS_HEADING, s_fix.heading);
+    if (s_fix.sats) r.u32(PID_GPS_SAT_COUNT, s_fix.sats);
+    if (s_fix.hdop > 0) r.u32(PID_GPS_HDOP, (uint32_t)(s_fix.hdop + 0.5f));
+  }
   time_t now = time(nullptr);
-  if (now > 1735689600) {        // a valid clock: date and time as v1F addTimeOf()
+  if (!fresh && now > 1735689600) {   // no fix: date and time from the clock as v1F addTimeOf()
     struct tm u;
     gmtime_r(&now, &u);
     r.u32(0x10, (uint32_t)u.tm_hour * 1000000 + u.tm_min * 10000 + u.tm_sec * 100);
@@ -93,6 +123,7 @@ static void makeRecord()
   r.f(PID_BATTERY_VOLTAGE, read12V() * 100, "%.0f");    // v1F: 0.01 V units (FleetNest: /100 V)
   r.i32(PID_DEVICE_TEMP, (int32_t)((temprature_sens_read() - 32) / 1.8f));
   if (WiFi.status() == WL_CONNECTED) r.i32(PID_CSQ, WiFi.RSSI());
+  else if (s_cellUp) { int q = s_cell.rssi(); if (q) r.i32(PID_CSQ, q); }
   if (sniffActive()) r.u32(PID_SNIFF_LEFT, sniffMinutesLeft());
   uint32_t v[6];
   if (txqSdDigestClosed(v)) {
@@ -116,23 +147,48 @@ static void recordTask(void*)
   }
 }
 
+// the modem: started when CELL=1, again every 5 min after a failure
+static void cellTask(void*)
+{
+  uint32_t lastTry = 0;
+  for (;;) {
+    if (s_cellOn && !s_cellUp && (!lastTry || millis() - lastTry > 300000UL)) {
+      lastTry = millis();
+      logNetEvent("CELL START");
+      s_cellUp = s_cell.start();
+      char m[120];
+      snprintf(m, sizeof(m), "CELL %s", s_cell.status());
+      logNetEvent(m);
+    }
+    if (!s_cellOn && s_cellUp) { s_cellUp = false; s_cell.stop(); logNetEvent("CELL OFF"); }
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+}
+
 // the net task (v1F telemetry(): delivery part)
 static void netTask(void*)
 {
   static char pkt[TXQ_PACKET_BUF];
-  s_client.setLink(&s_wifi);
   s_client.reset();
-  bool wasUp = false;
+  NetLink* cur = nullptr;
   for (;;) {
-    bool up = s_wifi.up();
-    if (!up) {
-      if (wasUp) { s_client.login = false; s_wifi.close(); Serial.println("[NET] WiFi down"); }
-      wasUp = false;
+    // WiFi first, the modem when WiFi is not there (v1F: cellular fallback)
+    NetLink* want = s_wifi.up() ? (NetLink*)&s_wifi : (s_cellUp ? (NetLink*)&s_cell : nullptr);
+    if (want != cur) {
+      if (cur) cur->close();
+      s_client.login = false;
+      cur = want;
+      s_client.setLink(cur);
+      char m[40];
+      snprintf(m, sizeof(m), "NET LINK %s", cur ? cur->name() : "none");
+      Serial.println(m);
+      logNetEvent(m);
+    }
+    if (!cur) {
       vTaskDelay(pdMS_TO_TICKS(1000));
       continue;
     }
-    if (!wasUp || !s_client.login) {
-      wasUp = true;
+    if (!s_client.login) {
       if (!s_client.connect()) { vTaskDelay(pdMS_TO_TICKS(10000)); continue; }
       Serial.printf("[NET] logged in as %s\n", devid);
     }
@@ -160,6 +216,13 @@ void telemetryBegin(uint32_t bootId, bool sdOk)
   if (nvs_open("storage", NVS_READWRITE, &nvs) != ESP_OK) Serial.println("[NVS] storage not open");
   uint32_t r = 60;
   if (nvs_get_u32(nvs, "REC_S", &r) == ESP_OK && r >= 10) s_recS = r;
+  uint8_t c = 0;
+  nvs_get_u8(nvs, "CELL", &c);
+  s_cellOn = c == 1;
+  char apn[40] = "";
+  size_t al = sizeof(apn);
+  if (nvs_get_str(nvs, "CELL_APN", apn, &al) == ESP_OK) s_cell.setApn(apn);   // empty = the network's default APN
+  s_cell.begin();
   genDeviceID(devid);
   Serial.printf("[TEL] device ID %s\n", devid);
   txqBegin(bootId);
@@ -177,6 +240,7 @@ void telemetryBegin(uint32_t bootId, bool sdOk)
   }
   xTaskCreatePinnedToCore(recordTask, "record", 4096, nullptr, 2, nullptr, 1);
   xTaskCreatePinnedToCore(netTask, "net", 8192, nullptr, 2, nullptr, 1);
+  xTaskCreatePinnedToCore(cellTask, "cell", 6144, nullptr, 2, nullptr, 1);
 }
 
 void telemetryBeforeRestart()

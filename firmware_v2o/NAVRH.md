@@ -85,3 +85,12 @@ volaní): `sys.*` (GPS, linka ku koprocesoru, bzučiak), `obd.*` (OBD cez koproc
 
 **Pred testom Peugeota stačí bod 1** (sniff 3 zberníc); v aute zároveň v1F na 6/14 ako meradlo.
 FleetNest: OVMS sa hlási ako zariadenie typu NestBox_v2O (hodnota `ovms`) – vlastné ID z MAC.
+
+## 5. Stav (2026-10-18 večer)
+
+| Krok | Kód | Overené |
+|---|---|---|
+| 1 hardvér + sniff 3 zberníc + WiFi + web + OTA (push) | hotový (`nestbox/`) | na module cez NAS: štart, SD, WiFi, oba MCP2515 odpovedajú, OTA cez WiFi, záťaž 3000 rámcov/s 5 min bez straty, tvrdý reset uprostred zápisu bez diery. **Otvorené:** po resete zvonka štart do režimu nahrávania (podozrenie MAX7317 0x0A, odstránené, neoverené). CAN rámce z auta – Peugeot |
+| 2a záznamy do FleetNest cez WiFi (fronta + ACK z v1F) | hotový | nie (na module zajtra; zariadenie treba pridať vo FleetNest) |
+| 2b modem SIM7600G + GNSS | hotový, **vypnutý** (`CELL=1` zapne) | nie – na USB modem možno nenaštartuje, test v aute |
+| pull-OTA (v1F), štart/stop motora, státie, spánok, dekódovanie áut | – | – |
