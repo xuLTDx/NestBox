@@ -107,6 +107,7 @@ void Mcp2515::service()
       memcpy(f.data, r + 6, 8);
       m_st.frames++;
       if (m_fn) m_fn(m_bus, f);
+      if (m_capId && f.id == m_capId && !f.ext && m_cap) xQueueSend(m_cap, &f, 0);
     }
     // errors: overflow = a frame lost in the chip; count it, clear the flags
     uint8_t intf = readReg(REG_CANINTF);
@@ -153,6 +154,7 @@ bool Mcp2515::begin(CanRxFn fn)
 bool Mcp2515::start(uint32_t kbit)
 {
   if (!m_present) return false;
+  m_kbit = kbit;
   stop();
   uint8_t r = CMD_RESET;
   spiXfer(m_cs, &r, nullptr, 1);
@@ -196,4 +198,56 @@ void Mcp2515::stop()
   gpio_intr_disable((gpio_num_t)m_int);
   writeReg(REG_CANINTE, 0);
   setMode(MODE_SLEEP);
+}
+
+// ---- READ exchange -------------------------------------------------------
+#define REG_TXB0CTRL 0x30
+#define CMD_LOAD_TX0 0x40     // load TX buffer 0 from TXB0SIDH
+#define CMD_RTS_TX0  0x81
+#define MODE_NORMAL  0x00
+
+bool Mcp2515::exchangeBegin(uint32_t kbit, uint32_t rxId)
+{
+  if (!m_present) return false;
+  m_wasRunning = m_running;
+  if (!m_running && !start(kbit)) return false;
+  if (!m_cap) m_cap = xQueueCreate(8, sizeof(CanRx));
+  xQueueReset(m_cap);
+  m_capId = rxId;                             // before the request goes out: the reply can be quick
+  writeReg(REG_BFPCTRL, 0x0C);               // transceiver transmitter on (OVMS SetTransceiverMode ACTIVE)
+  return setMode(MODE_NORMAL);
+}
+
+bool Mcp2515::sendFrame(uint32_t id, const uint8_t d[8])
+{
+  uint8_t o[14] = {CMD_LOAD_TX0, (uint8_t)(id >> 3), (uint8_t)(id << 5), 0, 0, 8};
+  memcpy(o + 6, d, 8);
+  spiXfer(m_cs, o, nullptr, 14);
+  uint8_t rts = CMD_RTS_TX0;
+  spiXfer(m_cs, &rts, nullptr, 1);
+  for (int i = 0; i < 25; i++) {              // up to ~50 ms for the frame to leave
+    if (!(readReg(REG_TXB0CTRL) & 0x08)) return true;   // TXREQ cleared = sent
+    delay(2);
+  }
+  bitModify(REG_CANCTRL, 0x10, 0x10);         // abort (ABAT): never repeated on the bus
+  delay(2);
+  bitModify(REG_CANCTRL, 0x10, 0x00);
+  return false;
+}
+
+bool Mcp2515::waitFrame(uint32_t id, uint8_t d[8], uint8_t* dlc, uint32_t timeoutMs)
+{
+  (void)id;                                   // m_capId set by exchangeBegin()
+  CanRx f;
+  bool got = m_cap && xQueueReceive(m_cap, &f, pdMS_TO_TICKS(timeoutMs)) == pdTRUE;
+  if (got) { memcpy(d, f.data, 8); *dlc = f.dlc; }
+  return got;
+}
+
+void Mcp2515::exchangeEnd()
+{
+  m_capId = 0;
+  writeReg(REG_BFPCTRL, 0x3C);               // transmitter off
+  if (m_wasRunning) setMode(MODE_LISTEN);
+  else stop();
 }

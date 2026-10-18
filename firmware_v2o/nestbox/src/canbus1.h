@@ -21,3 +21,8 @@ void can1Begin();
 void can1Tick();               // loop(): speed probe
 Can1Stats can1Stats();
 void can1SetSniffHook(Can1Fn fn);   // null = sniff off
+// READ command (nbread.h): for the exchange only the controller runs in normal mode and the
+// transceiver's transmitter is on; then listen-only again. Frames meanwhile still reach the
+// car decoder and the sniff. Returns NbReadResult.
+struct NbRead;
+int can1Exchange(const NbRead* r, uint8_t* resp, int cap, int* respLen, uint8_t* nrc);

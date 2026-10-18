@@ -40,6 +40,7 @@ uint32_t bootId() { return s_bootId; }
 void telemetryEarly();
 void telemetryBegin(uint32_t bootId, bool sdOk);
 void telemetryBeforeRestart();
+void readTick();
 
 // before every deliberate restart: the sniff file ends properly (v1F prepareRestart)
 void prepareRestart(const char* why)
@@ -138,6 +139,7 @@ void loop()
 {
   webProcess(20);
   can1Tick();
+  readTick();                                 // READ command: the request waiting for the bus
   int ev = sniffTick();
   if (ev == SNIFF_EV_STARTED) Serial.println("[SNIFF] started");
   wifiTick();

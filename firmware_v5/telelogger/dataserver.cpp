@@ -39,6 +39,7 @@
 #include <Update.h>
 #include <httpd.h>
 #include "config.h"
+#include "nbread.h"
 
 #if ENABLE_HTTPD
 
@@ -788,6 +789,11 @@ int handlerControl(UrlHandlerParam* param)
         const char* c = strchr(cmd + 6, ',');
         sniffRequest(cmd[6] == '1', c ? (uint16_t)atoi(c + 1) : 0);
         n = snprintf(buf, bufsize, "OK");
+    } else if (!strncmp(cmd, "READ=", 5)) {  // one read request into the car (nbread.h)
+        uint32_t seq = 0;
+        int r = nbReadSubmit(cmd + 5, &seq);
+        n = snprintf(buf, bufsize, r ? "ERR %d (#%u; 10 syntax, 11 not a reading service)" : "OK #%u - result in the next record (PID 0x39D) and the SD log",
+                     r ? r : (int)seq, (unsigned)seq);
     } else if (!strcmp(cmd, "SNIFF?")) {
         n = sniffStatus(buf, bufsize);
     } else if (!strncmp(cmd, "SNIFF_SEND=", 11)) {  // <id hex>,<data hex bytes>: one frame on purpose

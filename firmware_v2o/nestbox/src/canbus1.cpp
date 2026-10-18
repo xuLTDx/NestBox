@@ -4,6 +4,7 @@
 #include "esp_timer.h"
 #include "max7317.h"
 #include "hw.h"
+#include "nbread.h"
 
 void carDecode(uint32_t id, bool ext, uint8_t dlc, const uint8_t* data);   // cardecode.cpp
 
@@ -26,13 +27,13 @@ static twai_timing_config_t timingFor(uint32_t kbit)
   }
 }
 
-static bool start()
+static bool start(bool active = false)
 {
-  mx7317Out(MX_CAN1_RS, 1);                   // transmitter off
+  mx7317Out(MX_CAN1_RS, active ? 0 : 1);      // transmitter off, except for a READ exchange
   twai_general_config_t g = TWAI_GENERAL_CONFIG_DEFAULT((gpio_num_t)HW_CAN1_TX, (gpio_num_t)HW_CAN1_RX,
-                                                        TWAI_MODE_LISTEN_ONLY);
+                                                        active ? TWAI_MODE_NORMAL : TWAI_MODE_LISTEN_ONLY);
   g.rx_queue_len = 128;
-  g.tx_queue_len = 0;
+  g.tx_queue_len = active ? 2 : 0;
   twai_timing_config_t t = timingFor(s_speeds[s_speedIdx]);
   twai_filter_config_t f = TWAI_FILTER_CONFIG_ACCEPT_ALL();
   if (twai_driver_install(&g, &t, &f) != ESP_OK) return false;
@@ -119,3 +120,49 @@ Can1Stats can1Stats()
 }
 
 void can1SetSniffHook(Can1Fn fn) { s_hook = fn; }
+
+// ---- READ exchange -------------------------------------------------------
+static bool xSend(void*, uint32_t id, const uint8_t d[8])
+{
+  twai_message_t m = {};
+  m.identifier = id;
+  m.ss = 1;                                   // single shot: an unanswered frame is not repeated (v1F canodo)
+  m.data_length_code = 8;
+  memcpy(m.data, d, 8);
+  return twai_transmit(&m, pdMS_TO_TICKS(20)) == ESP_OK;
+}
+
+static bool xRecv(void*, uint32_t id, uint8_t d[8], uint8_t* dlc, uint32_t timeoutMs)
+{
+  uint32_t t0 = millis();
+  while (millis() - t0 < timeoutMs) {
+    twai_message_t m;
+    if (twai_receive(&m, pdMS_TO_TICKS(20)) != ESP_OK) continue;
+    uint8_t n = m.data_length_code > 8 ? 8 : m.data_length_code;
+    s_frames++;
+    s_lastMs = millis();
+    carDecode(m.identifier, m.extd, n, m.data);
+    Can1Fn h = s_hook;
+    if (h) h(esp_timer_get_time(), m.identifier, m.extd, n, m.data);
+    if (m.identifier == id && !m.extd) { memset(d, 0, 8); memcpy(d, m.data, n); *dlc = n; return true; }
+  }
+  return false;
+}
+
+int can1Exchange(const NbRead* r, uint8_t* resp, int cap, int* respLen, uint8_t* nrc)
+{
+  xSemaphoreTake(s_mux, portMAX_DELAY);
+  s_pause = true;
+  for (int i = 0; i < 100 && !s_paused; i++) delay(2);
+  stop();
+  int result = NBR_NOT_READY;
+  if (start(true)) {
+    NbCanPort p = {xSend, xRecv, nullptr};
+    result = nbReadExchange(&p, r, resp, cap, respLen, nrc);
+    stop();
+  }
+  start(false);                               // listen only again, transmitter off
+  s_pause = false;
+  xSemaphoreGive(s_mux);
+  return result;
+}

@@ -57,6 +57,11 @@ void canOdoEnd();
 // frame goes out single-shot, so an unanswered frame is not repeated on the
 // bus. Returns true and the km on success; `diag` is filled either way.
 bool canOdoRead(uint32_t* km, CanOdoDiag* diag);
+// READ command (libraries/NestBoxCommon nbread.h, 2026-10-18): one read request on this
+// controller (OBD 6/14), same ISO-TP handling as udsRead(). Returns NbReadResult
+// (NBR_NOT_READY when the controller is not running, e.g. sniff mode / VW_ODO off).
+struct NbRead;
+int canOdoExchange(const NbRead* r, uint8_t* resp, int cap, int* respLen, uint8_t* nrc);
 
 // Fuel block 22 22B0 from the instrument cluster: the data bytes after
 // 62 22 B0 into `data` (up to `cap`), their count in `len`.

@@ -10,6 +10,7 @@
 #include "mcp2515.h"
 #include "max7317.h"
 #include "hw.h"
+#include "nbread.h"
 
 extern const char FW_BUILD_STR[];
 uint32_t bootId();
@@ -754,3 +755,26 @@ int sniffCheck(uint32_t fileNo, char* out, int cap)
   return snprintf(out, cap, "%s", s_checkResult);
 }
 #endif
+
+// ----------------------------------------------------------------- READ ---
+// one READ exchange (nbread.h) on bus 1 (canbus1.cpp) or 2/3 (MCP2515); loop() task
+static bool mSend(void* c, uint32_t id, const uint8_t d[8]) { return ((Mcp2515*)c)->sendFrame(id, d); }
+static bool mRecv(void* c, uint32_t id, uint8_t d[8], uint8_t* dlc, uint32_t t) { return ((Mcp2515*)c)->waitFrame(id, d, dlc, t); }
+
+int busExchange(const NbRead* r, uint8_t* resp, int cap, int* respLen, uint8_t* nrc)
+{
+  if (r->bus == 1) return can1Exchange(r, resp, cap, respLen, nrc);
+  Mcp2515* m = (r->bus == 2 || r->bus == 3) ? mcpFor(r->bus - 1) : nullptr;
+  if (!m || !s_bus[r->bus - 1].present) return NBR_BAD_BUS;
+  xSemaphoreTake(s_canMux, portMAX_DELAY);
+  // the speed the sniff found, else 500 kbit/s (both buses of the Peugeot: Launch 2026-10-12)
+  uint32_t kbit = s_bus[r->bus - 1].speedFound ? s_speeds[s_bus[r->bus - 1].speedIdx] : 500;
+  int result = NBR_NOT_READY;
+  if (m->exchangeBegin(kbit, r->rxId)) {
+    NbCanPort p = {mSend, mRecv, m};
+    result = nbReadExchange(&p, r, resp, cap, respLen, nrc);
+  }
+  m->exchangeEnd();
+  xSemaphoreGive(s_canMux);
+  return result;
+}

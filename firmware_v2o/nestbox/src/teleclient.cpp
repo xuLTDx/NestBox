@@ -4,6 +4,7 @@
 #include "txqueue.h"
 #include "udpmsg.h"
 #include "sniff.h"
+#include "nbread.h"
 #include <sys/time.h>
 
 extern const char FW_BUILD_STR[];
@@ -186,6 +187,14 @@ void TeleClientUDP::onMessage(char* msg, UdpRx* rx)
       sniffRequest(on, min);
       Serial.printf("[UDP] CMD:SNIFF=%d,%u\n", on ? 1 : 0, (unsigned)min);
       logNetEvent(on ? "NET CMD_SNIFF_ON" : "NET CMD_SNIFF_OFF");
+    }
+    if (cmdp && !strncmp(cmdp + 4, "READ=", 5)) {   // one read request into the car (nbread.h)
+      uint32_t seq = 0;
+      int r = nbReadSubmit(cmdp + 9, &seq);
+      char m[64];
+      snprintf(m, sizeof(m), "NET CMD_READ #%u %s", (unsigned)seq, r ? "refused" : "accepted");
+      Serial.println(m);
+      logNetEvent(m);
     }
     if (cmdp && !strncmp(cmdp + 4, "RESEND=", 7)) {
       uint32_t f = (uint32_t)strtoul(cmdp + 11, 0, 10);

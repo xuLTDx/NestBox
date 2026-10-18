@@ -41,6 +41,12 @@ public:
   McpStats stats() const { return m_st; }
   uint8_t bus() const { return m_bus; }
   void service();              // the RX task (internal)
+  // READ command (nbread.h): normal mode + transmitter on for the exchange only
+  bool exchangeBegin(uint32_t kbit, uint32_t rxId);   // starts the bus if it was off; frames from rxId are kept
+  bool sendFrame(uint32_t id, const uint8_t d[8]);
+  bool waitFrame(uint32_t id, uint8_t d[8], uint8_t* dlc, uint32_t timeoutMs);
+  void exchangeEnd();                  // listen only again (or off, as before)
+  uint32_t speed() const { return m_kbit; }
 private:
   uint8_t readReg(uint8_t reg);
   void writeReg(uint8_t reg, uint8_t v);
@@ -53,5 +59,9 @@ private:
   CanRxFn m_fn = nullptr;
   TaskHandle_t m_task = nullptr;
   McpStats m_st = {};
+  uint32_t m_kbit = 500;
+  bool m_wasRunning = false;
+  volatile uint32_t m_capId = 0;               // READ: frames from this ID go to m_cap
+  QueueHandle_t m_cap = nullptr;
   friend void IRAM_ATTR mcpIsr(void*);
 };

@@ -6,7 +6,8 @@
 //   /api/control?cmd=...        SNIFF=1[,<min>] | SNIFF=0 | SNIFF? | SNIFF_VEH=<tag> |
 //                               SNIFF_BUSES=<mask 1-7> | SNIFF_PURGE | SDW? | RESTART |
 //                               TEL? | REC_S=<s> | CELL=0|1 | CELL_APN=<apn> | VEH=K0 | CAR? |
-//                               OTA? | OTA_CHECK | OTA_TOKEN= | OTA_HOST= | OTA_PORT=
+//                               OTA? | OTA_CHECK | OTA_TOKEN= | OTA_HOST= | OTA_PORT= |
+//                               READ=<bus>,<tx hex>,<rx hex>,<request hex>
 //   /api/ota                    raw firmware POST (v1F handlerOTA)
 //   /api/sniff, /api/sniff/live?id=&mask=, /api/sniff/list, /api/sniff/<n>[?from=&to=]
 #include <Arduino.h>
@@ -21,6 +22,7 @@
 #include "page.h"
 #include "cardecode.h"
 #include "ota.h"
+#include "nbread.h"
 
 extern const char FW_BUILD_STR[];
 uint32_t bootId();
@@ -111,6 +113,11 @@ static int handlerControl(UrlHandlerParam* param)
   } else if (!strncmp(cmd, "REC_S=", 6)) {          // seconds between records (>= 10)
     telemetrySetRecS(strtoul(cmd + 6, nullptr, 10));
     n = snprintf(buf, bufsize, "OK rec_s=%lu", (unsigned long)telemetryRecS());
+  } else if (!strncmp(cmd, "READ=", 5)) {           // one read request into the car (nbread.h)
+    uint32_t seq = 0;
+    int r = nbReadSubmit(cmd + 5, &seq);
+    n = snprintf(buf, bufsize, r ? "ERR %d (#%u; 10 syntax, 11 not a reading service)" : "OK #%u - result in the next record (PID 0x39D) and the SD log",
+                 r ? r : (int)seq, (unsigned)seq);
   } else if (!strcmp(cmd, "OTA?")) {
     n = otaStatus(buf, bufsize);
   } else if (!strcmp(cmd, "OTA_CHECK")) {           // pull-OTA check now (as the server's OTA_READY)

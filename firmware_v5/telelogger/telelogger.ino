@@ -38,6 +38,7 @@ extern UpdateClass Update;
 #include "canodo.h"
 #include "sniff.h"
 #include "sdwriter.h"
+#include "nbread.h"          // READ command (libraries/NestBoxCommon)
 #if BOARD_HAS_PSRAM
 #include "esp32/himem.h"
 #endif
@@ -2275,10 +2276,35 @@ static void addTimeOf(CBuffer* b, time_t when)
 
 // The SD fingerprint into a record: a closed file's final one first (once), otherwise the open
 // file's when `now` or SD_DIGEST_MS passed. A few bytes in a record that goes anyway.
+// READ command (libraries/NestBoxCommon/nbread.h, 2026-10-18): the request the server or the
+// local API sent, on the CAN module (OBD 6/14 = bus 1). Only while the module runs (VW_ODO on)
+// and not in sniff mode; the result goes into the next record (PID 0x39D) and the SD log.
+static void readTick()
+{
+  NbRead r;
+  uint32_t seq;
+  if (!nbReadTake(&r, &seq)) return;
+  static uint8_t resp[NB_READ_MAX];
+  int len = 0;
+  uint8_t nrc = 0;
+  int res = r.bus != 1 ? NBR_BAD_BUS : (!s_vwOdoOn || sniffActive()) ? NBR_NOT_READY
+            : canOdoExchange(&r, resp, sizeof(resp), &len, &nrc);
+  nbReadSetResult(seq, res, nrc, resp, len);
+  char line[300];
+  nbReadLine(line, sizeof(line), seq, &r, res, nrc, resp, len);
+  Serial.println(line);
+#if STORAGE != STORAGE_NONE
+  if (state.check(STATE_STORAGE_READY)) logger.logEvent(line);
+#endif
+}
+
 static void addSdDigest(CBuffer* b, bool now)
 {
   static uint32_t lastMs = 0;
   uint32_t v[6];
+  uint8_t rd[3 + NB_READ_RECORD_MAX];   // READ command result (nbread.h), once
+  int rn = nbReadForRecord(rd, sizeof(rd));
+  if (rn) b->add(PID_READ_RESULT, ELEMENT_UINT8, rd, rn, rn);
   uint8_t ota[64];
   int on = takeOtaStatus(ota, sizeof(ota));
   if (on) b->add(PID_OTA_STATUS, ELEMENT_UINT8, ota, on, on);
@@ -2530,6 +2556,7 @@ void process()
 #else
   if (s_engineOn && s_vwOdoOn && !sniffActive() && millis() - s_odoTryMs >= ODO_PERIOD_MS) { odoRead(); fuelRead(); phonesRead(false); }
 #endif
+  readTick();  // READ command (nbread.h): a waiting request on the CAN module
   addOdo(buffer);
   // Engine off: say so explicitly with RPM 0 (the decoder turns it into
   // ignition=false). Without it the RPM PID just stopped coming, Traccar

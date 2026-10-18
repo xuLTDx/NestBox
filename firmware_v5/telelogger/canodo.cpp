@@ -1,5 +1,6 @@
 #include "canodo.h"
 #include "driver/twai.h"
+#include "nbread.h"
 
 #define CANODO_TX_PIN     GPIO_NUM_26
 #define CANODO_RX_PIN     GPIO_NUM_34
@@ -268,4 +269,28 @@ bool canPhonesRead(CanPhones* p, CanOdoDiag* d)
     p->nameLen[i] = k;
   }
   return true;
+}
+
+// ---- READ command (nbread.h) --------------------------------------------
+static bool xSend(void*, uint32_t id, const uint8_t d[8]) { return sendFrame(id, d); }
+static bool xRecv(void*, uint32_t id, uint8_t d[8], uint8_t* dlc, uint32_t timeoutMs)
+{
+  twai_message_t m;
+  if (!waitFrame(id, &m, timeoutMs)) return false;
+  memset(d, 0, 8);
+  uint8_t n = m.data_length_code > 8 ? 8 : m.data_length_code;
+  memcpy(d, m.data, n);
+  *dlc = n;
+  return true;
+}
+
+int canOdoExchange(const NbRead* r, uint8_t* resp, int cap, int* respLen, uint8_t* nrc)
+{
+  *respLen = 0;
+  *nrc = 0;
+  if (!s_ready) return NBR_NOT_READY;
+  recover();
+  countPending();
+  NbCanPort p = {xSend, xRecv, nullptr};
+  return nbReadExchange(&p, r, resp, cap, respLen, nrc);
 }

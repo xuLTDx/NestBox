@@ -28,6 +28,7 @@
 #include "cardecode.h"
 #include "canbus1.h"
 #include "ota.h"
+#include "nbread.h"
 
 #define PID_SD_DIGEST  0x398
 #define SD_DIGEST_MS   600000UL
@@ -185,6 +186,9 @@ static void makeRecord(int event = 0, time_t when = 0)
     r.wire.log(PID_UREA_RAW, u, 8);
     s_log.log(PID_UREA_RAW, u, 8);
   }
+  uint8_t rd[3 + NB_READ_RECORD_MAX];   // READ result (nbread.h, PID 0x39D)
+  int rn = nbReadForRecord(rd, sizeof(rd));
+  if (rn) { r.wire.log(PID_READ_RESULT, rd, rn); s_log.log(PID_READ_RESULT, rd, rn); }
   uint8_t ota[64];                 // one pending OTA step line per record (v1F PID 0x399)
   int on = otaTakeStatus(ota, sizeof(ota));
   if (on) { r.wire.log(0x399, ota, on); s_log.log(0x399, ota, on); }
@@ -338,4 +342,21 @@ void telemetryBeforeRestart()
   s_log.logEvent(st);
   s_log.sync(3000);
   txqSave(true);
+}
+
+// READ command (nbread.h): run a waiting request on its bus; called from loop()
+void readTick()
+{
+  NbRead r;
+  uint32_t seq;
+  if (!nbReadTake(&r, &seq)) return;
+  static uint8_t resp[NB_READ_MAX];
+  int len = 0;
+  uint8_t nrc = 0;
+  int res = busExchange(&r, resp, sizeof(resp), &len, &nrc);
+  nbReadSetResult(seq, res, nrc, resp, len);
+  char line[300];
+  nbReadLine(line, sizeof(line), seq, &r, res, nrc, resp, len);
+  Serial.println(line);
+  s_log.logEvent(line);
 }

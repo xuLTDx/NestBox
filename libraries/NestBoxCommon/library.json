@@ -1,0 +1,7 @@
+{
+  "name": "NestBoxCommon",
+  "version": "1.0.0",
+  "description": "Code shared by NestBox_v1F and NestBox_v2O firmware (READ command)",
+  "frameworks": "arduino",
+  "platforms": "espressif32"
+}

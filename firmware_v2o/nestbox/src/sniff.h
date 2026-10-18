@@ -35,6 +35,10 @@ void sniffSetSdLimit(int pct);
 void sniffSetBuses(uint8_t mask);
 uint8_t sniffBuses();
 
+// READ command exchange on bus 1-3 (nbread.h); returns NbReadResult
+struct NbRead;
+int busExchange(const NbRead* r, uint8_t* resp, int cap, int* respLen, uint8_t* nrc);
+
 // sdwriter side
 int sniffFill(char* buf, int cap, uint32_t* frames, bool* last);
 void sniffConfirmed(uint32_t frames);

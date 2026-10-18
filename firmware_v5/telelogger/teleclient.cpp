@@ -21,6 +21,7 @@
 #include "sniff.h"
 #include "config.h"
 #include "txqueue.h"
+#include "nbread.h"          // READ command (libraries/NestBoxCommon)
 #include "udpmsg.h"          // server messages in one received buffer (WiFi = cellular)
 
 extern int16_t rssi;
@@ -614,6 +615,15 @@ void TeleClientUDP::onMessage(char* msg, UdpRx* rx)
         }
         // SD file sent again (FleetNest found its fingerprint differs from the database):
         // CMD=RESEND=<file> - that file and the later ones, the server drops duplicates
+        // one read request into the car (nbread.h): CMD=READ=<bus>,<tx>,<rx>,<request hex>
+        if (cmdp && !strncmp(cmdp + 4, "READ=", 5)) {
+          uint32_t seq = 0;
+          int r = nbReadSubmit(cmdp + 9, &seq);
+          char m[48];
+          snprintf(m, sizeof(m), "NET CMD_READ #%u %s", (unsigned)seq, r ? "refused" : "accepted");
+          Serial.println(m);
+          logNetEvent(m);
+        }
         if (cmdp && !strncmp(cmdp + 4, "RESEND=", 7)) {
           uint32_t f = (uint32_t)strtoul(cmdp + 11, 0, 10);
           bool started = txqResendRequest(f);
