@@ -11,8 +11,10 @@ Značky: **OVERENÉ** = prečítané v kóde / zmerané; **NEOVERENÉ** = treba 
 
 | Časť | Zapojenie | Poznámka |
 |---|---|---|
-| ESP32 | flash 16 MB, PSRAM áno (veľkosť sa zisťuje pri štarte) | podľa sdkconfig hw31; náš kus NEOVERENÉ |
-| Verzia dosky | hw 3.1 (predvolená) | náš kus NEOVERENÉ – prečítať z modulu |
+| Flash | 16 MB | podľa sdkconfig hw31 a oddielov v3-35 na module |
+| Verzia dosky | **OVMS v3.3**, modem doska OVMS MDM v3.3 (SIM7600G), vyrobené 2026.04.13 | foto 2026-09-30; v kóde OVMS sa v3.3 stavia ako „base 3.1“ (`Kconfig` pozná len 3.0 / 3.1) – piny 3.1 (modem RX 13 / TX 4). Bežiaci firmvér `product v3.3-5` modem SIM7600 vidí (`m.hardware`) |
+| ESP32 / PSRAM (zmerané 2026-10-18) | ESP32 rev 3, 2 jadrá; PSRAM 4 MB (`module memory`: SPIRAM 4194252 B) | |
+| Antény (SIM7600) | ANT1 = GNSS, ANT2 = MAIN, ANT3 = AUX | potlač na module |
 | SPI zbernica (VSPI) | MISO 19, MOSI 23, CLK 18 | spoločná pre MCP2515 ×2 a MAX7317 |
 | **MAX7317** (rozširovač výstupov, SPI, CS 21) | P0 napájanie modemu, P1 výstup 12 V, **P2 CAN1 vysielač (RS)**, P3 DTR modemu | **bez neho nejde ani CAN1** – RS = 1 vypne vysielač (len počúvanie) |
 | CAN1 (vstavaný CAN radič ESP32) | TX 25, RX 26 | OBD 6/14 (kábel) |
