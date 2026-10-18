@@ -13,7 +13,7 @@ a{color:#8ab4f8}button{margin:.2rem;padding:.3rem .7rem}.bad{color:#ff8a80}.ok{c
 function c(cmd){fetch('/api/control?cmd='+encodeURIComponent(cmd)).then(r=>r.text()).then(t=>{msg.textContent=cmd+': '+t;setTimeout(load,1500)})}
 function e(t){const d=document.createElement('div');d.textContent=t;return d}
 function load(){fetch('/api/info').then(r=>r.json()).then(i=>{fw.textContent=i.fw;
-dev.replaceChildren(e('MAC '+i.mac+' · boot '+i.boot+' · beží '+Math.round(i.uptime_s/60)+' min · WiFi '+i.wifi+' ('+i.rssi+' dBm) · SD '+i.sd_used_mb+' / '+i.sd_mb+' MB'));
+dev.replaceChildren(e('ID '+i.id+' · FleetNest '+(i.login?'prihlásené':'NEprihlásené')+' · MAC '+i.mac+' · boot '+i.boot+' · beží '+Math.round(i.uptime_s/60)+' min · WiFi '+i.wifi+' ('+i.rssi+' dBm) · SD '+i.sd_used_mb+' / '+i.sd_mb+' MB'));
 const s=i.sniff;sn.replaceChildren(e((s.on?'ZAPNUTÝ, zostáva '+s.min+' min, súbor S'+s.file:'vypnutý')+(s.refused?' · ODMIETNUTÝ (plná SD)':'')+' · vozidlo '+s.vehicle),
 e('rámce '+s.frames+' · zapísané '+s.written+' · stratené pred SD '+s.dropped+' · SD chyby '+s.sderr+' · SD stratené '+s.sdlost));
 bus.replaceChildren();const h=bus.insertRow();['CAN','čip','zapnutá','rýchlosť','rámce','straty / chyby'].forEach(x=>{const t=document.createElement('th');t.textContent=x;h.appendChild(t)});

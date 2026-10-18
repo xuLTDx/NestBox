@@ -4,7 +4,8 @@
 //   /                           status page (page.h)
 //   /api/info                   device, firmware, uptime, SD, sniff, buses (JSON)
 //   /api/control?cmd=...        SNIFF=1[,<min>] | SNIFF=0 | SNIFF? | SNIFF_VEH=<tag> |
-//                               SNIFF_BUSES=<mask 1-7> | SNIFF_PURGE | SDW? | RESTART
+//                               SNIFF_BUSES=<mask 1-7> | SNIFF_PURGE | SDW? | RESTART |
+//                               TEL? | REC_S=<s>
 //   /api/ota                    raw firmware POST (v1F handlerOTA)
 //   /api/sniff, /api/sniff/live?id=&mask=, /api/sniff/list, /api/sniff/<n>[?from=&to=]
 #include <Arduino.h>
@@ -23,6 +24,11 @@ uint32_t bootId();
 void sdLock();
 void sdUnlock();
 void prepareRestart(const char* why);
+int telemetryStatus(char* buf, int size);
+void telemetrySetRecS(uint32_t s);
+uint32_t telemetryRecS();
+bool telemetryLogin();
+extern char devid[12];
 
 static HttpParam httpParam;
 
@@ -34,9 +40,9 @@ static int handlerInfo(UrlHandlerParam* param)
   uint64_t tot = SD_MMC.totalBytes(), used = SD_MMC.usedBytes();
   sdUnlock();
   int n = snprintf(buf, bufsize,
-      "{\"device\":\"NestBox_v2O\",\"mac\":\"%s\",\"fw\":\"%s\",\"boot\":%lu,\"uptime_s\":%lu,"
+      "{\"device\":\"NestBox_v2O\",\"id\":\"%s\",\"login\":%d,\"mac\":\"%s\",\"fw\":\"%s\",\"boot\":%lu,\"uptime_s\":%lu,"
       "\"reset\":%d,\"heap\":%u,\"psram\":%u,\"sd_mb\":%llu,\"sd_used_mb\":%llu,\"wifi\":\"%s\",\"rssi\":%d,\"sniff\":",
-      WiFi.macAddress().c_str(), FW_BUILD_STR, (unsigned long)bootId(), (unsigned long)(millis() / 1000),
+      devid, telemetryLogin() ? 1 : 0, WiFi.macAddress().c_str(), FW_BUILD_STR, (unsigned long)bootId(), (unsigned long)(millis() / 1000),
       (int)esp_reset_reason(), (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram(),
       (unsigned long long)(tot >> 20), (unsigned long long)(used >> 20), WiFi.SSID().c_str(), (int)WiFi.RSSI());
   n += sniffStatus(buf + n, bufsize - n - 2);
@@ -93,6 +99,11 @@ static int handlerControl(UrlHandlerParam* param)
     sniffSetSdLimit(atoi(cmd + 12));
     n = snprintf(buf, bufsize, "OK");
 #endif
+  } else if (!strcmp(cmd, "TEL?")) {               // FleetNest link + delivery queue
+    n = telemetryStatus(buf, bufsize);
+  } else if (!strncmp(cmd, "REC_S=", 6)) {          // seconds between records (>= 10)
+    telemetrySetRecS(strtoul(cmd + 6, nullptr, 10));
+    n = snprintf(buf, bufsize, "OK rec_s=%lu", (unsigned long)telemetryRecS());
   } else if (!strcmp(cmd, "SDW?")) {
     n = sdwStatus(buf, bufsize);
   } else if (!strcmp(cmd, "RESTART")) {

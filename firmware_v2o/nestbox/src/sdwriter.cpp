@@ -8,9 +8,8 @@
 
 void sdLock();    // telestore.cpp - every other SD user takes the same lock
 void sdUnlock();
-// delivery queue (step 2 of NestBox_v2O); until it exists the telemetry channel is unused
-__attribute__((weak)) void txqSetFile(uint32_t) {}
-__attribute__((weak)) void txqSdConfirmed(const uint32_t*, int) {}
+void txqSetFile(uint32_t fileId);
+void txqSdConfirmed(const uint32_t* ts, int n);
 // sniff.cpp
 int sniffFill(char* buf, int cap, uint32_t* frames, bool* last);
 void sniffConfirmed(uint32_t frames);

@@ -1,6 +1,6 @@
 // NestBox_v2O - main. Step 1 of ../NAVRH.md: hardware (MAX7317, SD over
 // SDMMC, CAN1 TWAI + CAN2/CAN3 MCP2515), sniff on all buses, WiFi, local HTTP
-// API with OTA. No modem, no server yet (step 2).
+// API with OTA. Step 2a: records to FleetNest over WiFi (telemetry.cpp).
 #include <Arduino.h>
 #include <WiFi.h>
 #include <SD_MMC.h>
@@ -30,18 +30,21 @@ static const char* WIFI_NETS[][2] = {{"NTLIRIS", WIFI_PASSWORD}, {"uLTD_ext", WI
 #define WIFI_RETRY_MS 30000
 
 static uint32_t s_bootId;
-static SemaphoreHandle_t s_sdMux;
 static bool s_sdOk;
 
 uint32_t bootId() { return s_bootId; }
-void sdLock() { if (s_sdMux) xSemaphoreTake(s_sdMux, portMAX_DELAY); }
-void sdUnlock() { if (s_sdMux) xSemaphoreGive(s_sdMux); }
+
+// telemetry.cpp
+void telemetryEarly();
+void telemetryBegin(uint32_t bootId, bool sdOk);
+void telemetryBeforeRestart();
 
 // before every deliberate restart: the sniff file ends properly (v1F prepareRestart)
 void prepareRestart(const char* why)
 {
   Serial.printf("[RESTART] %s\n", why);
   sniffCloseForRestart();
+  telemetryBeforeRestart();
 }
 
 static bool sdMount()
@@ -94,6 +97,7 @@ static void wifiTick()
 
 void setup()
 {
+  telemetryEarly();                           // first: the delivery queue's PSRAM reserve (txqueue.h)
   Serial.begin(115200);
   delay(100);
   Serial.printf("\nNestBox_v2O %s reset=%d\n", FW_BUILD_STR, (int)esp_reset_reason());
@@ -109,7 +113,6 @@ void setup()
   mx7317Begin();
   mx7317Out(MX_CAN1_RS, 1);                   // CAN1 transmitter off from the start
 
-  s_sdMux = xSemaphoreCreateMutex();
   s_sdOk = sdMount();
   if (s_sdOk) {
     Serial.printf("[SD] %llu MB, %llu MB used\n", SD_MMC.totalBytes() >> 20, SD_MMC.usedBytes() >> 20);
@@ -119,6 +122,7 @@ void setup()
   }
 
   sniffInit();
+  telemetryBegin(s_bootId, s_sdOk);
 
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
