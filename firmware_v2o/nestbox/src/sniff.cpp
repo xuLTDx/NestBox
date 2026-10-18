@@ -717,7 +717,7 @@ static void checkTask(void*)
   uint64_t prev = 0, firstGapAt = 0;
   bool havePrev = false, endTag = false;
   static char buf[16384];
-  char line[200];
+  char line[512];              // v2O stats lines carry every bus (~300 chars)
   int ll = 0;
   sdLock();
   FILE* f = fopen(path, "r");
