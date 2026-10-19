@@ -13,6 +13,18 @@ extern nvs_handle_t nvs;
 void logNetEvent(const char* text);
 void prepareRestart(const char* why);
 bool telemetryEngineOn();
+float read12V();
+
+// Flash only with the engine off and a battery that is not weak (same rule as v1F,
+// Vojtech 2026-10-19: >= 11.5 V before the flash); under 7 V = bench (USB), not a car.
+#define OTA_FLASH_MIN_VOLTAGE 11.5f
+
+static bool flashAllowed()
+{
+  if (telemetryEngineOn()) return false;
+  const float v = read12V();
+  return v < 7.0f || v >= OTA_FLASH_MIN_VOLTAGE;
+}
 
 // the marker: in this firmware's image, never in a v1F one
 __attribute__((used)) const char NESTBOX_IMAGE_MARK[] = "NESTBOX_V2O_IMAGE_MARK_5f1d2c";
@@ -329,7 +341,7 @@ static void otaTask(void*)
   uint32_t last = 0;
   vTaskDelay(pdMS_TO_TICKS(60000));          // after the boot: network and clock first
   for (;;) {
-    if (s_staged && !telemetryEngineOn()) flashStaged();
+    if (s_staged && flashAllowed()) flashStaged();
     if (s_req || !last || millis() - last > OTA_PERIODIC_MS) {
       bool req = s_req;
       s_req = false;

@@ -970,6 +970,8 @@ static uint8_t s_otaChunkBuf[PULL_OTA_CHUNK_SIZE];
 // updating a running SHA256 context per chunk. Returns total bytes written -
 // equal to expectedSize only on full success; the caller compares the two
 // the same way the existing WiFi loops already do.
+static bool otaMayDownload();
+
 static size_t cellDownloadBody(LockedFile& file, size_t expectedSize, mbedtls_sha256_context* sha256Ctx)
 {
   size_t written = 0;
@@ -977,6 +979,7 @@ static size_t cellDownloadBody(LockedFile& file, size_t expectedSize, mbedtls_sh
   while (written < expectedSize) {
     int toRead = (int)(expectedSize - written);
     if (toRead > (int)PULL_OTA_CHUNK_SIZE) toRead = (int)PULL_OTA_CHUNK_SIZE;
+    if (!otaMayDownload()) break;    // engine off: stop, the rest resumes on the next drive
     int n = otaCellClient.receiveBodyBytes((char*)s_otaChunkBuf, toRead, CCHOPEN_TIMEOUT_SIM7670);
     if (n <= 0) break;
     size_t nw = file.write(s_otaChunkBuf, (size_t)n);
@@ -1118,6 +1121,10 @@ void prepareRestart(const char* why)
 RTC_NOINIT_ATTR uint32_t otaFlashBootMagic;
 
 static bool onBench() { return batteryVoltage > 0 && batteryVoltage < 7.0f; }
+
+// Downloads only while the engine runs (or on the bench): with the engine off nothing new
+// starts and a running download stops - it resumes (HTTP Range) on the next drive.
+static bool otaMayDownload() { return s_engineOn || onBench(); }
 
 static void restartToFlash(const char* why)
 {
@@ -3476,19 +3483,20 @@ void telemetry(void* inst)
       // OTA_READY) is now the ONLY trigger. otaCheckIntervalS > 0 is kept
       // purely as the existing OTA-provisioned/enabled gate (0 = OTA
       // disabled entirely), no longer as a timer period.
-      if (s_ota_check_now && !(otaToken[0] && otaCheckIntervalS > 0 &&
+      if (s_ota_check_now && !(otaToken[0] && otaCheckIntervalS > 0 && otaMayDownload() &&
           (state.check(STATE_WIFI_CONNECTED) || state.check(STATE_CELL_CONNECTED)))) {
         static uint32_t lastSkipMs = 0;   // requested, but the check cannot run now - say why (once a minute)
         if (!lastSkipMs || millis() - lastSkipMs >= 60000) {
           lastSkipMs = millis();
           char m[64];
-          snprintf(m, sizeof(m), "OTA-PULL WAIT token=%d interval=%u wifi=%d cell=%d", otaToken[0] ? 1 : 0,
-                   (unsigned)otaCheckIntervalS, state.check(STATE_WIFI_CONNECTED) ? 1 : 0,
-                   state.check(STATE_CELL_CONNECTED) ? 1 : 0);
+          snprintf(m, sizeof(m), "OTA-PULL WAIT token=%d interval=%u wifi=%d cell=%d engine=%d",
+                   otaToken[0] ? 1 : 0, (unsigned)otaCheckIntervalS,
+                   state.check(STATE_WIFI_CONNECTED) ? 1 : 0, state.check(STATE_CELL_CONNECTED) ? 1 : 0,
+                   otaMayDownload() ? 1 : 0);
           otaLog(m);
         }
       }
-      if (otaToken[0] && otaCheckIntervalS > 0 &&
+      if (otaToken[0] && otaCheckIntervalS > 0 && otaMayDownload() &&
           (state.check(STATE_WIFI_CONNECTED) || state.check(STATE_CELL_CONNECTED))) {
         bool checkNow = s_ota_check_now;
         if (checkNow) {
@@ -3650,8 +3658,16 @@ void standby()
   // Staged firmware (pull-OTA): the engine is off - restart into the boot-time flash; the
   // box then boots normally and, the engine still off, comes back here to sleep.
   if (s_ota_pending && state.check(STATE_STORAGE_READY)) {
-    logger.logEvent("OTA-PULL FLASH_AT_STANDBY");
-    restartToFlash("OTA_STANDBY_FLASH");
+    const float v = readSystemVoltage();
+    char m[48];
+    if (v >= OTA_FLASH_MIN_VOLTAGE) {
+      snprintf(m, sizeof(m), "OTA-PULL FLASH_AT_STANDBY V=%.2f", v);
+      logger.logEvent(m);
+      restartToFlash("OTA_STANDBY_FLASH");
+    }
+    // weak battery: sleep now, the firmware waits for the next standby
+    snprintf(m, sizeof(m), "OTA-PULL FLASH_SKIPPED LOW_BATTERY V=%.2f", v);
+    logger.logEvent(m);
   }
 #endif
 
@@ -4305,6 +4321,15 @@ static bool performPullOtaFlash()
     // signal): stop - the new image goes to the other app partition and the box switches to
     // it only in Update.end(), so the running firmware stays; the staged file is kept and
     // flashed at the next standby (Vojtech 2026-10-19: "E až po stop").
+    if (millis() - t0 > OTA_FLASH_MAX_MS) {   // never keep the car awake longer than this
+      Update.abort();
+      fwFile.close();
+#if STORAGE != STORAGE_NONE
+      if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL FLASH_STOPPED TIME_LIMIT");
+#endif
+      s_ota_pending = true;
+      return false;
+    }
     if (millis() - voltAt >= 1000) {
       voltAt = millis();
       const float v = readSystemVoltage();
@@ -5120,6 +5145,13 @@ bool performPullOtaCheck()
     WiFiClientSecure& rawSock = otaWifiClient.rawClient();
 
     while (written < fwSize) {
+      if (!otaMayDownload()) {
+#if STORAGE != STORAGE_NONE
+        if (state.check(STATE_STORAGE_READY)) otaLog("OTA-PULL STOPPED ENGINE_OFF");
+#endif
+        dlOk = false;
+        break;
+      }
       uint32_t chunkStart = millis();
       while (!rawSock.available() && millis() - chunkStart < PULL_OTA_CHUNK_TIMEOUT_MS) delay(1);
       if (!rawSock.available()) {

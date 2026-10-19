@@ -227,6 +227,11 @@
 // (12.8-15.3), after switch-off below 12.8 V within ~3 s and 12.5 V at 15 s.
 // Standby wake needs two readings >= this 5 s apart (no flapping).
 #define ENGINE_OFF_VOLTAGE 12.8 /* V */
+// Pull-OTA flash before standby only at/above this (engine off, before sleep). Passat 2026-10:
+// before sleep 11.80-12.48 V, 3-hour parked reports 11.80-12.09 V (box ADC) - Vojtech 2026-10-19.
+#define OTA_FLASH_MIN_VOLTAGE 11.5f /* V */
+// the flash (from SD, at the boot asked for by standby) never takes longer than this
+#define OTA_FLASH_MAX_MS 180000UL
 // reset device after waking up
 #define RESET_AFTER_WAKEUP 1
 
