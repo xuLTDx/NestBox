@@ -33,6 +33,10 @@ v aute vedľa NestBox_v1F, zistiť palivo, AdBlue, rýchlostný limit a zdroje p
 8. Pri jazde aspoň raz zastaviť na štart-stop (motor sa sám vypne) – čas.
 9. Koniec: motor vypnúť, zamknúť – časy; nechať zapojené ešte 5 min (zaspávanie zberníc).
 
+## Pripomenúť (Vojtech 2026-10-19)
+- **v2O otestovať mobilnú sieť** (modem s 12 V v aute; OTA cez mobilnú sieť v2O ešte nemá – iba WiFi)
+  a **spánok** (v2O zatiaľ nespí – návrh NAVRH.md bod 6; OTA pravidlá A–H ako v1F, flash pred spaním).
+
 ## Po teste (Claude)
 - Stiahnuť sniff súbory oboch zariadení, porovnať 6/14: v2O CAN1 = v1F rámec po rámci; straty MCP2515 na 3/8.
 - Hľadať: palivo / AdBlue (proti fotkám), limit 0x1E9 (proti zapísaným značkám), ktorá zbernica sa budí prvá,
