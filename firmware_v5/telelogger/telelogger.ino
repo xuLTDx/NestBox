@@ -1109,23 +1109,6 @@ void prepareRestart(const char* why)
   txqSave(true);
 }
 
-// Pull-OTA flash (2026-10-19, Vojtech): a staged firmware is flashed ONLY at a boot that was
-// asked for it - standby entry (engine off) or the bench (< 7 V, not in a vehicle). Any other
-// boot (crash, watchdog, power loss, a restart during a drive) leaves it staged and waiting
-// for the next standby. Before: the box restarted right after the download, at any speed
-// (16. 10. 2026: OTA restart at 25 km/h, ~1 min of the drive lost).
-#define OTA_FLASH_BOOT_MAGIC 0x0F1A5B07u
-RTC_NOINIT_ATTR uint32_t otaFlashBootMagic;
-
-static bool onBench() { return batteryVoltage > 0 && batteryVoltage < 7.0f; }
-
-static void restartToFlash(const char* why)
-{
-  otaFlashBootMagic = OTA_FLASH_BOOT_MAGIC;
-  prepareRestart(why);
-  esp_restart();
-}
-
 // One finished record (the CBuffer, already written to SD) into the delivery
 // queue, in the wire format "0:<ts>,<pid>:<value>,...".
 static void queueRecord(CBuffer* b)
@@ -2135,14 +2118,7 @@ void initialize()
         logger.logEvent("OTA-PULL STAGED_BY_OTHER_BUILD");
         stagingValid = false;
       }
-      const bool flashNow = otaFlashBootMagic == OTA_FLASH_BOOT_MAGIC;
-      otaFlashBootMagic = 0;
-      if (stagingValid && !flashNow) {
-        // not a boot meant for flashing: keep it staged, standby() flashes it (engine off)
-        Serial.println("[OTA-PULL] Staged firmware found on SD - waiting for standby");
-        logger.logEvent("OTA-PULL STAGED_WAIT_STANDBY");
-        s_ota_pending = true;
-      } else if (stagingValid) {
+      if (stagingValid) {
         Serial.println("[OTA-PULL] Staged firmware found on SD Ã¢â‚¬â€ flashing at boot");
         if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL BOOT_FLASH");
         // Flash immediately at boot: the telemetry task has not started yet so
@@ -3523,6 +3499,23 @@ void telemetry(void* inst)
             // shortly.  Block here so the loop doesn't continue transmitting.
             while (true) delay(1000);
           }
+#if STORAGE == STORAGE_SD
+          // SD-staged path: firmware was written to /ota_fw.bin; standby()
+          // will call performPullOtaFlash() when the car turns off.
+          // Break out of the inner while immediately so no further transmit
+          // attempts are made with the now-fragmented TLS heap.  The outer
+          // for(;;) loop sees s_ota_pending=true on the next iteration and
+          // enters its delay(1000)/continue idle path.
+          // performPullOtaCheck() called wifi.close() internally which reset
+          // m_state to HTTP_DISCONNECTED, so the HTTP_ERROR-based guard below
+          // would never fire after a successful SD download Ã¢â‚¬â€ break explicitly.
+          if (s_ota_pending) {
+            WiFi.disconnect(true);
+            WiFi.mode(WIFI_OFF);
+            state.clear(STATE_NET_READY | STATE_WIFI_CONNECTED);
+            break;
+          }
+#endif
           // If OTA failed due to genuine heap fragmentation (e.g. a TLS
           // teardown inside performPullOtaCheck() leaked mbedTLS state), the
           // heap may still be too low to re-establish telemetry.  Detect this
@@ -3647,11 +3640,20 @@ void standby()
   state.set(STATE_STANDBY);
 
 #if STORAGE == STORAGE_SD
-  // Staged firmware (pull-OTA): the engine is off - restart into the boot-time flash; the
-  // box then boots normally and, the engine still off, comes back here to sleep.
+  // Safety net: if s_ota_pending is set (e.g. esp_restart() failed in
+  // performPullOtaCheck), apply the staged firmware now before shutting down.
+  // Normally the device restarts immediately after staging and the boot-time
+  // flash path handles this Ã¢â‚¬â€ this block should rarely execute.
   if (s_ota_pending && state.check(STATE_STORAGE_READY)) {
-    logger.logEvent("OTA-PULL FLASH_AT_STANDBY");
-    restartToFlash("OTA_STANDBY_FLASH");
+    s_ota_active = true;
+    delay(OTA_TELEMETRY_YIELD_DELAY_MS); // give the telemetry task one scheduling cycle to yield
+    if (performPullOtaFlash()) {
+      // Flash succeeded; reboot timer is running Ã¢â‚¬â€ block here until it fires.
+      while (true) delay(1000);
+    }
+    // Flash failed: clear flags and fall through to normal standby.
+    s_ota_active = false;
+    s_ota_pending = false;
   }
 #endif
 
@@ -4508,11 +4510,14 @@ bool performPullOtaCheck()
 #endif
 
 #if STORAGE == STORAGE_SD
-  // A firmware is already staged on SD: nothing to download - on the bench flash it now,
-  // in a vehicle standby() flashes it when the engine is off.
+  // If a firmware is already staged on SD (from a previous download that set
+  // s_ota_pending before the esp_restart() fired), the restart did not happen
+  // yet.  Trigger it now so the boot-time flash runs cleanly.
   if (s_ota_pending) {
-    if (onBench()) restartToFlash("OTA_STAGED");
-    return false;  // staged, standby() flashes it when the engine is off
+    Serial.println("[OTA-PULL] Firmware already staged on SD, restarting to flash");
+    prepareRestart("OTA_STAGED");
+    esp_restart();
+    return false;  // unreachable
   }
 #endif
 
@@ -5323,12 +5328,15 @@ bool performPullOtaCheck()
       otaLog(_ota_diag);
     }
 #endif
-    // On the bench restart now into the boot-time flash (clean heap, no TLS session open).
-    // In a vehicle keep driving and sending; standby() restarts into the flash with the
-    // engine off (2026-10-19).
-    if (onBench()) restartToFlash("OTA_DOWNLOADED");
-    if (state.check(STATE_STORAGE_READY)) otaLog("OTA-PULL STAGED_WAIT_STANDBY");
-    return false;  // in a vehicle: standby() flashes it when the engine is off
+    // Restart immediately so the device boots with a clean heap.  The boot-time
+    // staging check (setup(), just after SD init) will detect /ota_fw.bin and
+    // /ota_meta.txt and call performPullOtaFlash() before any TLS session is
+    // opened, ensuring the flash and optional NVS update succeed reliably.
+    // This also resolves the "Low heap" WiFi/LTE failure loop that would
+    // otherwise block all network connections until the next natural standby.
+    prepareRestart("OTA_DOWNLOADED");
+    esp_restart();
+    return false;  // unreachable: esp_restart() does not return
   }
 #endif  // STORAGE == STORAGE_SD
 
