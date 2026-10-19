@@ -7,13 +7,22 @@ v aute vedľa NestBox_v1F, zistiť palivo, AdBlue, rýchlostný limit a zdroje p
 - [ ] v2O (OVMS): firmvér aktuálny (stránka http://192.168.0.117/), SD karta, `SNIFF_VEH=Peugeot_K0`.
 - [ ] **Sniff v2O spustiť doma** na dlhý čas (napr. 240 min) – po vypnutí a zapnutí v aute sám pokračuje so zvyškom
       minút do nového súboru (overené na stole 2026-10-18). V aute WiFi nie je a modem v2O zatiaľ nie je overený.
+- [ ] **v2O modem zapnúť doma:** na stránke v2O príkaz `CELL=1` (alebo `http://192.168.0.117/api/control?cmd=CELL%3D1`),
+      odpoveď `OK cell=1`. Na USB modem zlyhá na `NETOPEN` (2026-10-19, podozrenie slabé napájanie – NEOVERENÉ);
+      v aute s 12 V je to práve skúška. Doma po zapnutí ešte nechať WiFi – v2O posiela cez WiFi, kým ju vidí.
+- [ ] **Mobil – hotspot ako záloha:** v2O pozná iba siete `NTLIRIS` a `uLTD_ext` (zadané vo firmvéri). Hotspot
+      v mobile pomenovať `uLTD_ext` s rovnakým heslom, ale **zapnúť ho iba vtedy, keď modem v aute nejde**
+      (WiFi má v2O prednosť pred modemom, so zapnutým hotspotom by sa modem neskúšal).
 - [ ] v1F (Freematics): sniff zo stránky FleetNest (`SNIFF=1,240`) alebo doma z jeho stránky.
 - [ ] Kábel OVMS: CAN1 = OBD 6/14 (DB9 7/2), CAN2 = OBD 3/8 (DB9 5/4), 12 V = OBD 16 (DB9 9), zem = OBD 4 (DB9 3);
       CAN3 podľa tvojho rozhodnutia. **Y-kábel**, aby v OBD boli naraz v1F aj OVMS (a Launch).
 - [ ] Hodinky / mobil na zapisovanie časov (stačí fotka s časom).
 
 ## V aute – zapísať čas pri každom kroku
-1. Zapojiť (Y-kábel: v1F + OVMS), počkať 1 min.
+1. Zapojiť (Y-kábel: v1F + OVMS), počkať 1 min. **Modem v2O:** do 5 min (modem skúša znova každých 5 min) sa vo FleetNest (VXQH2SY2) objavia
+   nové záznamy = modem ide. Ak nie: zapnúť hotspot `uLTD_ext`, v mobile otvoriť stránku v2O (IP adresa v mobile
+   medzi pripojenými zariadeniami) – riadok „modem: …“ ukáže, kde zlyhal; **fotka obrazovky s časom**. Príkazy
+   `AT=` sú iba na stránke zariadenia, Claude ich zo servera poslať nevie.
 2. Odomknúť / zamknúť auto (diaľkovým), otvoriť a zavrieť dvere vodiča, posuvné dvere – **časy**.
 3. Zapaľovanie bez motora 1 min – čas. **Ručička paliva a AdBlue na palubovke** (fotka).
 4. Naštartovať – čas; voľnobeh 1 min.
