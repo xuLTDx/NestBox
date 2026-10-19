@@ -351,7 +351,7 @@ char nvsVersion[64] = "";
 // ---------------------------------------------------------------------------
 // Pull-OTA configuration (loaded from NVS by loadConfig(), firmware v5.2+).
 // When otaToken is non-empty the firmware periodically GETs
-//   https://{otaHost}:{otaPort}/api/freematics/ota_pull/{otaToken}/meta.json
+//   https://{otaHost}:{otaPort}/api/nestbox/ota/{otaToken}/meta.json
 // and downloads / flashes a newer firmware version when one is available.
 // ---------------------------------------------------------------------------
 // Secret path token provisioned by the HA integration (OTA_TOKEN NVS key).
@@ -4059,7 +4059,7 @@ void loadConfig()
 // available, downloads and flashes it using the Arduino Update library.
 //
 // The metadata endpoint is:
-//   GET https://{otaHost}:{otaPort}/api/freematics/ota_pull/{otaToken}/meta.json
+//   GET https://{otaHost}:{otaPort}/api/nestbox/ota/{otaToken}/meta.json
 //
 // For Variant 2 (/local/ deployment) the same path structure is used:
 //   GET https://{otaHost}:{otaPort}/local/FreematicsONE/{devid}/version.json
@@ -4522,7 +4522,7 @@ bool performPullOtaCheck()
 #endif
 
   // ---- Step 1: Fetch metadata JSON ----------------------------------------
-  // Build the metadata path: /api/freematics/ota_pull/{token}/meta.json
+  // Build the metadata path: /api/nestbox/ota/{token}/meta.json
   // Query string reports the currently-running build (__DATE__ __TIME__,
   // e.g. "Sep 14 2026 12:04:32") so the server can tell whether the
   // firmware it would offer is already installed, instead of blindly
