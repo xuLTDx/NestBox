@@ -262,3 +262,15 @@ bool CellLink::gnss(GnssFix* f)
   f->at = millis();
   return true;
 }
+
+int CellLink::raw(const char* cmd, unsigned int timeoutMs, char* out, int cap)
+{
+  if (!m_mux) return snprintf(out, cap, "modem not started (CELL=1 first)");
+  lock();
+  char c[128];
+  snprintf(c, sizeof(c), "%s\r", cmd);
+  at(c, timeoutMs);
+  int n = snprintf(out, cap, "%s", m_buf);
+  unlock();
+  return n;
+}

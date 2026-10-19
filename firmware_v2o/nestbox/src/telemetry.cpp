@@ -400,3 +400,5 @@ int telemetryLive(char* buf, int size)
       (unsigned long)can1Stats().frames, (unsigned long)can1Stats().kbit, can1Stats().speedFound ? 1 : 0,
       age(can1Stats().lastFrameMs), (unsigned long)s_log.id(), (unsigned long)txqPending());
 }
+
+int telemetryModemAt(const char* cmd, char* out, int cap) { return s_cell.raw(cmd, 5000, out, cap); }

@@ -52,6 +52,8 @@ public:
   const char* status() { return m_status; }
   const char* storedApn() { return m_cgdcont; }
   void setApn(const char* apn);
+  // diagnostics (local web API only): one AT command, the modem's raw answer into out
+  int raw(const char* cmd, unsigned int timeoutMs, char* out, int cap);
 private:
   bool at(const char* cmd, unsigned int timeoutMs = 1000, const char* expect = nullptr);
   bool waitFor(const char* a, const char* b, unsigned int timeoutMs);

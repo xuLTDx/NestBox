@@ -38,6 +38,7 @@ void telemetrySetCell(bool on);
 bool telemetryCell();
 void telemetrySetApn(const char* apn);
 void telemetrySetVehicle(const char* p);
+int telemetryModemAt(const char* cmd, char* out, int cap);
 
 static HttpParam httpParam;
 
@@ -138,6 +139,8 @@ static int handlerControl(UrlHandlerParam* param)
                  carProfile(), (unsigned long)v.odoKm, v.odoAt ? (long)(ms - v.odoAt) : -1L, v.fuelL, v.fuelRaw,
                  v.fuelAt ? (long)(ms - v.fuelAt) : -1L, (unsigned long)v.ureaKm, v.urea[0], v.urea[1], v.urea[2],
                  v.urea[3], v.urea[4], v.urea[5], v.urea[6], v.urea[7], v.ureaAt ? (long)(ms - v.ureaAt) : -1L);
+  } else if (!strncmp(cmd, "AT=", 3)) {             // modem diagnostics, local only: AT=AT+CGDCONT?
+    n = telemetryModemAt(cmd + 3, buf, bufsize);
   } else if (!strncmp(cmd, "CELL=", 5)) {           // modem on/off (stored)
     telemetrySetCell(cmd[5] == '1');
     n = snprintf(buf, bufsize, "OK cell=%d", telemetryCell() ? 1 : 0);
