@@ -4298,8 +4298,28 @@ static bool performPullOtaFlash()
   size_t written = 0;
   uint32_t t0 = millis();
   size_t lastLogAt = 0;
+  uint32_t voltAt = 0;
 
   while (written < fwSize) {
+    // Engine started during the flash (battery >= ENGINE_OFF_VOLTAGE, the box's own START
+    // signal): stop - the new image goes to the other app partition and the box switches to
+    // it only in Update.end(), so the running firmware stays; the staged file is kept and
+    // flashed at the next standby (Vojtech 2026-10-19: "E až po stop").
+    if (millis() - voltAt >= 1000) {
+      voltAt = millis();
+      const float v = readSystemVoltage();
+      if (v >= ENGINE_OFF_VOLTAGE && v < 20.0f) {
+        Serial.printf("[OTA-PULL] Engine on (%.1f V) at %u / %u bytes - flash stopped, staged for standby\n",
+                      v, (unsigned)written, (unsigned)fwSize);
+        Update.abort();
+        fwFile.close();
+#if STORAGE != STORAGE_NONE
+        if (state.check(STATE_STORAGE_READY)) logger.logEvent("OTA-PULL FLASH_STOPPED ENGINE_ON");
+#endif
+        s_ota_pending = true;
+        return false;
+      }
+    }
     int toRead = (int)(fwSize - written);
     if (toRead > (int)PULL_OTA_CHUNK_SIZE) toRead = (int)PULL_OTA_CHUNK_SIZE;
     int n = fwFile.read(s_otaChunkBuf, toRead);
