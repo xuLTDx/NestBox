@@ -14,7 +14,7 @@ throughout. Companion doc: `traccar` repo's `ARCHITECTURE_FREEMATICS.md`.
 is unchanged: it still sends the same UDP protocol to `ultd.mooo.com:6000`; FleetNest took the
 port over (Traccar stopped and disabled, its database kept) and answers byte-identically (ACK
 after storage, event replies, `EV=5` commands) - FleetNest `apps/telemetry/protocol.py`. OTA:
-`freematics-ota` asks FleetNest for the build and queues `OTA_READY` there
+`nestbox-ota` (renamed from freematics-ota 2026-10-18, device path `/api/nestbox/ota/`) asks FleetNest for the build and queues `OTA_READY` there
 (`fleetnest_credentials.json` `active=true`); `locations.csv` comes from FleetNest places. Where
 this document says "Traccar" for the server side, read FleetNest from that date; the Traccar-side
 details (decoder, calibration, `ReportUtils`) are history.
@@ -132,7 +132,7 @@ reachable at all.
 ### A5. Pull-OTA (`performPullOtaCheck()`/`performPullOtaFlash()`)
 
 ```
-performPullOtaCheck()   GET .../ota_pull/<token>/meta.json  (WiFi, or
+performPullOtaCheck()   GET .../api/nestbox/ota/<token>/meta.json  (WiFi, or
                          cellular via CellHTTP's AT+CCH*)
   → if a newer build is available: GET .../firmware.bin
     STORAGE_SD: streamed to /ota_fw.bin on SD + /ota_meta.txt (expected
@@ -600,9 +600,9 @@ struct KnownLocation { float lat, lon, radiusM; uint8_t wifiIdx; };
 KnownLocation knownLocations[MAX_KNOWN_LOCATIONS];   // NVS-persisted
 uint8_t knownLocationCount;
 
-syncKnownLocations()          // GET .../ota_pull/<token>/locations.csv
+syncKnownLocations()          // GET .../api/nestbox/ota/<token>/locations.csv
   → parses "lat,lon,radius,ssid" lines from ota_server.py (which proxies
-    Traccar's tc_business_addresses, filtered to non-empty ssid)
+    FleetNest places of the box's company, filtered to non-empty ssid)
   → keeps only entries whose ssid matches THIS device's own wifiSSID/
     wifiSSID2 (never a new/unknown network)
   → called on every successful WiFi connect (rate-limited by
