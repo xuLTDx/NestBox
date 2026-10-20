@@ -7,12 +7,15 @@
 #include <mbedtls/sha256.h>
 #include "nb_sd.h"
 #include "store.h"
+#include "cellmodem.h"
 
 extern const char FW_BUILD_STR[];
 extern nvs_handle_t nvs;
 void logNetEvent(const char* text);
 void prepareRestart(const char* why);
 bool telemetryEngineOn();
+class CellLink;
+CellLink* telemetryCellLink();
 float read12V();
 
 // Flash only with the engine off and a battery that is not weak (same rule as v1F,
@@ -98,25 +101,88 @@ bool otaSet(const char* key, const char* value)
 void otaRequest() { s_req = true; }
 
 // ---------------------------------------------------------------- HTTP ---
+// One HTTPS connection: WiFi (WiFiClientSecure) or the modem's own TLS (AT+CCH*, 2026-10-20 -
+// over cellular when there is no WiFi; NOT TESTED: the data link did not come up on USB power).
+struct OtaConn {
+  virtual bool connect(const char* host, uint16_t port) = 0;
+  virtual void write(const char* s) = 0;
+  virtual int read(uint8_t* buf, int cap, unsigned int timeoutMs) = 0;   // >0, 0 closed, -1 timeout
+  virtual void stop() = 0;
+  virtual ~OtaConn() {}
+  // buffered line reader on top of read()
+  uint8_t rb[1024];
+  int rn = 0, rp = 0;
+  int getc(unsigned int timeoutMs) {
+    if (rp >= rn) { rn = read(rb, sizeof(rb), timeoutMs); rp = 0; if (rn <= 0) { rn = 0; return -1; } }
+    return rb[rp++];
+  }
+  String line(unsigned int timeoutMs) {
+    String s;
+    for (int c; (c = getc(timeoutMs)) >= 0 && c != '\n';) s += (char)c;
+    return s;
+  }
+  int body(uint8_t* buf, int cap, unsigned int timeoutMs) {   // what the line reader buffered first
+    if (rp < rn) { int n = rn - rp < cap ? rn - rp : cap; memcpy(buf, rb + rp, n); rp += n; return n; }
+    return read(buf, cap, timeoutMs);
+  }
+};
+
+struct WifiConn : OtaConn {
+  WiFiClientSecure c;
+  bool connect(const char* host, uint16_t port) override {
+    c.setInsecure();
+    c.setTimeout(OTA_TIMEOUT_MS / 1000);
+    return c.connect(host, port);
+  }
+  void write(const char* s) override { c.print(s); }
+  int read(uint8_t* buf, int cap, unsigned int timeoutMs) override {
+    uint32_t t = millis();
+    while (!c.available() && c.connected() && millis() - t < timeoutMs) delay(2);
+    if (!c.available()) return c.connected() ? -1 : 0;
+    return c.read(buf, cap);
+  }
+  void stop() override { c.stop(); }
+};
+
+struct CellConn : OtaConn {
+  CellLink* m;
+  explicit CellConn(CellLink* l) : m(l) {}
+  bool connect(const char* host, uint16_t port) override { return m->tlsOpen(host, port); }
+  void write(const char* s) override { m->tlsSend(s, strlen(s)); }
+  int read(uint8_t* buf, int cap, unsigned int timeoutMs) override {
+    return m->tlsRead(buf, cap > 1024 ? 1024 : cap, timeoutMs);
+  }
+  void stop() override { m->tlsClose(); }
+};
+
 // one GET; returns the status code (-1 = no connection), *len = Content-Length (-1 unknown).
-// The body is then read from c.
-static int httpGet(WiFiClientSecure& c, const char* path, size_t rangeFrom, long* len)
+// The body is then read with c.body().
+static int httpGet(OtaConn& c, const char* path, size_t rangeFrom, long* len)
 {
-  c.setInsecure();
-  c.setTimeout(OTA_TIMEOUT_MS / 1000);
+  c.rn = c.rp = 0;
   if (!c.connect(s_host, s_port)) return -1;
-  c.printf("GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n", path, s_host);
-  if (rangeFrom) c.printf("Range: bytes=%u-\r\n", (unsigned)rangeFrom);
-  c.print("\r\n");
-  String status = c.readStringUntil('\n');
+  char req[400];
+  int n = snprintf(req, sizeof(req), "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n", path, s_host);
+  if (rangeFrom) n += snprintf(req + n, sizeof(req) - n, "Range: bytes=%u-\r\n", (unsigned)rangeFrom);
+  snprintf(req + n, sizeof(req) - n, "\r\n");
+  c.write(req);
+  String status = c.line(OTA_TIMEOUT_MS);
   int code = status.length() > 12 ? status.substring(9, 12).toInt() : 0;
   *len = -1;
   for (;;) {
-    String h = c.readStringUntil('\n');
+    String h = c.line(OTA_TIMEOUT_MS);
     if (h.length() <= 1) break;             // empty line (just "\r") = end of the headers
     if (h.startsWith("Content-Length:") || h.startsWith("content-length:")) *len = h.substring(15).toInt();
   }
   return code;
+}
+
+static String readAll(OtaConn& c)
+{
+  String s;
+  uint8_t b[256];
+  for (int n; (n = c.body(b, sizeof(b), OTA_TIMEOUT_MS)) > 0;) s.concat((const char*)b, n);
+  return s;
 }
 
 static String urlBuild()
@@ -160,12 +226,16 @@ static bool fileHasMark(const char* path)
 static void check()
 {
   if (!s_token[0]) { otaLog("OTA-PULL STOP no token"); return; }
-  if (WiFi.status() != WL_CONNECTED) { otaLog("OTA-PULL STOP no wifi (cell OTA not yet in v2O)"); return; }
+  CellLink* cell = WiFi.status() == WL_CONNECTED ? nullptr : telemetryCellLink();
+  if (WiFi.status() != WL_CONNECTED && !cell) { otaLog("OTA-PULL STOP no wifi, no cell"); return; }
   if (s_staged) { otaLog("OTA-PULL STAGED waits for engine off"); return; }
   char path[300];
   snprintf(path, sizeof(path), "/api/nestbox/ota/%s/meta.json?build=%s&variant=%s", s_token,
            urlBuild().c_str(), OTA_VARIANT);
-  WiFiClientSecure c;
+  WifiConn wc;
+  CellConn cc(cell);
+  OtaConn& c = cell ? (OtaConn&)cc : (OtaConn&)wc;
+  otaLog(cell ? "OTA-PULL CHECK cell" : "OTA-PULL CHECK wifi");
   long len = 0;
   int code = httpGet(c, path, 0, &len);
   if (code != 200) {
@@ -175,7 +245,7 @@ static void check()
     c.stop();
     return;
   }
-  String body = c.readString();
+  String body = readAll(c);
   c.stop();
   if (body.indexOf("\"available\": true") < 0 && body.indexOf("\"available\":true") < 0) {
     otaLog("OTA-PULL NO_UPDATE");
@@ -243,11 +313,8 @@ static void check()
   }
   if (code == 200 || code == 206) {
     while (written < size) {
-      uint32_t t = millis();
-      while (!c.available() && c.connected() && millis() - t < OTA_TIMEOUT_MS) delay(2);
-      if (!c.available()) break;
       int want = size - written < OTA_CHUNK ? size - written : OTA_CHUNK;
-      int n = c.read(s_buf, want);
+      int n = c.body(s_buf, want, OTA_TIMEOUT_MS);
       if (n <= 0) break;
       sdLock();
       bool ok = out.write(s_buf, n) == (size_t)n;

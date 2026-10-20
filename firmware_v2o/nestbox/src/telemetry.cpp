@@ -124,6 +124,7 @@ struct Rec {
 
 static volatile bool s_engineOn;
 bool telemetryEngineOn() { return s_engineOn; }
+CellLink* telemetryCellLink() { return s_cellUp ? &s_cell : nullptr; }   // pull-OTA over cellular
 
 // event: 0 = a regular record, 1 = START, 2 = STOP (timed at `when`, the record's own time)
 static void makeRecord(int event = 0, time_t when = 0)

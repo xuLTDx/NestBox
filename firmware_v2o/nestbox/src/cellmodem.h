@@ -54,6 +54,13 @@ public:
   void setApn(const char* apn);
   // diagnostics (local web API only): one AT command, the modem's raw answer into out
   int raw(const char* cmd, unsigned int timeoutMs, char* out, int cap);
+  // HTTPS inside the modem (AT+CCH*, session 0, cache receive mode) - pull-OTA over cellular
+  // (2026-10-20, from v1F CellHTTP; SIM7600 command set per the SIMCom SSL application note).
+  // NOT TESTED on the module: the data link itself (NETOPEN) did not come up on USB power.
+  bool tlsOpen(const char* host, uint16_t port);
+  bool tlsSend(const char* data, int len);
+  int tlsRead(uint8_t* buf, int cap, unsigned int timeoutMs);   // >0 bytes, 0 closed, -1 timeout
+  void tlsClose();
 private:
   bool at(const char* cmd, unsigned int timeoutMs = 1000, const char* expect = nullptr);
   bool waitFor(const char* a, const char* b, unsigned int timeoutMs);

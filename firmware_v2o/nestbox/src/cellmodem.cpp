@@ -274,3 +274,99 @@ int CellLink::raw(const char* cmd, unsigned int timeoutMs, char* out, int cap)
   unlock();
   return n;
 }
+
+
+// ------------------------------------------------------------- HTTPS (CCH) ---
+
+bool CellLink::tlsOpen(const char* host, uint16_t port)
+{
+  if (!m_netOpen) return false;
+  lock();
+  at("AT+CCHCLOSE=0\r", 2000, "+CCHCLOSE:");   // a session left from before (harmless ERROR)
+  at("AT+CCHSTOP\r", 2000);
+  at("AT+CCHSET=1,1\r");                       // send result report, cache receive mode - before CCHSTART
+  bool started = at("AT+CCHSTART\r", 5000);
+  if (!started) started = at("AT+CCHSTART\r", 5000);
+  if (!started) { unlock(); snprintf(m_status, sizeof(m_status), "online, CCHSTART failed"); return false; }
+  at("AT+CSSLCFG=\"sslversion\",0,4\r");       // all versions
+  at("AT+CSSLCFG=\"authmode\",0,0\r");         // no server certificate check (as v1F, self-signed server)
+  at("AT+CSSLCFG=\"ignorelocaltime\",0,1\r");
+  at("AT+CSSLCFG=\"enableSNI\",0,1\r");
+  at("AT+CCHSSLCFG=0,0\r");
+  char c[160];
+  snprintf(c, sizeof(c), "AT+CCHOPEN=0,\"%s\",%u,2\r", host, (unsigned)port);
+  bool ok = at(c, 30000, "+CCHOPEN: 0,0");
+  if (!ok) Serial.printf("[CELL] CCHOPEN %s:%u failed: %s\n", host, (unsigned)port, m_buf);
+  unlock();
+  return ok;
+}
+
+bool CellLink::tlsSend(const char* data, int len)
+{
+  lock();
+  char c[40];
+  snprintf(c, sizeof(c), "AT+CCHSEND=0,%d\r", len);
+  bool ok = at(c, 5000, ">");
+  if (ok) {
+    s_uart.write((const uint8_t*)data, len);
+    m_len = 0;
+    m_buf[0] = 0;
+    ok = waitFor("\r\nOK", "\r\nERROR", 10000);
+  }
+  unlock();
+  return ok;
+}
+
+// one AT+CCHRECV: "+CCHRECV: DATA,0,<n>\r\n<n raw bytes>...OK"; no data = no DATA line
+int CellLink::tlsRead(uint8_t* buf, int cap, unsigned int timeoutMs)
+{
+  uint32_t t0 = millis();
+  for (;;) {
+    lock();
+    while (s_uart.available()) s_uart.read();
+    char c[40];
+    snprintf(c, sizeof(c), "AT+CCHRECV=0,%d\r", cap);
+    s_uart.print(c);
+    // header up to the end of the DATA line, or the final OK / ERROR without data
+    char head[96];
+    int hl = 0;
+    int n = -1;
+    bool closed = false;
+    uint32_t t = millis();
+    while (millis() - t < 3000) {
+      if (!s_uart.available()) { delay(1); continue; }
+      char ch = (char)s_uart.read();
+      if (hl < (int)sizeof(head) - 1) { head[hl++] = ch; head[hl] = 0; }
+      char* d = strstr(head, "+CCHRECV: DATA,0,");
+      if (d && ch == '\n') { n = atoi(d + 17); break; }
+      if (strstr(head, "PEER_CLOSED") || strstr(head, "+CCHCLOSE")) closed = true;
+      if (strstr(head, "\r\nOK\r\n") || strstr(head, "\r\nERROR\r\n")) break;
+    }
+    if (n > 0) {
+      int got = 0;
+      t = millis();
+      while (got < n && millis() - t < 5000) {
+        if (s_uart.available()) { int b = s_uart.read(); if (got < cap) buf[got] = (uint8_t)b; got++; t = millis(); }
+        else delay(1);
+      }
+      m_len = 0;
+      m_buf[0] = 0;
+      waitFor("\r\nOK", "\r\nERROR", 2000);   // the rest of the answer
+      if (strstr(m_buf, "PEER_CLOSED")) closed = true;
+      unlock();
+      return got > cap ? cap : got;
+    }
+    unlock();
+    if (closed) return 0;
+    if (millis() - t0 >= timeoutMs) return -1;
+    delay(200);                                 // nothing cached yet
+  }
+}
+
+void CellLink::tlsClose()
+{
+  lock();
+  at("AT+CCHCLOSE=0\r", 3000, "+CCHCLOSE:");
+  at("AT+CCHSTOP\r", 3000);
+  unlock();
+}
