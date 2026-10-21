@@ -127,6 +127,24 @@ struct Rec {
 
 static volatile bool s_engineOn;
 bool telemetryEngineOn() { return s_engineOn; }
+static volatile bool s_recNow;                // standby.cpp: the parked report's record now
+static volatile bool s_standby;               // standby.cpp: going to sleep - the modem stays off
+void telemetryRecordNow() { s_recNow = true; }
+bool telemetryRecordDone() { return !s_recNow; }
+// standby.cpp, parked report: one GNSS reading now (true = a fix)
+bool telemetryPollFix()
+{
+  GnssFix g;
+  if (!s_cellOn || !s_cell.gnss(&g)) return false;
+  s_fix = g;
+  return true;
+}
+// standby.cpp: modem (and its GNSS) off before the deep sleep; the cell task does not start it again
+void telemetryCellOff()
+{
+  s_standby = true;
+  if (s_cellOn) { s_cellUp = false; s_cell.powerOff(); logNetEvent("CELL OFF standby"); }
+}
 CellLink* telemetryCellLink() { return s_cellUp ? &s_cell : nullptr; }   // pull-OTA over cellular
 
 // event: 0 = a regular record, 1 = START, 2 = STOP (timed at `when`, the record's own time)
@@ -244,9 +262,10 @@ static void recordTask(void*)
   for (;;) {
     engineTick();
     uint32_t every = s_engineOn ? DRIVE_REC_MS : s_recS * 1000UL;
-    if (!last || millis() - last >= every) {
+    if (!last || millis() - last >= every || s_recNow) {
       last = millis();
       makeRecord();
+      s_recNow = false;
     }
     vTaskDelay(pdMS_TO_TICKS(100));
   }
@@ -257,7 +276,7 @@ static void cellTask(void*)
 {
   uint32_t lastTry = 0;
   for (;;) {
-    if (s_cellOn && !s_cellUp && (!lastTry || millis() - lastTry > 300000UL)) {
+    if (s_cellOn && !s_cellUp && !s_standby && (!lastTry || millis() - lastTry > 300000UL)) {
       lastTry = millis();
       logNetEvent("CELL START");
       s_cell.setApn(nbApnPick(nvs, s_apn));   // a server APN= is tried first (nbapn.h)

@@ -45,6 +45,8 @@ __attribute__((used)) const char NESTBOX_IMAGE_MARK[] = "NESTBOX_V2O_IMAGE_MARK_
 static char s_token[68], s_host[128] = "ultd.mooo.com";
 static uint16_t s_port = 6001;               // freematics-ota LISTEN_PORT (v1F default)
 static volatile bool s_req;
+static volatile bool s_busy;                 // a check / download runs (standby waits)
+bool otaBusy() { return s_busy; }
 static volatile bool s_staged;               // a verified image waits on SD for the engine to stop
 static uint8_t s_buf[OTA_CHUNK];
 
@@ -420,7 +422,9 @@ static void otaTask(void*)
       last = millis();
       if (req || s_token[0]) {
         otaLog(req ? "OTA-PULL REQ" : "OTA-PULL CHECK periodic");
+        s_busy = true;
         check();
+        s_busy = false;
       }
     }
     vTaskDelay(pdMS_TO_TICKS(2000));

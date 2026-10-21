@@ -14,6 +14,7 @@
 #include "canbus1.h"
 #include "ota.h"
 #include "laststep.h"
+#include "standby.h"
 
 extern const char FW_BUILD_STR[] = __DATE__ " " __TIME__;
 
@@ -40,7 +41,8 @@ static char s_prevStep[sizeof(g_lastStep.text)];
 // the BOOT event's tail: reset reason + the step marked before the reset
 const char* bootResetInfo(char* buf, int cap)
 {
-  snprintf(buf, cap, "reset=%s step=%s", resetReasonName(esp_reset_reason()), s_prevStep[0] ? s_prevStep : "-");
+  snprintf(buf, cap, "reset=%s wake=%s step=%s", resetReasonName(esp_reset_reason()), standbyWakeName(),
+           s_prevStep[0] ? s_prevStep : "-");
   return buf;
 }
 
@@ -116,6 +118,7 @@ void setup()
     s_prevStep[sizeof(s_prevStep) - 1] = 0;
   }
   lastStep("boot");
+  standbyEarly();                             // a deep-sleep wake: confirmed, or asleep again here
   Serial.begin(115200);
   delay(100);
   Serial.printf("\nNestBox_v2O %s reset=%d step=%s\n", FW_BUILD_STR, (int)esp_reset_reason(), s_prevStep);
@@ -158,6 +161,7 @@ void loop()
   int ev = sniffTick();
   if (ev == SNIFF_EV_STARTED) Serial.println("[SNIFF] started");
   wifiTick();
+  standbyTick();
   static uint32_t lastPurge;
   if (millis() - lastPurge > 3600000UL || !lastPurge) {   // hourly, once the clock is set
     if (time(nullptr) > 1735689600) { lastPurge = millis(); sniffPurgeOld(time(nullptr)); }

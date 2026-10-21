@@ -29,6 +29,7 @@ uint32_t bootId();
 void sdLock();
 void sdUnlock();
 void prepareRestart(const char* why);
+#include "standby.h"
 int telemetryStatus(char* buf, int size);
 void telemetrySetRecS(uint32_t s);
 uint32_t telemetryRecS();
@@ -139,6 +140,12 @@ static int handlerControl(UrlHandlerParam* param)
                  carProfile(), (unsigned long)v.odoKm, v.odoAt ? (long)(ms - v.odoAt) : -1L, v.fuelL, v.fuelRaw,
                  v.fuelAt ? (long)(ms - v.fuelAt) : -1L, (unsigned long)v.ureaKm, v.urea[0], v.urea[1], v.urea[2],
                  v.urea[3], v.urea[4], v.urea[5], v.urea[6], v.urea[7], v.ureaAt ? (long)(ms - v.ureaAt) : -1L);
+  } else if (!strcmp(cmd, "STANDBY?")) {
+    n = standbyStatus(buf, bufsize);
+  } else if (!strncmp(cmd, "SLEEP_TEST=", 11)) {     // bench: deep sleep now, timer wake after <s> (10..3600)
+    uint32_t sec = strtoul(cmd + 11, nullptr, 10);
+    if (sec < 10 || sec > 3600) n = snprintf(buf, bufsize, "ERR 10..3600 s");
+    else { standbyTest(sec); n = snprintf(buf, bufsize, "OK sleep %lu s in ~2 s", (unsigned long)sec); }
   } else if (!strncmp(cmd, "AT=", 3)) {             // modem diagnostics, local only: AT=AT+CGDCONT?
     n = telemetryModemAt(cmd + 3, buf, bufsize);
   } else if (!strncmp(cmd, "CELL=", 5)) {           // modem on/off (stored)

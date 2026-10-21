@@ -129,6 +129,14 @@ void CellLink::stop()
   snprintf(m_status, sizeof(m_status), "off");
 }
 
+void CellLink::powerOff()
+{
+  if (!m_mux) return;
+  lock();
+  stop();
+  unlock();
+}
+
 bool CellLink::open(const char* host, uint16_t port)
 {
   if (!m_netOpen) return false;

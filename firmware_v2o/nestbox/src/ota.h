@@ -19,6 +19,7 @@ extern const char NESTBOX_IMAGE_MARK[];
 
 void otaBegin();                     // after SD + NVS: settings, the OTA task
 void otaRequest();                   // server OTA_READY / web: check now
+bool otaBusy();                      // a check / download runs now (standby waits for it)
 int otaTakeStatus(uint8_t* out, int cap);   // the oldest pending step line (records)
 int otaStatus(char* buf, int size);  // web
 bool otaSet(const char* key, const char* value);   // OTA_TOKEN / OTA_HOST / OTA_PORT

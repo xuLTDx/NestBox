@@ -47,6 +47,7 @@ public:
   void begin();                // UART + mutex; the modem task does the rest
   bool start();                // power on, SIM, registration, data - true = up (blocking, up to ~2 min)
   void stop();                 // network closed, modem powered off
+  void powerOff();             // stop() under the lock (standby, from another task)
   bool gnss(GnssFix* out);     // one AT+CGNSSINFO reading, CGPSINFO when empty (modem on, network not needed)
   bool alive_() { return m_alive; }
   int rssi();                  // dBm, 0 = unknown
