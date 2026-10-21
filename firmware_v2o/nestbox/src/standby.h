@@ -19,10 +19,14 @@
 #define STANDBY_REPORT_SEND_S  60         // max wait for the delivery after the record
 #define STANDBY_OTA_WAIT_MS    180000UL   // a running OTA download delays the sleep at most this
 #define STANDBY_ULP_PERIOD_US  200000     // ULP measures every 200 ms
+#ifndef STANDBY_AUTO
+#define STANDBY_AUTO 0                    // automatic sleep: off since 21.10.2026 (ULP did not wake) until tested
+#endif
 
 void standbyEarly();          // first in setup(): a deep-sleep wake - confirm or sleep again (no return)
 bool standbyParkedBoot();     // this boot is the 3-hour parked report
 const char* standbyWakeName();// why this boot: "-", "VOLTAGE", "REPORT", "TEST"
 void standbyTick();           // loop()
-void standbyTest(uint32_t seconds);   // /api/control SLEEP_TEST=<s>: sleep in ~2 s, timer wake only (bench)
+void standbyTest(uint32_t seconds, bool ulp);   // /api/control SLEEP_TEST=<s> (timer) / SLEEP_ULP=<s> (ULP + timer): sleep in ~2 s
+int standbyUlpRead(char* buf, int cap);         // /api/control ULP_READ
 int standbyStatus(char* buf, int cap);

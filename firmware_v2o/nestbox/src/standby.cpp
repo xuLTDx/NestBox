@@ -29,13 +29,15 @@ enum { ULP_THR = 0, ULP_LAST = 1, ULP_PROG = 4 };
 RTC_DATA_ATTR static time_t s_nextReport;     // time() of the next parked report (time() runs on in deep sleep)
 RTC_DATA_ATTR static uint8_t s_falseWakes;    // ULP wakes not confirmed by the 5 s reading, in a row
 RTC_DATA_ATTR static uint16_t s_thrRaise;     // raw x4 added to the ULP threshold after false wakes
+RTC_DATA_ATTR static uint8_t s_ulpTest;       // SLEEP_ULP test: a wake always boots (no sleep again)
 
-static const char* s_wake = "-";
+static char s_wake[48] = "-";
 static bool s_parked;
 static uint32_t s_otaWaitSince, s_reportAt, s_recAt;
 static bool s_reportFix, s_reportRecDone;
-static volatile uint32_t s_testS, s_testAt;   // SLEEP_TEST from the web
-static void standbyTestNow(uint32_t seconds);
+static volatile uint32_t s_testS, s_testAt;   // SLEEP_TEST / SLEEP_ULP from the web
+static volatile bool s_testUlp;
+static void standbyTestNow(uint32_t seconds, bool ulp);
 
 bool standbyParkedBoot() { return s_parked; }
 const char* standbyWakeName() { return s_wake; }
@@ -94,6 +96,13 @@ void standbyEarly()
 {
   if (esp_reset_reason() != ESP_RST_DEEPSLEEP) return;
   esp_sleep_wakeup_cause_t c = esp_sleep_get_wakeup_cause();
+  unsigned ulpSum = RTC_SLOW_MEM[ULP_LAST] & 0xFFFF;   // the ULP's last 4-sample sum
+  if (s_ulpTest) {                    // SLEEP_ULP: report and boot, whatever woke it
+    s_ulpTest = 0;
+    snprintf(s_wake, sizeof(s_wake), "ULP_TEST %s ulp=%u v=%.2f", c == ESP_SLEEP_WAKEUP_ULP ? "ULP" :
+             c == ESP_SLEEP_WAKEUP_TIMER ? "TIMER" : "OTHER", ulpSum, read12V());
+    return;
+  }
   if (c == ESP_SLEEP_WAKEUP_ULP) {
     // the second reading (v1F: two readings >= ENGINE_OFF_VOLTAGE 5 s apart); the ULP gave the first
     float v1 = read12V();
@@ -106,14 +115,14 @@ void standbyEarly()
     }
     s_falseWakes = 0;
     s_thrRaise = 0;
-    s_wake = "VOLTAGE";
+    snprintf(s_wake, sizeof(s_wake), "VOLTAGE ulp=%u", ulpSum);
   } else if (c == ESP_SLEEP_WAKEUP_TIMER) {
     if ((long)(s_nextReport - time(nullptr)) > 10) {   // a SLEEP_TEST wake, not the report
-      s_wake = "TEST";
+      snprintf(s_wake, sizeof(s_wake), "TEST");
       return;
     }
     s_parked = true;
-    s_wake = "REPORT";
+    snprintf(s_wake, sizeof(s_wake), "REPORT");
   }
 }
 
@@ -141,7 +150,8 @@ static void goStandby()
 
 void standbyTick()
 {
-  if (s_testS && millis() - s_testAt > 2000) standbyTestNow(s_testS);   // the HTTP answer went out first
+  if (s_testS && millis() - s_testAt > 2000) standbyTestNow(s_testS, s_testUlp);   // the HTTP answer went out first
+  if (!STANDBY_AUTO) return;          // 21.10.2026: the ULP did not wake at the engine start - off until tested
   static uint32_t lastCheck;
   if (millis() - lastCheck < 1000) return;
   lastCheck = millis();
@@ -176,19 +186,38 @@ void standbyTick()
   goStandby();
 }
 
-void standbyTest(uint32_t seconds) { s_testS = seconds; s_testAt = millis(); }   // web: runs from loop()
+void standbyTest(uint32_t seconds, bool ulp) { s_testUlp = ulp; s_testS = seconds; s_testAt = millis(); }   // web: runs from loop()
 
-static void standbyTestNow(uint32_t seconds)
+static void standbyTestNow(uint32_t seconds, bool ulp)
 {
   char m[64];
-  snprintf(m, sizeof(m), "STANDBY TEST %lus (timer only)", (unsigned long)seconds);
+  snprintf(m, sizeof(m), "STANDBY TEST %lus %s", (unsigned long)seconds, ulp ? "ULP + timer" : "(timer only)");
   logNetEvent(m);
   if (s_nextReport < time(nullptr) + (time_t)seconds + 60) s_nextReport = time(nullptr) + STANDBY_REPORT_S;
   telemetryCellOff();
   prepareRestart("SLEEP_TEST");
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
-  sleepNow(false, seconds);
+  s_ulpTest = ulp ? 1 : 0;
+  sleepNow(ulp, seconds);
+}
+
+// ULP_READ: the ULP measures while the chip is awake (threshold never reached = no wake), 1 s;
+// its 4-sample sum next to analogRead - the same input and scale? (21.10.2026)
+int standbyUlpRead(char* buf, int cap)
+{
+  RTC_SLOW_MEM[ULP_LAST] = 0xFFFF;
+  if (!ulpStart(0xFFFF)) return snprintf(buf, cap, "ERR ULP start");
+  delay(1100);
+  ulp_timer_stop();
+  delay(250);                          // a run in progress ends
+  unsigned sum = RTC_SLOW_MEM[ULP_LAST] & 0xFFFF;
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ULP);
+  uint32_t raw = 0;
+  for (int i = 0; i < 4; i++) raw += analogRead(36);   // adc1_get_raw: the ADC back from the ULP
+  return snprintf(buf, cap, "ulp_sum4=%u%s ulp_v=%.2f arduino_sum4=%lu v=%.2f thr_sum4=%u",
+                  sum, sum == 0xFFFF ? " (ULP wrote nothing)" : "", sum / 4.0f / ADC_12V_FACTOR_SB,
+                  (unsigned long)raw, raw / 4.0f / ADC_12V_FACTOR_SB, (unsigned)rawX4(ENGINE_OFF_VOLTAGE));
 }
 
 int standbyStatus(char* buf, int cap)

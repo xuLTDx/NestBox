@@ -145,7 +145,13 @@ static int handlerControl(UrlHandlerParam* param)
   } else if (!strncmp(cmd, "SLEEP_TEST=", 11)) {     // bench: deep sleep now, timer wake after <s> (10..3600)
     uint32_t sec = strtoul(cmd + 11, nullptr, 10);
     if (sec < 10 || sec > 3600) n = snprintf(buf, bufsize, "ERR 10..3600 s");
-    else { standbyTest(sec); n = snprintf(buf, bufsize, "OK sleep %lu s in ~2 s", (unsigned long)sec); }
+    else { standbyTest(sec, false); n = snprintf(buf, bufsize, "OK sleep %lu s in ~2 s", (unsigned long)sec); }
+  } else if (!strncmp(cmd, "SLEEP_ULP=", 10)) {      // car: deep sleep with the ULP (>= 12.8 V wakes), timer after <s> (10..60)
+    uint32_t sec = strtoul(cmd + 10, nullptr, 10);
+    if (sec < 10 || sec > 60) n = snprintf(buf, bufsize, "ERR 10..60 s");
+    else { standbyTest(sec, true); n = snprintf(buf, bufsize, "OK sleep %lu s with ULP in ~2 s", (unsigned long)sec); }
+  } else if (!strcmp(cmd, "ULP_READ")) {
+    n = standbyUlpRead(buf, bufsize);
   } else if (!strncmp(cmd, "AT=", 3)) {             // modem diagnostics, local only: AT=AT+CGDCONT?
     n = telemetryModemAt(cmd + 3, buf, bufsize);
   } else if (!strncmp(cmd, "CELL=", 5)) {           // modem on/off (stored)
