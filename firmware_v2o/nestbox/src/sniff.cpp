@@ -22,7 +22,11 @@ void sdUnlock();
 // receive tasks -> SD writer (PSRAM): 65536 frames = ~1.5 MB; with ~1580 frames/s
 // on Peugeot 6/14 (2026-10-12) that is ~40 s of a stalled card
 static const uint32_t QUEUE_TRY[] = {65536, 32768, 8192};
-#define SPEED_PROBE_MS 2000
+#define SPEED_PROBE_MS 5000
+// a speed counts as found only with clean frames: at least this many in the probe window and no
+// new error interrupt (21.10.2026: CAN2 of the Peugeot "found" 125k on noise - 4971 bad frames,
+// eflg 0x40; the bus is 500k, verified 15:19 with clean 0x736/0x716 frames)
+#define SPEED_MIN_FRAMES 3
 #define STATS_EVERY_MS 60000
 #define NVS_SAVE_EVERY_MIN 5
 
@@ -49,7 +53,7 @@ struct BusState {
   bool on;                                    // taking part in this session
   int speedIdx;
   bool speedFound;
-  uint32_t probeStart, probeFrames;
+  uint32_t probeStart, probeFrames, probeErr;
   volatile uint32_t frames;
 };
 static BusState s_bus[SNIFF_BUSES];
@@ -438,6 +442,8 @@ static bool startNow(uint16_t minutes)
     b.speedIdx = 0;
     b.speedFound = false;
     b.frames = 0;
+    // Peugeot K0: CAN2 = OBD 3/8 is 500 kbit/s (verified 21.10.2026) - no probe
+    if (i == 1 && s_vehicle == "Peugeot_K0") b.speedFound = true;
   }
   s_closing = false;
   s_lastStats = millis();
@@ -450,7 +456,9 @@ static bool startNow(uint16_t minutes)
     bool ok = busStart(i);
     b.probeStart = millis();
     b.probeFrames = 0;
+    b.probeErr = mcpFor(i) ? mcpFor(i)->stats().errIrq : 0;
     Serial.printf("[SNIFF] CAN%d listen-only %s\n", i + 1, ok ? "started" : "FAILED");
+    if (i == 1 && b.speedFound) addLine("# can2 speed 500 kbit/s (Peugeot_K0, fixed)");
   }
   xSemaphoreGive(s_canMux);
   s_minLeft = minutes;
@@ -497,7 +505,9 @@ static void speedTick()
   for (int i = 1; i < SNIFF_BUSES; i++) {    // CAN1: canbus1.cpp probes its own speed
     BusState& b = s_bus[i];
     if (!b.on || b.speedFound) continue;
-    if (b.frames > b.probeFrames) {
+    uint32_t err = mcpFor(i) ? mcpFor(i)->stats().errIrq : 0;
+    bool clean = err == b.probeErr;
+    if (clean && b.frames - b.probeFrames >= SPEED_MIN_FRAMES) {
       b.speedFound = true;
       char line[64];
       snprintf(line, sizeof(line), "# can%d speed %lu kbit/s", i + 1, (unsigned long)s_speeds[b.speedIdx]);
@@ -512,6 +522,7 @@ static void speedTick()
     busStart(i);
     b.probeFrames = b.frames;
     b.probeStart = millis();
+    b.probeErr = mcpFor(i) ? mcpFor(i)->stats().errIrq : 0;
     xSemaphoreGive(s_canMux);
   }
 }

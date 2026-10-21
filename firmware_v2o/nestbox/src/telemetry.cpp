@@ -45,6 +45,7 @@ const char* bootResetInfo(char* buf, int cap);   // main.cpp
 #define PID_UREA_KM    0x39A     // NEW: AdBlue range before start inhibit, km (candidate)
 #define PID_UREA_RAW   0x39B     // NEW: 0x5A8 raw, 8 bytes
 #define PID_RPM        0x10C     // rpm (v1F: OBD 0x0C | 0x100)
+#define PID_AUTO_READ  0x39F     // NEW: automatic diagnostic read (K0), "<item>;<bus>;<result>;<nrc>;<response bytes>"
 #define PID_ENG_STATE  0x39C     // NEW: K0 0x348 engine running state (1 off, 3 running, 4 stop-start ...)
 #define PID_ENGINE_EVENT      0x380   // v1F: 1 = START, 2 = STOP
 #define PID_ENGINE_EVENT_TIME 0x381   // v1F: unix time of the event
@@ -147,6 +148,93 @@ void telemetryCellOff()
 }
 CellLink* telemetryCellLink() { return s_cellUp ? &s_cell : nullptr; }   // pull-OTA over cellular
 
+// ---- automatic diagnostic reads (Peugeot K0, agreed 21.10.2026 "k") ------------------------
+// At every engine START and then every 10 min while the engine runs, one UDS 22 read after
+// another (1 s apart), only reading services (nbread.h). DIDs from PSA-RE (prototux/PSA-RE
+// diag/: CMM DCM62 0x6A8->0x688, BSI2010_EV 0x752->0x652). The CMM answered Launch on CAN1
+// (OBD 6/14, sniff 21.10.2026); on which bus the BSI answers is not known: CAN2 (OBD 3/8)
+// first, then CAN1 - the bus that answered is kept for the boot. Raw response into the next
+// record (PID 0x39F) and an SD event line; FleetNest stores it, decoding comes later.
+#define AUTO_READ_EVERY_MS 600000UL
+#define AUTO_READ_GAP_MS   1000UL
+struct AutoRead { uint32_t tx, rx; uint8_t did[2]; uint8_t buses[2]; };
+static const AutoRead K0_READS[] = {
+  {0x752, 0x652, {0xDB, 0xED}, {2, 1}},   // BSI: km to the next service
+  {0x752, 0x652, {0xDC, 0x5F}, {2, 1}},   // BSI: months to the next service
+  {0x6A8, 0x688, {0xD5, 0x1F}, {1, 0}},   // CMM: engine oil dilution (to be verified)
+  {0x6A8, 0x688, {0xD4, 0x29}, {1, 0}},   // CMM: oil pressure
+  {0x6A8, 0x688, {0xD5, 0x17}, {1, 0}},   // CMM: urea volume - both bytes kept (x0.001 L? to be verified at a refill)
+};
+#define K0_READS_N (sizeof(K0_READS) / sizeof(K0_READS[0]))
+static uint8_t s_autoBus[K0_READS_N];        // the bus that answered (0 = not known yet)
+#define AUTO_Q 8
+static uint8_t s_autoQ[AUTO_Q][5 + NB_READ_RECORD_MAX];
+static int s_autoQLen[AUTO_Q];
+static uint8_t s_autoHead, s_autoCount;
+static portMUX_TYPE s_autoMux = portMUX_INITIALIZER_UNLOCKED;
+
+static void autoReadPush(uint8_t item, uint8_t bus, int res, uint8_t nrc, const uint8_t* resp, int len)
+{
+  portENTER_CRITICAL(&s_autoMux);
+  uint8_t slot = (s_autoHead + s_autoCount) % AUTO_Q;
+  if (s_autoCount == AUTO_Q) s_autoHead = (s_autoHead + 1) % AUTO_Q; else s_autoCount++;
+  uint8_t* q = s_autoQ[slot];
+  q[0] = item; q[1] = bus; q[2] = (uint8_t)res; q[3] = nrc;
+  int n = len < NB_READ_RECORD_MAX ? len : NB_READ_RECORD_MAX;
+  if (n > 0) memcpy(q + 4, resp, n);
+  s_autoQLen[slot] = 4 + (n > 0 ? n : 0);
+  portEXIT_CRITICAL(&s_autoMux);
+}
+
+static int autoReadForRecord(uint8_t* out, int cap)
+{
+  int n = 0;
+  portENTER_CRITICAL(&s_autoMux);
+  if (s_autoCount) {
+    n = s_autoQLen[s_autoHead] < cap ? s_autoQLen[s_autoHead] : cap;
+    memcpy(out, s_autoQ[s_autoHead], n);
+    s_autoHead = (s_autoHead + 1) % AUTO_Q;
+    s_autoCount--;
+  }
+  portEXIT_CRITICAL(&s_autoMux);
+  return n;
+}
+
+// loop() (the bus owner, as readTick): one read per call when due
+static void autoReadTick()
+{
+  static bool wasOn;
+  static int next = -1;
+  static uint32_t lastRound, lastItem;
+  if (strcmp(carProfile(), "K0")) return;
+  bool on = s_engineOn;
+  if (on && !wasOn) next = 0;                                   // START
+  wasOn = on;
+  if (on && next < 0 && lastRound && millis() - lastRound >= AUTO_READ_EVERY_MS) next = 0;
+  if (next < 0 || millis() - lastItem < AUTO_READ_GAP_MS) return;
+  const AutoRead& a = K0_READS[next];
+  NbRead r = {};
+  r.txId = a.tx; r.rxId = a.rx;
+  r.req[0] = 0x22; r.req[1] = a.did[0]; r.req[2] = a.did[1]; r.reqLen = 3;
+  static uint8_t resp[NB_READ_MAX];
+  int len = 0, res = NBR_NO_REPLY;
+  uint8_t nrc = 0;
+  for (int k = 0; k < 2; k++) {
+    uint8_t bus = s_autoBus[next] ? (k ? 0 : s_autoBus[next]) : a.buses[k];
+    if (!bus) break;
+    r.bus = bus;
+    lastStep("auto read %d bus %u", next, bus);
+    res = busExchange(&r, resp, sizeof(resp), &len, &nrc);
+    if (res == NBR_OK || res == NBR_NRC) { s_autoBus[next] = bus; break; }
+  }
+  autoReadPush((uint8_t)next, r.bus, res, nrc, resp, len);
+  char line[300];
+  nbReadLine(line, sizeof(line), 1000 + next, &r, res, nrc, resp, len);
+  s_log.logEvent(line);
+  lastItem = millis();
+  if (++next >= (int)K0_READS_N) { next = -1; lastRound = millis(); }
+}
+
 // event: 0 = a regular record, 1 = START, 2 = STOP (timed at `when`, the record's own time)
 static void makeRecord(int event = 0, time_t when = 0)
 {
@@ -218,6 +306,9 @@ static void makeRecord(int event = 0, time_t when = 0)
     r.wire.log(PID_UREA_RAW, u, 8);
     s_log.log(PID_UREA_RAW, u, 8);
   }
+  uint8_t ar[5 + NB_READ_RECORD_MAX];   // automatic read result (PID 0x39F), one per record
+  int arn = autoReadForRecord(ar, sizeof(ar));
+  if (arn) { r.wire.log(PID_AUTO_READ, ar, arn); s_log.log(PID_AUTO_READ, ar, arn); }
   uint8_t rd[3 + NB_READ_RECORD_MAX];   // READ result (nbread.h, PID 0x39D)
   int rn = nbReadForRecord(rd, sizeof(rd));
   if (rn) { r.wire.log(PID_READ_RESULT, rd, rn); s_log.log(PID_READ_RESULT, rd, rn); }
@@ -392,7 +483,7 @@ void readTick()
 {
   NbRead r;
   uint32_t seq;
-  if (!nbReadTake(&r, &seq)) return;
+  if (!nbReadTake(&r, &seq)) { autoReadTick(); return; }
   static uint8_t resp[NB_READ_MAX];
   int len = 0;
   uint8_t nrc = 0;
