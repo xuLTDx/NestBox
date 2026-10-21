@@ -158,6 +158,12 @@ struct CellConn : OtaConn {
   void stop() override { m->tlsClose(); }
 };
 
+// Both connections live outside the ota task's stack, as v1F's global otaWifiClient
+// (telelogger.ino): on the stack (2 x 1 KB line buffer + the TLS client) the second TLS
+// handshake overflowed the 8 KB stack - "Stack canary watchpoint triggered (ota)", serial 21.10.2026.
+static WifiConn s_wc;
+static CellConn s_cc(nullptr);
+
 // one GET; returns the status code (-1 = no connection), *len = Content-Length (-1 unknown).
 // The body is then read with c.body().
 static int httpGet(OtaConn& c, const char* path, size_t rangeFrom, long* len)
@@ -235,9 +241,8 @@ static void check()
   char path[300];
   snprintf(path, sizeof(path), "/api/nestbox/ota/%s/meta.json?build=%s&variant=%s", s_token,
            urlBuild().c_str(), OTA_VARIANT);
-  WifiConn wc;
-  CellConn cc(cell);
-  OtaConn& c = cell ? (OtaConn&)cc : (OtaConn&)wc;
+  s_cc.m = cell;
+  OtaConn& c = cell ? (OtaConn&)s_cc : (OtaConn&)s_wc;
   otaLog(cell ? "OTA-PULL CHECK cell" : "OTA-PULL CHECK wifi");
   long len = 0;
   int code = httpGet(c, path, 0, &len);
