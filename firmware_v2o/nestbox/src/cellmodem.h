@@ -12,7 +12,8 @@
 //    CGSOCKCONT + CSOCKSETPN (APN), CIPMODE=0, NETOPEN, UDP with CIPRXGET=1
 //    (buffer mode - the server's commands are not lost between polls, v1F
 //    2026-09-23), CIPOPEN=0,"UDP",..., CIPSEND=0,<len>,"<ip>",<port>, CIPRXGET=2;
-//  - GNSS: AT+CGPS=1,1 (v1F setGPS), position polled with AT+CGNSSINFO (v1F
+//  - GNSS: AT+CGPS=1,1 (v1F setGPS), position polled with AT+CGNSSINFO, and
+//    AT+CGPSINFO when that is empty (SIM7600G V2.0.2, Peugeot 21.10.2026) (v1F
 //    used the CGPSINFO URC, which has no satellite count; FleetNest hides
 //    points with < 4 satellites). The field list of CGNSSINFO differs between
 //    firmware versions (an extra GALILEO count) - the parser finds the fields
@@ -46,7 +47,7 @@ public:
   void begin();                // UART + mutex; the modem task does the rest
   bool start();                // power on, SIM, registration, data - true = up (blocking, up to ~2 min)
   void stop();                 // network closed, modem powered off
-  bool gnss(GnssFix* out);     // one AT+CGNSSINFO reading (modem on, network not needed)
+  bool gnss(GnssFix* out);     // one AT+CGNSSINFO reading, CGPSINFO when empty (modem on, network not needed)
   bool alive_() { return m_alive; }
   int rssi();                  // dBm, 0 = unknown
   const char* status() { return m_status; }
@@ -63,6 +64,7 @@ public:
   void tlsClose();
 private:
   bool at(const char* cmd, unsigned int timeoutMs = 1000, const char* expect = nullptr);
+  bool gnssLine(const char* cmd, const char* tag, char* line, int cap);
   bool waitFor(const char* a, const char* b, unsigned int timeoutMs);
   bool alive();
   void pressKey(int ms);

@@ -222,42 +222,73 @@ static float degOf(const char* s)
   return d + (v - d * 100) / 60.0;
 }
 
+// one AT query, the text after "<tag>" up to the line end into line (under the lock)
+bool CellLink::gnssLine(const char* cmd, const char* tag, char* line, int cap)
+{
+  lock();
+  bool got = at(cmd, 1000, tag);
+  if (got) waitFor("\r\nOK", nullptr, 300);
+  char* p = got ? strstr(m_buf, tag) : nullptr;
+  if (!p) { unlock(); return false; }
+  p += strlen(tag);
+  while (*p == ' ') p++;
+  int i = 0;
+  while (*p && *p != '\r' && *p != '\n' && i < cap - 1) line[i++] = *p++;
+  line[i] = 0;
+  unlock();
+  return true;
+}
+
+// splits at commas; an empty field stays empty
+static int fields(char* s, char** tok, int max)
+{
+  int nt = 0;
+  tok[nt++] = s;
+  for (; *s && nt < max; s++) if (*s == ',') { *s = 0; tok[nt++] = s + 1; }
+  return nt;
+}
+
 bool CellLink::gnss(GnssFix* f)
 {
   memset(f, 0, sizeof(*f));
   if (!m_mux || !m_alive) return false;
-  lock();                              // the whole reply is read under the lock
-  bool got = at("AT+CGNSSINFO\r", 1000, "+CGNSSINFO:");
-  if (got) waitFor("\r\nOK", nullptr, 300);
   char line[200];
-  char* p = got ? strstr(m_buf, "+CGNSSINFO:") : nullptr;
-  if (!p) { unlock(); return false; }
-  p += 11;
-  while (*p == ' ') p++;
-  int i = 0;
-  while (*p && *p != '\r' && *p != '\n' && i < (int)sizeof(line) - 1) line[i++] = *p++;
-  line[i] = 0;
-  unlock();
-  // tokens; an empty field stays empty
   char* tok[24];
-  int nt = 0;
-  char* s = line;
-  tok[nt++] = s;
-  for (; *s && nt < 24; s++) if (*s == ',') { *s = 0; tok[nt++] = s + 1; }
-  int ns = -1;                         // index of the N/S letter
-  for (int k = 0; k + 1 < nt; k++) if ((!strcmp(tok[k], "N") || !strcmp(tok[k], "S")) && k >= 2) { ns = k; break; }
-  if (ns < 0 || ns + 9 >= nt || !tok[ns - 1][0]) return false;   // no fix (fields empty)
-  int sats = 0;
-  for (int k = 1; k < ns - 1; k++) sats += atoi(tok[k]);          // GPS + GLONASS + BEIDOU (+ GALILEO)
-  f->lat = degOf(tok[ns - 1]) * (tok[ns][0] == 'S' ? -1 : 1);
-  f->lng = degOf(tok[ns + 1]) * (tok[ns + 2][0] == 'W' ? -1 : 1);
-  f->date = (uint32_t)atol(tok[ns + 3]);                          // DDMMYY
-  f->time = (uint32_t)(atof(tok[ns + 4]) * 100);                  // HHMMSS.s -> HHMMSSss
-  f->alt = atof(tok[ns + 5]);
-  f->kph = atof(tok[ns + 6]) * 1.852f;                            // knots
-  f->heading = (uint16_t)atof(tok[ns + 7]);
-  f->hdop = ns + 9 < nt ? atof(tok[ns + 9]) : 0;                  // PDOP, HDOP, VDOP
-  f->sats = sats;
+  // CGNSSINFO first (has the satellite count); SIM7600G V2.0.2 in the Peugeot (21.10.2026)
+  // answers it empty while CGPSINFO has the fix -> then CGPSINFO
+  if (gnssLine("AT+CGNSSINFO\r", "+CGNSSINFO:", line, sizeof(line))) {
+    int nt = fields(line, tok, 24);
+    int ns = -1;                       // index of the N/S letter
+    for (int k = 0; k + 1 < nt; k++) if ((!strcmp(tok[k], "N") || !strcmp(tok[k], "S")) && k >= 2) { ns = k; break; }
+    if (ns >= 0 && ns + 9 < nt && tok[ns - 1][0]) {
+      int sats = 0;
+      for (int k = 1; k < ns - 1; k++) sats += atoi(tok[k]);      // GPS + GLONASS + BEIDOU (+ GALILEO)
+      f->lat = degOf(tok[ns - 1]) * (tok[ns][0] == 'S' ? -1 : 1);
+      f->lng = degOf(tok[ns + 1]) * (tok[ns + 2][0] == 'W' ? -1 : 1);
+      f->date = (uint32_t)atol(tok[ns + 3]);                        // DDMMYY
+      f->time = (uint32_t)(atof(tok[ns + 4]) * 100);                // HHMMSS.s -> HHMMSSss
+      f->alt = atof(tok[ns + 5]);
+      f->kph = atof(tok[ns + 6]) * 1.852f;                          // knots
+      f->heading = (uint16_t)atof(tok[ns + 7]);
+      f->hdop = ns + 9 < nt ? atof(tok[ns + 9]) : 0;                // PDOP, HDOP, VDOP
+      f->sats = sats;
+      f->valid = true;
+      f->at = millis();
+      return true;
+    }
+  }
+  // +CGPSINFO: lat,N/S,lon,E/W,DDMMYY,HHMMSS.s,alt,speed(knots),course - no satellite count
+  // (sats 0 = not sent; FleetNest keeps points without a count)
+  if (!gnssLine("AT+CGPSINFO\r", "+CGPSINFO:", line, sizeof(line))) return false;
+  int nt = fields(line, tok, 24);
+  if (nt < 9 || !tok[0][0] || !tok[2][0]) return false;            // no fix (fields empty)
+  f->lat = degOf(tok[0]) * (tok[1][0] == 'S' ? -1 : 1);
+  f->lng = degOf(tok[2]) * (tok[3][0] == 'W' ? -1 : 1);
+  f->date = (uint32_t)atol(tok[4]);
+  f->time = (uint32_t)(atof(tok[5]) * 100);
+  f->alt = atof(tok[6]);
+  f->kph = atof(tok[7]) * 1.852f;                                   // knots (v1F: speed * 1.852)
+  f->heading = (uint16_t)atof(tok[8]);
   f->valid = true;
   f->at = millis();
   return true;
