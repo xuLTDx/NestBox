@@ -28,6 +28,9 @@
 #include "cardecode.h"
 #include "canbus1.h"
 #include "ota.h"
+#include "laststep.h"
+
+const char* bootResetInfo(char* buf, int cap);   // main.cpp
 #include "nbread.h"
 #include "nbapn.h"
 
@@ -288,6 +291,7 @@ static void netTask(void*)
       snprintf(m, sizeof(m), "NET LINK %s", cur ? cur->name() : "none");
       Serial.println(m);
       logNetEvent(m);
+      lastStep("%s", m);
     }
     if (!cur) {
       vTaskDelay(pdMS_TO_TICKS(1000));
@@ -344,8 +348,8 @@ void telemetryBegin(uint32_t bootId, bool sdOk)
     uint32_t id = s_log.begin(last);
     if (id) { nvs_set_u32(nvs, "DATA_ID", id); nvs_commit(nvs); }
     txqSetFile(id);
-    char ev[64];
-    snprintf(ev, sizeof(ev), "BOOT %lu ID=%s", (unsigned long)bootId, devid);
+    char ev[160], ri[100];
+    snprintf(ev, sizeof(ev), "BOOT %lu ID=%s %s", (unsigned long)bootId, devid, bootResetInfo(ri, sizeof(ri)));
     s_log.logEvent(ev);
   } else {
     txqSetFile(0);

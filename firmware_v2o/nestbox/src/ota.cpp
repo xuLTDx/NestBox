@@ -1,5 +1,6 @@
 // see ota.h
 #include "ota.h"
+#include "laststep.h"
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <Update.h>
@@ -303,6 +304,7 @@ static void check()
     otaLog(m);
   }
   snprintf(path, sizeof(path), "/api/nestbox/ota/%s/firmware.bin", s_token);
+  lastStep("OTA GET firmware from %u", (unsigned)from);
   code = httpGet(c, path, from, &len);
   size_t written = from;
   uint32_t t0 = millis();
@@ -322,10 +324,12 @@ static void check()
       if (!ok) break;
       mbedtls_sha256_update_ret(&ctx, s_buf, n);
       written += n;
+      lastStep("OTA download %u/%u", (unsigned)written, (unsigned)size);
     }
   }
   c.stop();
   sdLock(); out.close(); sdUnlock();
+  lastStep("OTA download end %u/%u", (unsigned)written, (unsigned)size);
   if (written != size) {
     mbedtls_sha256_free(&ctx);
     snprintf(m, sizeof(m), "OTA-PULL ERR=RECV %u/%u http=%d in %ums", (unsigned)written, (unsigned)size, code,
@@ -387,6 +391,7 @@ static void flashStaged()
     sdUnlock();
     if (n <= 0 || Update.write(s_buf, n) != (size_t)n) break;
     done += n;
+    lastStep("OTA flash %u/%u", (unsigned)done, (unsigned)size);
   }
   sdLock(); f.close(); sdUnlock();
   if (done != size || !Update.end()) {

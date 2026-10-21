@@ -13,6 +13,7 @@
 #include "sniff.h"
 #include "canbus1.h"
 #include "ota.h"
+#include "laststep.h"
 
 extern const char FW_BUILD_STR[] = __DATE__ " " __TIME__;
 
@@ -33,6 +34,15 @@ static const char* WIFI_NETS[][2] = {{"NTLIRIS", WIFI_PASSWORD}, {"uLTD_ext", WI
 
 static uint32_t s_bootId;
 static bool s_sdOk;
+
+RTC_NOINIT_ATTR LastStep g_lastStep;          // laststep.h
+static char s_prevStep[sizeof(g_lastStep.text)];
+// the BOOT event's tail: reset reason + the step marked before the reset
+const char* bootResetInfo(char* buf, int cap)
+{
+  snprintf(buf, cap, "reset=%s step=%s", resetReasonName(esp_reset_reason()), s_prevStep[0] ? s_prevStep : "-");
+  return buf;
+}
 
 uint32_t bootId() { return s_bootId; }
 
@@ -101,9 +111,14 @@ static void wifiTick()
 void setup()
 {
   telemetryEarly();                           // first: the delivery queue's PSRAM reserve (txqueue.h)
+  if (g_lastStep.magic == LASTSTEP_MAGIC && esp_reset_reason() != ESP_RST_POWERON) {
+    memcpy(s_prevStep, g_lastStep.text, sizeof(s_prevStep));
+    s_prevStep[sizeof(s_prevStep) - 1] = 0;
+  }
+  lastStep("boot");
   Serial.begin(115200);
   delay(100);
-  Serial.printf("\nNestBox_v2O %s reset=%d\n", FW_BUILD_STR, (int)esp_reset_reason());
+  Serial.printf("\nNestBox_v2O %s reset=%d step=%s\n", FW_BUILD_STR, (int)esp_reset_reason(), s_prevStep);
 
   Preferences p;
   p.begin("nestbox", false);
