@@ -63,7 +63,15 @@ public:
   bool tlsSend(const char* data, int len);
   int tlsRead(uint8_t* buf, int cap, unsigned int timeoutMs);   // >0 bytes, 0 closed, -1 timeout
   void tlsClose();
+  // HTTPS diagnostics (p42, 2026-10-26: OTA over cellular ended with META_HTTP0) - the modem's
+  // AT+CCH* answers into the record (PID 0x399); set by ota.cpp, nullptr = none
+  void (*diag)(const char*) = nullptr;
 private:
+  int m_diagRecv = 0;
+  bool m_moreData = false;   // the last AT+CCHRECV filled the buffer: read again without a new notice
+  // data the modem pushed by itself (+CCHRECV: DATA,0,<n> without AT+CCHRECV - p43), not yet read
+  uint8_t m_push[2048];
+  int m_pushLen = 0, m_pushPos = 0;
   bool at(const char* cmd, unsigned int timeoutMs = 1000, const char* expect = nullptr);
   bool gnssLine(const char* cmd, const char* tag, char* line, int cap);
   bool waitFor(const char* a, const char* b, unsigned int timeoutMs);

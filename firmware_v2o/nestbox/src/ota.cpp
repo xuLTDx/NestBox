@@ -51,7 +51,7 @@ static volatile bool s_staged;               // a verified image waits on SD for
 static uint8_t s_buf[OTA_CHUNK];
 
 // -------------------------------------------------------------- status ---
-#define OTA_STATUS_Q 8
+#define OTA_STATUS_Q 24      // p42: CCH diagnostics - several lines in a row
 static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 static char s_q[OTA_STATUS_Q][64];
 static uint8_t s_head, s_count;
@@ -166,6 +166,8 @@ static CellConn s_cc(nullptr);
 
 // one GET; returns the status code (-1 = no connection), *len = Content-Length (-1 unknown).
 // The body is then read with c.body().
+static String s_lastStatus;                  // the answer's first line (p42 diagnostics)
+
 static int httpGet(OtaConn& c, const char* path, size_t rangeFrom, long* len)
 {
   c.rn = c.rp = 0;
@@ -176,6 +178,7 @@ static int httpGet(OtaConn& c, const char* path, size_t rangeFrom, long* len)
   snprintf(req + n, sizeof(req) - n, "\r\n");
   c.write(req);
   String status = c.line(OTA_TIMEOUT_MS);
+  s_lastStatus = status.substring(0, 40);
   int code = status.length() > 12 ? status.substring(9, 12).toInt() : 0;
   *len = -1;
   for (;;) {
@@ -242,6 +245,7 @@ static void check()
   snprintf(path, sizeof(path), "/api/nestbox/ota/%s/meta.json?build=%s&variant=%s", s_token,
            urlBuild().c_str(), OTA_VARIANT);
   s_cc.m = cell;
+  if (cell) cell->diag = otaLog;              // p42: the modem's answers into the record
   OtaConn& c = cell ? (OtaConn&)s_cc : (OtaConn&)s_wc;
   otaLog(cell ? "OTA-PULL CHECK cell" : "OTA-PULL CHECK wifi");
   long len = 0;
@@ -250,6 +254,9 @@ static void check()
     char m[48];
     snprintf(m, sizeof(m), "OTA-PULL ERR=META_HTTP%d", code);
     otaLog(m);
+    char st[64];
+    snprintf(st, sizeof(st), "OTA-PULL STATUS '%s' len=%u", s_lastStatus.c_str(), s_lastStatus.length());
+    otaLog(st);
     c.stop();
     return;
   }

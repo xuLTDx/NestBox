@@ -317,16 +317,39 @@ int CellLink::raw(const char* cmd, unsigned int timeoutMs, char* out, int cap)
 
 // ------------------------------------------------------------- HTTPS (CCH) ---
 
+// a modem answer as diagnostic text: \r\n -> '|', non-printable -> '.', at most `cap` chars
+static void diagText(char* out, int cap, const char* prefix, const char* in)
+{
+  int n = snprintf(out, cap, "%s", prefix);
+  for (const char* p = in; *p && n < cap - 1; p++) {
+    char ch = *p;
+    if (ch == '\r') continue;
+    out[n++] = ch == '\n' ? '|' : (ch >= 32 && ch < 127 ? ch : '.');
+  }
+  out[n < cap ? n : cap - 1] = 0;
+}
+
 bool CellLink::tlsOpen(const char* host, uint16_t port)
 {
   if (!m_netOpen) return false;
   lock();
   at("AT+CCHCLOSE=0\r", 2000, "+CCHCLOSE:");   // a session left from before (harmless ERROR)
-  at("AT+CCHSTOP\r", 2000);
-  at("AT+CCHSET=1,1\r");                       // send result report, cache receive mode - before CCHSTART
+  at("AT+CCHSTOP\r", 3000, "+CCHSTOP:");      // wait for the stop itself, not only its OK (p43)
+  // send result report, cache receive mode - before CCHSTART; an ERROR here left the modem pushing
+  // the answer by itself (p43, 26.10.2026: CCHRECV only ERROR, the answer never read)
+  bool set = at("AT+CCHSET=1,1\r");
+  if (!set) { delay(500); set = at("AT+CCHSET=1,1\r"); }
+  if (diag) { char t[64]; diagText(t, sizeof(t), set ? "CCH SET OK " : "CCH SET ERR ", m_buf); diag(t); }
+  m_pushLen = m_pushPos = 0;
+  m_moreData = false;
   bool started = at("AT+CCHSTART\r", 5000);
   if (!started) started = at("AT+CCHSTART\r", 5000);
-  if (!started) { unlock(); snprintf(m_status, sizeof(m_status), "online, CCHSTART failed"); return false; }
+  if (!started) {
+    if (diag) { char t[64]; diagText(t, sizeof(t), "CCH START ERR ", m_buf); diag(t); }
+    unlock(); snprintf(m_status, sizeof(m_status), "online, CCHSTART failed"); return false;
+  }
+  m_diagRecv = 0;
+  if (diag && at("AT+CCHSET?\r", 2000)) { char t[64]; diagText(t, sizeof(t), "CCH SET? ", m_buf); diag(t); }
   at("AT+CSSLCFG=\"sslversion\",0,4\r");       // all versions
   at("AT+CSSLCFG=\"authmode\",0,0\r");         // no server certificate check (as v1F, self-signed server)
   at("AT+CSSLCFG=\"ignorelocaltime\",0,1\r");
@@ -336,6 +359,7 @@ bool CellLink::tlsOpen(const char* host, uint16_t port)
   snprintf(c, sizeof(c), "AT+CCHOPEN=0,\"%s\",%u,2\r", host, (unsigned)port);
   bool ok = at(c, 30000, "+CCHOPEN: 0,0");
   if (!ok) Serial.printf("[CELL] CCHOPEN %s:%u failed: %s\n", host, (unsigned)port, m_buf);
+  if (diag) { char t[64]; diagText(t, sizeof(t), ok ? "CCH OPEN OK " : "CCH OPEN ERR ", m_buf); diag(t); }
   unlock();
   return ok;
 }
@@ -352,6 +376,12 @@ bool CellLink::tlsSend(const char* data, int len)
     m_buf[0] = 0;
     ok = waitFor("\r\nOK", "\r\nERROR", 10000);
   }
+  if (diag) {
+    char t[64], pre[24];
+    snprintf(pre, sizeof(pre), "CCH SEND %d %s ", len, ok ? "OK" : "ERR");
+    diagText(t, sizeof(t), pre, m_buf);
+    diag(t);
+  }
   unlock();
   return ok;
 }
@@ -359,47 +389,110 @@ bool CellLink::tlsSend(const char* data, int len)
 // one AT+CCHRECV: "+CCHRECV: DATA,0,<n>\r\n<n raw bytes>...OK"; no data = no DATA line
 int CellLink::tlsRead(uint8_t* buf, int cap, unsigned int timeoutMs)
 {
-  uint32_t t0 = millis();
-  for (;;) {
-    lock();
-    while (s_uart.available()) s_uart.read();
-    char c[40];
-    snprintf(c, sizeof(c), "AT+CCHRECV=0,%d\r", cap);
-    s_uart.print(c);
-    // header up to the end of the DATA line, or the final OK / ERROR without data
-    char head[96];
-    int hl = 0;
-    int n = -1;
-    bool closed = false;
-    uint32_t t = millis();
-    while (millis() - t < 3000) {
-      if (!s_uart.available()) { delay(1); continue; }
-      char ch = (char)s_uart.read();
-      if (hl < (int)sizeof(head) - 1) { head[hl++] = ch; head[hl] = 0; }
-      char* d = strstr(head, "+CCHRECV: DATA,0,");
-      if (d && ch == '\n') { n = atoi(d + 17); break; }
-      if (strstr(head, "PEER_CLOSED") || strstr(head, "+CCHCLOSE")) closed = true;
-      if (strstr(head, "\r\nOK\r\n") || strstr(head, "\r\nERROR\r\n")) break;
-    }
-    if (n > 0) {
-      int got = 0;
-      t = millis();
-      while (got < n && millis() - t < 5000) {
-        if (s_uart.available()) { int b = s_uart.read(); if (got < cap) buf[got] = (uint8_t)b; got++; t = millis(); }
-        else delay(1);
-      }
-      m_len = 0;
-      m_buf[0] = 0;
-      waitFor("\r\nOK", "\r\nERROR", 2000);   // the rest of the answer
-      if (strstr(m_buf, "PEER_CLOSED")) closed = true;
-      unlock();
-      return got > cap ? cap : got;
-    }
-    unlock();
-    if (closed) return 0;
-    if (millis() - t0 >= timeoutMs) return -1;
-    delay(200);                                 // nothing cached yet
+  // as the FreematicsPlus SIM7600 branch (p44, 2026-10-26): in cache mode wait for the modem's
+  // "+CCHRECV: 0,<n>" (data ready) or +CCH_PEER_CLOSED, only then AT+CCHRECV. The modem is held
+  // (lock) for the whole wait - another task's at() would throw the notice away. Every modem line
+  // goes into the diagnostics (first 16 per connection).
+  if (m_pushPos < m_pushLen) {
+    int n = m_pushLen - m_pushPos < cap ? m_pushLen - m_pushPos : cap;
+    memcpy(buf, m_push + m_pushPos, n);
+    m_pushPos += n;
+    return n;
   }
+  uint32_t t0 = millis(), lastProbe = millis();
+  lock();
+  // RECV EVENT comes only for NEW data: after a full read the rest is still cached (p46)
+  bool ready = m_moreData, closed = false;
+  m_moreData = false;
+  char line[96];
+  int ll = 0;
+  while (!ready && !closed && millis() - t0 < timeoutMs) {
+    if (millis() - lastProbe > 5000) { ready = true; break; }   // no notice in 5 s: try a read anyway
+    if (!s_uart.available()) { delay(2); continue; }
+    char ch = (char)s_uart.read();
+    if (ch != '\n') { if (ch != '\r' && ll < (int)sizeof(line) - 1) { line[ll++] = ch; line[ll] = 0; } continue; }
+    line[ll] = 0;
+    if (!ll) continue;
+    ll = 0;
+    if (diag && m_diagRecv < 16) { m_diagRecv++; char t[64]; diagText(t, sizeof(t), "CCH URC ", line); diag(t); }
+    char* d = strstr(line, "+CCHRECV: DATA,0,");
+    if (d) {                                   // pushed by the modem itself
+      int n = atoi(d + 17), got = 0;
+      uint32_t tb = millis();
+      while (got < n && millis() - tb < 5000) {
+        if (!s_uart.available()) { delay(1); continue; }
+        int b = s_uart.read();
+        if (got < (int)sizeof(m_push)) m_push[got] = (uint8_t)b;
+        got++;
+        tb = millis();
+      }
+      m_pushLen = got < (int)sizeof(m_push) ? got : (int)sizeof(m_push);
+      m_pushPos = 0;
+      unlock();
+      return tlsRead(buf, cap, timeoutMs);
+    }
+    // the data-ready notice: "+CCHEVENT: 0,RECV EVENT" on this SIM7600G (car 26.10.2026), as the
+    // FreematicsPlus inbound() pattern "RECV EVENT"; "+CCHRECV: 0,<n>" on other firmware (p45)
+    if (strstr(line, "RECV EVENT") || strstr(line, "+CCHRECV: 0,") || strstr(line, "+CCHRECV:0,")) ready = true;
+    if (strstr(line, "PEER_CLOSED") || strstr(line, "+CCHCLOSE")) closed = true;
+  }
+  if (!ready && !closed) { unlock(); return -1; }
+  // read what the modem keeps. SIM7500/SIM7600/SIM7800 SSL AT Command Manual V1.00, 2.2.10 - the
+  // answer is "OK" FIRST, then "+CCHRECV: DATA,<id>,<len>\r\n<len bytes>" (one or more), then
+  // "+CCHRECV: <id>,<err>"; ERROR when nothing is cached ("not allowed"). Stopping at the OK threw
+  // the data away (p46, car 26.10.2026: "+CCH_PEER_CLOSED: 0 | OK", then only ERROR).
+  if (diag && m_diagRecv < 16 && at("AT+CCHRECV?\r", 1000)) {
+    m_diagRecv++;
+    char t[64];
+    diagText(t, sizeof(t), "CCH LEN ", m_buf);
+    diag(t);
+  }
+  char c[40];
+  snprintf(c, sizeof(c), "AT+CCHRECV=0,%d\r", cap);
+  s_uart.print(c);
+  int got = 0, blocks = 0, err = -1;
+  bool failed = false;
+  ll = 0;
+  uint32_t t = millis();
+  while (millis() - t < 5000) {
+    if (!s_uart.available()) { delay(1); continue; }
+    char ch = (char)s_uart.read();
+    t = millis();
+    if (ch != '\n') { if (ch != '\r' && ll < (int)sizeof(line) - 1) { line[ll++] = ch; line[ll] = 0; } continue; }
+    line[ll] = 0;
+    if (!ll) continue;
+    ll = 0;
+    if (strstr(line, "PEER_CLOSED") || strstr(line, "+CCHCLOSE")) { closed = true; continue; }
+    if (!strcmp(line, "ERROR")) { failed = true; break; }
+    char* d = strstr(line, "+CCHRECV: DATA,");
+    if (d) {                                   // "<id>,<len>" (the manual also shows "DATA, <id>")
+      char* q = strchr(d + 15, ',');
+      int n = q ? atoi(q + 1) : 0, r = 0;
+      uint32_t tb = millis();
+      while (r < n && millis() - tb < 5000) {
+        if (!s_uart.available()) { delay(1); continue; }
+        int b = s_uart.read();
+        if (got < cap) buf[got++] = (uint8_t)b;
+        r++;
+        tb = millis();
+      }
+      blocks++;
+      continue;
+    }
+    if (!strncmp(line, "+CCHRECV: 0,", 12)) { err = atoi(line + 12); break; }   // end of the answer
+  }
+  if (diag && m_diagRecv < 16) {
+    m_diagRecv++;
+    char tt[64];
+    snprintf(tt, sizeof(tt), "CCH RECV got=%d blocks=%d err=%d%s%s", got, blocks, err,
+             failed ? " ERROR" : "", closed ? " closed" : "");
+    diag(tt);
+  }
+  if (got > 0) { m_moreData = got >= cap; unlock(); return got; }
+  unlock();
+  if (closed) return 0;
+  if (millis() - t0 >= timeoutMs) return -1;
+  return tlsRead(buf, cap, timeoutMs - (millis() - t0));   // nothing yet: wait for the next notice
 }
 
 void CellLink::tlsClose()
