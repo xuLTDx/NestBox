@@ -44,7 +44,10 @@ const char* standbyWakeName() { return s_wake; }
 
 static uint16_t rawX4(float volts) { return (uint16_t)(volts * ADC_12V_FACTOR_SB * 4.0f + 0.5f); }
 
-// ULP: 4 ADC1 ch0 samples summed; sum >= threshold -> wake the chip, else halt until the next period
+// ULP: 4 ADC1 ch0 samples summed; sum >= threshold -> wake the chip, else halt until the next period.
+// p55 (27.10.2026, as ESP-IDF 4.4 examples/system/ulp_fsm/ulp_adc): WAKE only when the RTC
+// controller is ready (RTC_CNTL_RDY_FOR_WAKEUP, else WAKE has no effect - ulp_instruction_set.rst),
+// not ready = halt and try at the next period; after WAKE the ULP timer stops (ulp_run starts it again)
 static bool ulpStart(uint16_t thrX4)
 {
   const ulp_insn_t prog[] = {
@@ -57,7 +60,11 @@ static bool ulpStart(uint16_t thrX4)
     I_MOVI(R2, ULP_THR), I_LD(R0, R2, 0),
     I_SUBR(R0, R3, R0),                 // sum - threshold: overflow = below
     M_BXF(1),
+    I_RD_REG(RTC_CNTL_LOW_POWER_ST_REG, RTC_CNTL_RDY_FOR_WAKEUP_S, RTC_CNTL_RDY_FOR_WAKEUP_S),
+    I_ANDI(R0, R0, 1),
+    M_BXZ(1),                           // not ready for the wake: next period
     I_WAKE(),
+    I_END(),                            // ULP timer off - the woken chip takes over
     M_LABEL(1),
     I_HALT()
   };
