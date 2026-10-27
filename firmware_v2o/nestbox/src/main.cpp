@@ -80,12 +80,13 @@ static bool sdMount()
 static int s_wifiNet = -1;
 static uint32_t s_wifiTry;
 
-// K12 (NAVRH 8, 27.10.2026): no known network for 2 min -> the box's own access point
+// K12 (NAVRH 8, 27.10.2026, only when AP=1 from FleetNest, default off): no known network for 2 min -> the box's own access point
 // "NestBox-<ID>" (password = the web password, K13; none set = no AP), the same page on 192.168.4.1;
 // a known network found again -> joined, the AP switched off
 #define WIFI_AP_AFTER_MS 120000UL
 extern char devid[12];
 const char* webPassword();
+bool webApAllowed();
 static uint32_t s_knownAt;
 static bool s_apOn;
 
@@ -101,7 +102,8 @@ static void apOff()
 static void wifiTick()
 {
   if (WiFi.status() == WL_CONNECTED) { s_knownAt = millis(); apOff(); return; }
-  if (!s_apOn && millis() - s_knownAt > WIFI_AP_AFTER_MS && strlen(webPassword()) >= 8) {
+  if (s_apOn && !webApAllowed()) apOff();
+  if (!s_apOn && webApAllowed() && millis() - s_knownAt > WIFI_AP_AFTER_MS && strlen(webPassword()) >= 8) {
     char ssid[24];
     snprintf(ssid, sizeof(ssid), "NestBox-%s", devid);
     WiFi.mode(WIFI_AP_STA);

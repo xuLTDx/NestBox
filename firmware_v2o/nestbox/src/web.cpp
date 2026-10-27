@@ -55,6 +55,12 @@ static AuthHandler s_auth[] = {{"", "admin", s_webPw, nullptr, ""}, {nullptr, nu
 
 const char* webPassword() { return s_webPw; }
 
+// K12 switch (Vojtech 27.10.2026): the box's own access point only when allowed from FleetNest (AP=1),
+// default OFF
+static bool s_apAllowed;
+bool webApAllowed() { return s_apAllowed; }
+void webSetApAllowed(bool on) { s_apAllowed = on; s_webPrefs.putBool("ap", on); }
+
 bool webSetPassword(const char* pw)
 {
   size_t n = strlen(pw);
@@ -580,6 +586,7 @@ bool webStart()
   s_webPrefs.begin("web", false);
   String pw = s_webPrefs.getString("pw", "");
   snprintf(s_webPw, sizeof(s_webPw), "%s", pw.c_str());
+  s_apAllowed = s_webPrefs.getBool("ap", false);
   httpParam.pxAuthHandler = s_auth;                // empty password = the handler is skipped (open)
   httpParam.maxClients = 2;
   if (mwServerStart(&httpParam)) return false;
