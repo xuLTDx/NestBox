@@ -12,6 +12,7 @@
 #include "laststep.h"
 
 float read12V();                      // telemetry.cpp
+void telemetryGpsStartNext(char mode);
 bool telemetryEngineOn();
 void telemetryRecordNow();
 bool telemetryRecordDone();
@@ -210,6 +211,23 @@ void standbyRemote(const char* cmd)
 {
   if (!strcmp(cmd, "ULP_READ")) { s_remote = 1; return; }
   if (!strcmp(cmd, "STANDBY?")) { s_remote = 2; return; }
+  if (!strncmp(cmd, "GPS_TEST=", 9)) {   // p66: timer sleep <s>, then GNSS start N / H / C, TTFF reported
+    char* e = nullptr;
+    unsigned long sec = strtoul(cmd + 9, &e, 10);
+    char mode = (e && *e == ',') ? e[1] : 'N';
+    char m[64];
+    if (sec < 30 || sec > 3600 || (mode != 'N' && mode != 'H' && mode != 'C'))
+      snprintf(m, sizeof(m), "CMD %s ERR 30..3600 s, N|H|C", cmd);
+    else if (!strcmp(s_wake, "TEST") && millis() < 300000UL)
+      snprintf(m, sizeof(m), "CMD %s not again, woke %lus ago", cmd, (unsigned long)(millis() / 1000));
+    else {
+      telemetryGpsStartNext(mode);
+      standbyTest(sec, false);
+      snprintf(m, sizeof(m), "CMD %s sleep in ~2 s", cmd);
+    }
+    statusLine(m);
+    return;
+  }
   if (strncmp(cmd, "SLEEP_ULP=", 10)) return;
   unsigned long sec = strtoul(cmd + 10, nullptr, 10);
   char m[64];

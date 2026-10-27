@@ -203,7 +203,7 @@ void TeleClientUDP::onMessage(char* msg, UdpRx* rx)
     }
 #if NESTBOX_DIAG                                // p60: debug D3 (NAVRH 7) - not in the final build
     if (cmdp && (!strcmp(cmdp + 4, "ULP_READ") || !strcmp(cmdp + 4, "STANDBY?") ||
-                 !strncmp(cmdp + 4, "SLEEP_ULP=", 10))) {   // p59: sleep tests from FleetNest (standby.h)
+                 !strncmp(cmdp + 4, "SLEEP_ULP=", 10) || !strncmp(cmdp + 4, "GPS_TEST=", 9))) {   // p59: sleep tests from FleetNest (standby.h)
       Serial.printf("[UDP] CMD:%s\n", cmdp + 4);
       standbyRemote(cmdp + 4);
     }

@@ -76,7 +76,9 @@ bool CellLink::start()
     if (!alive()) { snprintf(m_status, sizeof(m_status), "no answer after power key"); return false; }
   }
   at("ATE0\r");
-  at("AT+CGPS=1,1\r", 2000);           // GNSS first: it does not need the network (an error = already on)
+  // GNSS first: it does not need the network (an error = already on); p66: hot / cold start on request
+  m_gpsOk = at(m_gpsMode == 'H' ? "AT+CGPSHOT\r" : m_gpsMode == 'C' ? "AT+CGPSCOLD\r" : "AT+CGPS=1,1\r", 2000);
+  m_gpsAt = millis();
   m_alive = true;
   at("ATI\r", 1000);
   if (!strstr(m_buf, "7600")) Serial.printf("[CELL] ATI: %s\n", m_buf);   // not the expected model: logged, continue

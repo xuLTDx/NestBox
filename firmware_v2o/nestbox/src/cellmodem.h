@@ -50,6 +50,12 @@ public:
   void powerOff();             // stop() under the lock (standby, from another task)
   bool gnss(GnssFix* out);     // one AT+CGNSSINFO reading, CGPSINFO when empty (modem on, network not needed)
   bool alive_() { return m_alive; }
+  // p66: how the next start() switches GNSS on - 'N' AT+CGPS=1,1 (as before), 'H' AT+CGPSHOT, 'C' AT+CGPSCOLD
+  // (SIM7500_SIM7600 GNSS Application Note V2.00 3.1: only with GNSS off - after power on it is)
+  void setGpsStart(char mode) { m_gpsMode = mode; }
+  char gpsMode() const { return m_gpsMode; }
+  uint32_t gpsStartedAt() const { return m_gpsAt; }   // millis() of the GNSS start command, 0 = not yet
+  bool gpsStartOk() const { return m_gpsOk; }
   int rssi();                  // dBm, 0 = unknown
   const char* status() { return m_status; }
   const char* storedApn() { return m_cgdcont; }
@@ -83,6 +89,9 @@ private:
   int m_len = 0;
   volatile bool m_netOpen = false;
   volatile bool m_alive = false;     // answers AT (GNSS can be read)
+  char m_gpsMode = 'N';
+  uint32_t m_gpsAt = 0;
+  bool m_gpsOk = false;
   bool m_sockOpen = false;
   char m_ip[40] = "";
   uint16_t m_port = 0;

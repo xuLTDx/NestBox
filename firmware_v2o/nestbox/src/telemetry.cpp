@@ -68,6 +68,20 @@ static CellLink s_cell;
 static volatile bool s_cellOn;               // NVS CELL (default 0 until tested on 12 V)
 static volatile bool s_cellUp;
 static GnssFix s_fix;                        // last valid reading
+// p66: GNSS start mode for the boot after a GPS_TEST sleep (one-shot), time to the first fix reported once
+RTC_DATA_ATTR static char s_gpsNext;
+static bool s_ttffSent;
+void telemetryGpsStartNext(char mode) { s_gpsNext = mode; }
+static void ttffCheck()
+{
+  if (s_ttffSent || !s_fix.valid || !s_cell.gpsStartedAt()) return;
+  s_ttffSent = true;
+  char m[57];
+  snprintf(m, sizeof(m), "GPS ttff=%lus boot=%lus mode=%c ok=%d sats=%u",
+           (unsigned long)((s_fix.at - s_cell.gpsStartedAt()) / 1000), (unsigned long)(s_fix.at / 1000),
+           s_cell.gpsMode(), s_cell.gpsStartOk() ? 1 : 0, (unsigned)s_fix.sats);
+  statusLine(m);
+}
 static char s_apn[40] = "internet";          // the CELL_APN in force (NVS), home operator 4ka
 static volatile uint32_t s_recS = 60;
 static volatile bool s_otaReq;
@@ -138,6 +152,7 @@ bool telemetryPollFix()
   GnssFix g;
   if (!s_cellOn || !s_cell.gnss(&g)) return false;
   s_fix = g;
+  ttffCheck();
   return true;
 }
 // standby.cpp: modem (and its GNSS) off before the deep sleep; the cell task does not start it again
@@ -253,7 +268,7 @@ static void makeRecord(int event = 0, time_t when = 0)
     }
   }
   GnssFix g;
-  if (s_cellOn && s_cell.gnss(&g)) s_fix = g;
+  if (s_cellOn && s_cell.gnss(&g)) { s_fix = g; ttffCheck(); }
   bool fresh = s_fix.valid && millis() - s_fix.at < 5000;
   if (fresh && event) {          // an event record carries the event's time (above), the position only
     r.f(PID_GPS_LATITUDE, s_fix.lat, "%f");
@@ -434,6 +449,8 @@ void telemetryEarly() { txqEarlyInit(); }      // first thing in setup(): the PS
 
 void telemetryBegin(uint32_t bootId, bool sdOk)
 {
+  if (s_gpsNext == 'H' || s_gpsNext == 'C' || s_gpsNext == 'N') s_cell.setGpsStart(s_gpsNext);   // p66, one boot
+  s_gpsNext = 0;
   if (nvs_open("storage", NVS_READWRITE, &nvs) != ESP_OK) Serial.println("[NVS] storage not open");
   uint32_t r = 60;
   if (nvs_get_u32(nvs, "REC_S", &r) == ESP_OK && r >= 10) s_recS = r;

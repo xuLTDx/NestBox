@@ -20,7 +20,7 @@
 #define STANDBY_OTA_WAIT_MS    180000UL   // a running OTA download delays the sleep at most this
 #define STANDBY_ULP_PERIOD_US  200000     // ULP measures every 200 ms
 #ifndef STANDBY_AUTO
-#define STANDBY_AUTO 0                    // automatic sleep: off since 21.10.2026 (ULP did not wake) until tested
+#define STANDBY_AUTO 1                    // automatic sleep: on again 27.10.2026 (D8) - ULP wake fixed (p64/p65) and verified in the Passat
 #endif
 
 void standbyEarly();          // first in setup(): a deep-sleep wake - confirm or sleep again (no return)
