@@ -80,9 +80,36 @@ static bool sdMount()
 static int s_wifiNet = -1;
 static uint32_t s_wifiTry;
 
+// K12 (NAVRH 8, 27.10.2026): no known network for 2 min -> the box's own access point
+// "NestBox-<ID>" (password = the web password, K13; none set = no AP), the same page on 192.168.4.1;
+// a known network found again -> joined, the AP switched off
+#define WIFI_AP_AFTER_MS 120000UL
+extern char devid[12];
+const char* webPassword();
+static uint32_t s_knownAt;
+static bool s_apOn;
+
+static void apOff()
+{
+  if (!s_apOn) return;
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_STA);
+  s_apOn = false;
+  statusLine("WIFI AP off");
+}
+
 static void wifiTick()
 {
-  if (WiFi.status() == WL_CONNECTED) return;
+  if (WiFi.status() == WL_CONNECTED) { s_knownAt = millis(); apOff(); return; }
+  if (!s_apOn && millis() - s_knownAt > WIFI_AP_AFTER_MS && strlen(webPassword()) >= 8) {
+    char ssid[24];
+    snprintf(ssid, sizeof(ssid), "NestBox-%s", devid);
+    WiFi.mode(WIFI_AP_STA);
+    s_apOn = WiFi.softAP(ssid, webPassword());
+    char ln[56];
+    snprintf(ln, sizeof(ln), "WIFI AP %s %s %s", ssid, s_apOn ? "on" : "ERR", WiFi.softAPIP().toString().c_str());
+    statusLine(ln);
+  }
   if (s_wifiTry && millis() - s_wifiTry < WIFI_RETRY_MS) return;
   s_wifiTry = millis();
   // the network in range: scan, then join the strongest known one
@@ -98,6 +125,7 @@ static void wifiTick()
     Serial.printf("[WIFI] no known network in range (%d seen)\n", n);
     return;
   }
+  s_knownAt = millis();
   s_wifiNet = best;
   Serial.printf("[WIFI] joining %s (%d dBm)\n", WIFI_NETS[best][0], bestRssi);
   WiFi.begin(WIFI_NETS[best][0], WIFI_NETS[best][1]);

@@ -11,6 +11,7 @@
 #include <sys/time.h>
 
 void telemetrySetVehicle(const char* p);   // telemetry.cpp
+bool webSetPassword(const char* pw);       // web.cpp (K13)
 
 extern const char FW_BUILD_STR[];
 #define FIRMWARE_VARIANT "NestBox_v2O"
@@ -211,6 +212,9 @@ void TeleClientUDP::onMessage(char* msg, UdpRx* rx)
       char m[64];
       snprintf(m, sizeof(m), "CMD %s OK veh=%s", cmdp + 4, carProfile());
       statusLine(m);
+    }
+    if (cmdp && !strncmp(cmdp + 4, "WEB_PW=", 7)) {  // K13: the password is never echoed into records
+      statusLine(webSetPassword(cmdp + 11) ? "CMD WEB_PW OK" : "CMD WEB_PW ERR 8-32 a-z A-Z 0-9 . _ -");
     }
     if (cmdp && !strncmp(cmdp + 4, "SNIFF_VEH=", 10)) {
       char m[64];

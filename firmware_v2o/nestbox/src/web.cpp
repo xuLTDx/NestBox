@@ -14,6 +14,7 @@
 #include <WiFi.h>
 #include <SD_MMC.h>
 #include <Update.h>
+#include <Preferences.h>
 #include <esp_timer.h>
 
 void telemetrySetMux(bool on);   // telemetry.cpp (p69)
@@ -44,6 +45,27 @@ void telemetrySetVehicle(const char* p);
 int telemetryModemAt(const char* cmd, char* out, int cap);
 
 static HttpParam httpParam;
+
+// K13 (NAVRH 8, 27.10.2026): HTTP Basic login (user "admin") for every page and API - the httpd
+// library's own AuthHandler (httpd.c _mwBasicAuthorizationHandlers); the password comes from
+// FleetNest (CMD WEB_PW=, Admin only) and is kept in NVS; no password set = open as before
+static Preferences s_webPrefs;
+static char s_webPw[33] = "";
+static AuthHandler s_auth[] = {{"", "admin", s_webPw, nullptr, ""}, {nullptr, nullptr, nullptr, nullptr, ""}};
+
+const char* webPassword() { return s_webPw; }
+
+bool webSetPassword(const char* pw)
+{
+  size_t n = strlen(pw);
+  if (n < 8 || n > 32) return false;               // 8: the minimum of a WiFi AP password (K12)
+  for (size_t i = 0; i < n; i++)
+    if (!isalnum((unsigned char)pw[i]) && pw[i] != '.' && pw[i] != '_' && pw[i] != '-') return false;
+  strcpy(s_webPw, pw);
+  s_auth[0].pchAuthString[0] = 0;                  // the library recomputes the Basic string
+  s_webPrefs.putString("pw", s_webPw);
+  return true;
+}
 
 static int handlerInfo(UrlHandlerParam* param)
 {
@@ -555,6 +577,10 @@ bool webStart()
 {
   mwInitParam(&httpParam, 80, "/spiffs");
   httpParam.pxUrlHandler = urlHandlerList;
+  s_webPrefs.begin("web", false);
+  String pw = s_webPrefs.getString("pw", "");
+  snprintf(s_webPw, sizeof(s_webPw), "%s", pw.c_str());
+  httpParam.pxAuthHandler = s_auth;                // empty password = the handler is skipped (open)
   httpParam.maxClients = 2;
   if (mwServerStart(&httpParam)) return false;
   return true;
