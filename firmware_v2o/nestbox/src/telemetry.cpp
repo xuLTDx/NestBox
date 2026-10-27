@@ -96,6 +96,8 @@ static void loadApn()
   else snprintf(s_apn, sizeof(s_apn), "internet");
 }
 void telemetryApnCommand(const char* arg) { nbApnCommand(nvs, arg, "internet"); }
+void telemetrySetMux(bool on) { nvs_set_u8(nvs, "CELL_MUX", on ? 1 : 0); nvs_commit(nvs); s_cell.setMuxWanted(on); }
+bool telemetryMuxOn() { return s_cell.muxOn(); }
 void telemetrySetCell(bool on) { s_cellOn = on; nvs_set_u8(nvs, "CELL", on ? 1 : 0); nvs_commit(nvs); }
 bool telemetryCell() { return s_cellOn; }
 void telemetrySetVehicle(const char* p) { carSetProfile(p); nvs_set_str(nvs, "VEH", carProfile()); nvs_commit(nvs); }
@@ -107,9 +109,10 @@ void telemetrySetRecS(uint32_t s) { s_recS = s < 10 ? 10 : s; nvs_set_u32(nvs, "
 uint32_t telemetryFileId() { return s_log.id(); }
 int telemetryStatus(char* buf, int size)
 {
-  int n = snprintf(buf, size, "devid=%s login=%d link=%s cell=%d/%s fix=%d sats=%u tx=%lu txB=%lu rxB=%lu file=%lu rec_s=%lu ota_req=%d ",
+  int n = snprintf(buf, size, "devid=%s login=%d link=%s cell=%d/%s mux=%d/%lu/%lu fix=%d sats=%u tx=%lu txB=%lu rxB=%lu file=%lu rec_s=%lu ota_req=%d ",
                    devid, s_client.login ? 1 : 0, s_client.link ? s_client.link->name() : "-", s_cellOn ? 1 : 0,
-                   s_cell.status(), s_fix.valid ? 1 : 0, (unsigned)s_fix.sats, (unsigned long)s_client.txCount,
+                   s_cell.status(), s_cell.muxOn() ? 1 : 0, (unsigned long)s_cell.muxFrames(),
+                   (unsigned long)s_cell.muxErrors(), s_fix.valid ? 1 : 0, (unsigned)s_fix.sats, (unsigned long)s_client.txCount,
                    (unsigned long)s_client.txBytes, (unsigned long)s_client.rxBytes, (unsigned long)s_log.id(),
                    (unsigned long)s_recS, s_otaReq ? 1 : 0);
   txqStatus(buf + n, size - n);
@@ -416,6 +419,13 @@ static void cellTask(void*)
       logNetEvent(m);
     }
     if (!s_cellOn && s_cellUp) { s_cellUp = false; s_cell.stop(); logNetEvent("CELL OFF"); }
+    if (s_cellUp && s_cell.muxDead()) {           // p69: no good CMUX frame for 3 min (OVMS) -> restart
+      s_cellUp = false;
+      logNetEvent("CELL CMUX dead - restart");
+      statusLine("CELL CMUX dead - restart");
+      s_cell.stop();
+      lastTry = 0;
+    }
     vTaskDelay(pdMS_TO_TICKS(1000));
   }
 }
@@ -487,6 +497,9 @@ void telemetryBegin(uint32_t bootId, bool sdOk)
   // only the visited network changes, the modem picks it. CELL_APN= overrides (stored).
   loadApn();
   s_cell.setApn(s_apn);
+  uint8_t mux = 1;                               // p69: CMUX on unless CELL_MUX=0 (local web)
+  nvs_get_u8(nvs, "CELL_MUX", &mux);
+  s_cell.setMuxWanted(mux != 0);
   s_cell.begin();
   genDeviceID(devid);
   Serial.printf("[TEL] device ID %s\n", devid);

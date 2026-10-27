@@ -20,8 +20,18 @@
 //    by the N/S and E/W letters, not by position.
 // One mutex around every AT exchange: the net task (UDP) and the record task
 // (GNSS) share the UART.
+//
+// p69 (27.10.2026, NAVRH 8 K1-K3/K11, as OVMS3 components/ovms_cellular gsmmux.cpp + simcom_7600.cpp):
+// after the power-on the modem is switched to CMUX (AT+CMUX=0;+CATR=6, 3GPP 27.010 basic mode, the
+// frame code of OVMS gsmmux.cpp) - four virtual ports on the one UART: 1 = GNSS (NMEA pushed by the
+// modem, AT+CGPSNMEA=258 + AT+CGPSINFOCFG=1,258 = RMC + GNS every second, manual V3.00 17.2.16),
+// 2 = our AT data link (CIP UDP, CCH HTTPS, everything at() does), 3 = all URCs (+CATR=6, manual
+// 3.2.11), 4 = spare. GNSS no longer costs an AT exchange on the data port; system time from RMC when
+// there is no NTP. A CMUX that does not come up -> the modem is switched off and started the old way
+// (one UART, GNSS polled) - never worse than before. No good frame for 180 s -> link down (OVMS).
 #pragma once
 #include <Arduino.h>
+#include <freertos/stream_buffer.h>
 #include "netlink.h"
 
 struct GnssFix {
@@ -59,6 +69,13 @@ public:
   int rssi();                  // dBm, 0 = unknown
   const char* status() { return m_status; }
   const char* storedApn() { return m_cgdcont; }
+  // p69 CMUX
+  void setMuxWanted(bool on) { m_muxWanted = on; }
+  bool muxOn() const { return m_muxOn; }
+  bool muxDead() const { return m_muxOn && millis() - m_lastFrame > 180000UL; }   // OVMS: 3 min
+  uint32_t muxFrames() const { return m_rxFrames; }
+  uint32_t muxErrors() const { return m_frameErr; }
+  void muxLoop();              // the reader task (internal)
   void setApn(const char* apn);
   // diagnostics (local web API only): one AT command, the modem's raw answer into out
   int raw(const char* cmd, unsigned int timeoutMs, char* out, int cap);
@@ -73,6 +90,40 @@ public:
   // AT+CCH* answers into the record (PID 0x399); set by ota.cpp, nullptr = none
   void (*diag)(const char*) = nullptr;
 private:
+  // p69 CMUX state
+  volatile bool m_muxOn = false;
+  bool m_muxWanted = true;
+  StreamBufferHandle_t m_rx2 = nullptr;        // port 2 (AT data link) bytes
+  SemaphoreHandle_t m_txLock = nullptr;
+  TaskHandle_t m_rdTask = nullptr;
+  volatile uint8_t m_chOpen[5] = {0, 0, 0, 0, 0};
+  volatile uint32_t m_lastFrame = 0, m_rxFrames = 0, m_frameErr = 0, m_rx2Lost = 0;
+  uint8_t m_frame[2100];
+  int m_fpos = 0, m_flen = 0, m_fipos = 0;
+  bool m_fmore = false;
+  char m_lines[5][256];
+  int m_lineLen[5] = {0, 0, 0, 0, 0};
+  int m_binLeft = 0;                           // raw bytes of a pushed +CCHRECV: DATA still to take
+  char m_urc[1024];                            // port 3 lines (URCs) for waitFor
+  int m_urcLen = 0;
+  portMUX_TYPE m_spin = portMUX_INITIALIZER_UNLOCKED;
+  volatile bool m_recvEvent = false, m_peerClosed = false, m_recvEnd = false;
+  volatile int8_t m_gpsCmdResult = -1;         // port 1: 1 OK, 0 ERROR
+  GnssFix m_nfix = {};
+  volatile uint32_t m_rmcAt = 0, m_gnsAt = 0, m_nmeaAt = 0, m_timeSetAt = 0;
+  int linkAvail();
+  int linkRead();
+  void linkWrite(const uint8_t* d, size_t n);
+  void muxTx(int ch, const uint8_t* d, size_t n);
+  void muxTxStr(int ch, const char* s) { muxTx(ch, (const uint8_t*)s, strlen(s)); }
+  bool muxStart();
+  void muxStop();
+  void muxByte(uint8_t b);
+  void muxFrame();
+  void portLine(int ch, char* line);
+  void nmeaLine(const char* line);
+  void startGnss();
+  int tlsReadMux(uint8_t* buf, int cap, unsigned int timeoutMs);
   int m_diagRecv = 0;
   bool m_moreData = false;   // the last AT+CCHRECV filled the buffer: read again without a new notice
   // data the modem pushed by itself (+CCHRECV: DATA,0,<n> without AT+CCHRECV - p43), not yet read

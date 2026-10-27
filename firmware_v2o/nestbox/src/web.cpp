@@ -15,6 +15,8 @@
 #include <SD_MMC.h>
 #include <Update.h>
 #include <esp_timer.h>
+
+void telemetrySetMux(bool on);   // telemetry.cpp (p69)
 #include <lwip/sockets.h>
 #include <httpd.h>
 #include "sniff.h"
@@ -156,6 +158,9 @@ static int handlerControl(UrlHandlerParam* param)
   } else if (!strncmp(cmd, "AT=", 3)) {             // modem diagnostics, local only: AT=AT+CGDCONT?
     n = telemetryModemAt(cmd + 3, buf, bufsize);
 #endif
+  } else if (!strncmp(cmd, "CELL_MUX=", 9)) {       // p69: CMUX on the modem UART (1, default) or not (0)
+    telemetrySetMux(cmd[9] == '1');
+    n = snprintf(buf, bufsize, "OK cell_mux=%c (next modem start)", cmd[9] == '1' ? '1' : '0');
   } else if (!strncmp(cmd, "CELL=", 5)) {           // modem on/off (stored)
     telemetrySetCell(cmd[5] == '1');
     n = snprintf(buf, bufsize, "OK cell=%d", telemetryCell() ? 1 : 0);
