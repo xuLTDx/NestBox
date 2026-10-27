@@ -28,6 +28,7 @@
 #include "cardecode.h"
 #include "canbus1.h"
 #include "ota.h"
+#include "standby.h"
 #include "laststep.h"
 
 const char* bootResetInfo(char* buf, int cap);   // main.cpp
@@ -362,12 +363,33 @@ static void engineTick()
   }
 }
 
+// p67 (27.10.2026, as v1F telelogger.ino 2874-2882 DATA_INTERVAL_TABLE / STATIONARY_TIME_TABLE):
+// moving = the engine runs (K0 rpm, or the 12 V >= ENGINE_OFF_VOLTAGE = charging) or GPS >= 3 km/h;
+// a record every 1 s while moving, then 2 s (still 10-60 s), 5 s (60-180 s), REC_S after 180 s
+static uint32_t recordEveryMs()
+{
+  static uint32_t lastMove, lastCheck;
+  static bool moving;
+  uint32_t ms = millis();
+  if (!lastCheck || ms - lastCheck >= 1000) {
+    lastCheck = ms;
+    bool gpsMove = s_fix.valid && ms - s_fix.at < 5000 && s_fix.kph >= 3.0f;
+    moving = s_engineOn || read12V() >= ENGINE_OFF_VOLTAGE || gpsMove;
+    if (moving || !lastMove) lastMove = ms;
+  }
+  uint32_t still = (ms - lastMove) / 1000;
+  if (still < 10) return 1000;
+  if (still < 60) return 2000;
+  if (still < 180) return 5000;
+  return s_recS * 1000UL;
+}
+
 static void recordTask(void*)
 {
   uint32_t last = 0;
   for (;;) {
     engineTick();
-    uint32_t every = s_engineOn ? DRIVE_REC_MS : s_recS * 1000UL;
+    uint32_t every = recordEveryMs();
     if (!last || millis() - last >= every || s_recNow) {
       last = millis();
       makeRecord();

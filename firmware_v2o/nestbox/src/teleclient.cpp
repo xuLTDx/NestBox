@@ -6,7 +6,11 @@
 #include "sniff.h"
 #include "nbread.h"
 #include "standby.h"
+#include "cardecode.h"
+#include "ota.h"
 #include <sys/time.h>
+
+void telemetrySetVehicle(const char* p);   // telemetry.cpp
 
 extern const char FW_BUILD_STR[];
 #define FIRMWARE_VARIANT "NestBox_v2O"
@@ -200,6 +204,18 @@ void TeleClientUDP::onMessage(char* msg, UdpRx* rx)
       snprintf(m, sizeof(m), "NET CMD_READ #%u %s", (unsigned)seq, r ? "refused" : "accepted");
       Serial.println(m);
       logNetEvent(m);
+    }
+    // settings from FleetNest (27.10.2026, no WiFi needed): car profile and the sniff file's vehicle tag
+    if (cmdp && !strncmp(cmdp + 4, "VEH=", 4)) {
+      telemetrySetVehicle(cmdp + 8);
+      char m[64];
+      snprintf(m, sizeof(m), "CMD %s OK veh=%s", cmdp + 4, carProfile());
+      statusLine(m);
+    }
+    if (cmdp && !strncmp(cmdp + 4, "SNIFF_VEH=", 10)) {
+      char m[64];
+      snprintf(m, sizeof(m), "CMD %s %s", cmdp + 4, sniffSetVehicle(cmdp + 14) ? "OK" : "ERR");
+      statusLine(m);
     }
 #if NESTBOX_DIAG                                // p60: debug D3 (NAVRH 7) - not in the final build
     if (cmdp && (!strcmp(cmdp + 4, "ULP_READ") || !strcmp(cmdp + 4, "STANDBY?") ||
