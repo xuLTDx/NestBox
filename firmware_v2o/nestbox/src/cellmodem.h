@@ -130,6 +130,7 @@ private:
   void startGnss();
   int tlsReadMux(uint8_t* buf, int cap, unsigned int timeoutMs);
   int m_diagRecv = 0;
+  int m_diagFlush = 0;                         // p75: "CCH FLUSHED n" lines sent
   bool m_moreData = false;   // the last AT+CCHRECV filled the buffer: read again without a new notice
   // data the modem pushed by itself (+CCHRECV: DATA,0,<n> without AT+CCHRECV - p43), not yet read
   uint8_t m_push[2048];

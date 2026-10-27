@@ -429,6 +429,7 @@ bool CellLink::tlsOpen(const char* host, uint16_t port)
     unlock(); snprintf(m_status, sizeof(m_status), "online, CCHSTART failed"); return false;
   }
   m_diagRecv = 0;
+  m_diagFlush = 0;
   if (diag && at("AT+CCHSET?\r", 2000)) { char t[64]; diagText(t, sizeof(t), "CCH SET? ", m_buf); diag(t); }
   at("AT+CSSLCFG=\"sslversion\",0,4\r");       // all versions
   at("AT+CSSLCFG=\"authmode\",0,0\r");         // no server certificate check (as v1F, self-signed server)
@@ -921,7 +922,14 @@ int CellLink::tlsReadMux(uint8_t* buf, int cap, unsigned int timeoutMs)
   bool closed = m_peerClosed;
   m_recvEvent = false;
   m_recvEnd = false;
-  while (linkAvail()) linkRead();
+  int flushed = 0;                           // p75: bytes left on port 2 - lost data, reported
+  while (linkAvail()) { linkRead(); flushed++; }
+  if (flushed && diag && m_diagFlush < 16) {
+    m_diagFlush++;
+    char tf[48];
+    snprintf(tf, sizeof(tf), "CCH FLUSHED %d", flushed);
+    diag(tf);
+  }
   char c[40];
   snprintf(c, sizeof(c), "AT+CCHRECV=0,%d\r", cap);
   linkWrite((const uint8_t*)c, strlen(c));
@@ -930,7 +938,10 @@ int CellLink::tlsReadMux(uint8_t* buf, int cap, unsigned int timeoutMs)
   char line[96];
   int ll = 0;
   uint32_t t = millis();
-  while (millis() - t < 5000 && !m_recvEnd) {
+  // p75: the end "+CCHRECV: 0,<err>" comes on port 3, the data on port 2 - stop only when port 2
+  // is empty too (27.10.2026: the rest was thrown away by the next read's flush -> ERR=SHA256)
+  while (millis() - t < 5000) {
+    if (m_recvEnd && !linkAvail()) { delay(20); if (!linkAvail()) break; }
     int ch = linkRead();
     if (ch < 0) { delay(1); continue; }
     t = millis();
@@ -970,7 +981,7 @@ int CellLink::tlsReadMux(uint8_t* buf, int cap, unsigned int timeoutMs)
   if (diag && m_diagRecv < 16) {
     m_diagRecv++;
     char tt[64];
-    snprintf(tt, sizeof(tt), "CCH RECV mux got=%d blocks=%d err=%d%s%s", got, blocks, err,
+    snprintf(tt, sizeof(tt), "CCH RECV mux got=%d blocks=%d err=%d fl=%d%s%s", got, blocks, err, flushed,
              failed ? " ERROR" : "", closed ? " closed" : "");
     diag(tt);
   }
