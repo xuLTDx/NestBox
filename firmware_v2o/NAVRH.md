@@ -137,7 +137,11 @@ Rozhodnutie je **OTVORENÉ** – do finálneho fw sa rieši pri každom bode zvl
 | D9 | Automatické čítania K0 (BSI/CMM DIDs) surovo do PID 0x39F | `telemetry.cpp` | dotazy do auta každých 10 min | rozhodnúť: funkcia alebo ladenie |
 | D10 | FleetNest admin: príkaz s ľubovoľným textom bez kontroly | FleetNest `apps/telemetry/admin.py` `CommandAdmin` | obíde kontrolu príkazov (firmvér neznáme ignoruje) | zakázať pridávanie v admine alebo volať `commands.validate` |
 
-Spôsob (návrh, na schválenie): ladiace funkcie D1–D4 za jeden prepínač pri builde (napr. `NESTBOX_DIAG`), teraz 1,
-vo finálnom builde 0 – kód ostane v repozitári, vo finálnom firmvéri nebude.
+**Rozhodnuté (Vojtech 2026-10-27, p60):** ladiace funkcie D1–D4 sú za prepínačom pri builde `NESTBOX_DIAG`
+(`platformio.ini` `-DNESTBOX_DIAG=1` teraz; vo finálnom builde riadok preč alebo =0, bez neho je vypnutý) – kód ostane
+v repozitári, vo finálnom firmvéri nebude (overené: build s =0 neobsahuje text `SLEEP_ULP=`).
+**D9 – ponechať** (Vojtech 2026-10-27: „potrebujeme“): je to funkcia, nie ladenie. Pozor: odometer to nie je –
+ten v2O pri K0 číta pasívne z CAN1 rámca 0x552 (`cardecode.cpp`); D9 = km/mesiace do servisu, riedenie a tlak oleja,
+objem AdBlue (dekódovanie ešte chýba).
 Poznámka: časť 6 vyššie („ESP32 v spánku ADC nesleduje“) je prekonaná – ULP koprocesor meria 12 V aj v spánku
 (`standby.cpp`, overené podľa ESP-IDF 4.4 `ulp_fsm/ulp_adc`); funkčnosť v aute ukáže test.

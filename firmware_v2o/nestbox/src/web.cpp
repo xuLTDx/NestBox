@@ -142,6 +142,7 @@ static int handlerControl(UrlHandlerParam* param)
                  v.urea[3], v.urea[4], v.urea[5], v.urea[6], v.urea[7], v.ureaAt ? (long)(ms - v.ureaAt) : -1L);
   } else if (!strcmp(cmd, "STANDBY?")) {
     n = standbyStatus(buf, bufsize);
+#if NESTBOX_DIAG                                    // p60: debug commands D1, D2, D4 (NAVRH 7) - not in the final build
   } else if (!strncmp(cmd, "SLEEP_TEST=", 11)) {     // bench: deep sleep now, timer wake after <s> (10..3600)
     uint32_t sec = strtoul(cmd + 11, nullptr, 10);
     if (sec < 10 || sec > 3600) n = snprintf(buf, bufsize, "ERR 10..3600 s");
@@ -154,6 +155,7 @@ static int handlerControl(UrlHandlerParam* param)
     n = standbyUlpRead(buf, bufsize);
   } else if (!strncmp(cmd, "AT=", 3)) {             // modem diagnostics, local only: AT=AT+CGDCONT?
     n = telemetryModemAt(cmd + 3, buf, bufsize);
+#endif
   } else if (!strncmp(cmd, "CELL=", 5)) {           // modem on/off (stored)
     telemetrySetCell(cmd[5] == '1');
     n = snprintf(buf, bufsize, "OK cell=%d", telemetryCell() ? 1 : 0);

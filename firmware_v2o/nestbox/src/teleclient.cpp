@@ -201,11 +201,13 @@ void TeleClientUDP::onMessage(char* msg, UdpRx* rx)
       Serial.println(m);
       logNetEvent(m);
     }
+#if NESTBOX_DIAG                                // p60: debug D3 (NAVRH 7) - not in the final build
     if (cmdp && (!strcmp(cmdp + 4, "ULP_READ") || !strcmp(cmdp + 4, "STANDBY?") ||
                  !strncmp(cmdp + 4, "SLEEP_ULP=", 10))) {   // p59: sleep tests from FleetNest (standby.h)
       Serial.printf("[UDP] CMD:%s\n", cmdp + 4);
       standbyRemote(cmdp + 4);
     }
+#endif
     if (cmdp && !strncmp(cmdp + 4, "RESEND=", 7)) {
       uint32_t f = (uint32_t)strtoul(cmdp + 11, 0, 10);
       bool started = txqResendRequest(f);
