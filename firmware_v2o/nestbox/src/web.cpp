@@ -148,11 +148,9 @@ static int handlerControl(UrlHandlerParam* param)
     if (sec < 10 || sec > 3600) n = snprintf(buf, bufsize, "ERR 10..3600 s");
     else { standbyTest(sec, false); n = snprintf(buf, bufsize, "OK sleep %lu s in ~2 s", (unsigned long)sec); }
   } else if (!strncmp(cmd, "SLEEP_ULP=", 10)) {      // car: deep sleep with the ULP (>= 12.8 V wakes), timer after <s> (10..600)
-    char* e = nullptr;
-    uint32_t sec = strtoul(cmd + 10, &e, 10);
-    uint32_t var = (e && *e == ',') ? strtoul(e + 1, nullptr, 10) : 0;   // p64 ULP variant
-    if (sec < 10 || sec > 600 || var > 2) n = snprintf(buf, bufsize, "ERR 10..600 s, variant 0..2");
-    else { standbyTest(sec, true, var); n = snprintf(buf, bufsize, "OK sleep %lu s with ULP v%lu in ~2 s", (unsigned long)sec, (unsigned long)var); }
+    uint32_t sec = strtoul(cmd + 10, nullptr, 10);
+    if (sec < 10 || sec > 600) n = snprintf(buf, bufsize, "ERR 10..600 s");
+    else { standbyTest(sec, true); n = snprintf(buf, bufsize, "OK sleep %lu s with ULP in ~2 s", (unsigned long)sec); }
   } else if (!strcmp(cmd, "ULP_READ")) {
     n = standbyUlpRead(buf, bufsize);
   } else if (!strncmp(cmd, "AT=", 3)) {             // modem diagnostics, local only: AT=AT+CGDCONT?
