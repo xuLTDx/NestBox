@@ -220,7 +220,7 @@ void standbyRemote(const char* cmd)
       snprintf(m, sizeof(m), "CMD %s ERR 30..3600 s, N|H|C", cmd);
     else {                             // no "not again" guard: FleetNest resends GPS_TEST only after 3900 s
       telemetryGpsStartNext(mode);
-      standbyTest(sec, false);
+      standbyTest(sec, true);          // timer + ULP: an engine start wakes it too (27.10.2026)
       snprintf(m, sizeof(m), "CMD %s sleep in ~2 s", cmd);
     }
     statusLine(m);
