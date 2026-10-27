@@ -171,3 +171,5 @@ Kód sa podľa tejto tabuľky NEMENÍ bez rozhodnutia.
 | K15 | Protokol na server | v1F Freematics UDP → FleetNest | OVMS v2/v3 na vlastný server | **v1F** | ponechať |
 
 Poradie podľa dopadu: **K1+K2+K3 (p69)** → K13 (D5) → K11 (s p69) → K12.
+
+**Stav 27.10.2026 večer:** K1 (len CMUX, bez PPP – PPP nie je v Arduino-ESP32 2.0.14: `sdkconfig.h` bez `CONFIG_LWIP_PPP_SUPPORT`, `pppapi.c.obj` bez symbolov), K2, K3, K11 = p69 (b68095a); K12 + K13 (fw 17:01:25). Všetko zverejnené na OTA, v aute NEOVERENÉ.
