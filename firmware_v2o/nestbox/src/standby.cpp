@@ -218,9 +218,7 @@ void standbyRemote(const char* cmd)
     char m[64];
     if (sec < 30 || sec > 3600 || (mode != 'N' && mode != 'H' && mode != 'C'))
       snprintf(m, sizeof(m), "CMD %s ERR 30..3600 s, N|H|C", cmd);
-    else if (!strcmp(s_wake, "TEST") && millis() < 300000UL)
-      snprintf(m, sizeof(m), "CMD %s not again, woke %lus ago", cmd, (unsigned long)(millis() / 1000));
-    else {
+    else {                             // no "not again" guard: FleetNest resends GPS_TEST only after 3900 s
       telemetryGpsStartNext(mode);
       standbyTest(sec, false);
       snprintf(m, sizeof(m), "CMD %s sleep in ~2 s", cmd);
