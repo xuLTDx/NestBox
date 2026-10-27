@@ -145,3 +145,29 @@ ten v2O pri K0 číta pasívne z CAN1 rámca 0x552 (`cardecode.cpp`); D9 = km/me
 objem AdBlue (dekódovanie ešte chýba).
 Poznámka: časť 6 vyššie („ESP32 v spánku ADC nesleduje“) je prekonaná – ULP koprocesor meria 12 V aj v spánku
 (`standby.cpp`, overené podľa ESP-IDF 4.4 `ulp_fsm/ulp_adc`); funkčnosť v aute ukáže test.
+
+## 8. Porovnanie po častiach: v1F (kostra) vs. OVMS3 na tej istej doske (p70, 2026-10-27)
+
+Pravidlo (Vojtech 2026-10-27): z v1F brať len kostru, k tomu z OVMS3 čo je lepšie – pri každej časti
+porovnať a rozhodnúť. Zdroje: OVMS3 clone `~/GitHub/OVMS3` @86dfa0afe, NestBox `firmware_v2o/nestbox/src`.
+Kód sa podľa tejto tabuľky NEMENÍ bez rozhodnutia.
+
+| # | Časť | v2O dnes (pôvod) | OVMS3 na tejto doske | Lepšie | Odporúčanie |
+|---|------|------------------|----------------------|--------|-------------|
+| K1 | **Dáta cez modem** | v1F: UDP cez AT sokety `CIP*`, HTTPS (OTA) cez `CCH*` v modeme, jedna UART linka pre všetko (`cellmodem.cpp`) | `AT+CMUX=0` → 4 virtuálne kanály (CTRL/NMEA, DATA, POLL, CMD), dáta = **PPP + lwIP** (`gsmpppos.cpp`) – sokety ESP32 rovnaké ako pri WiFi; stavový automat s obnovou: NetLoss → opakovania → vypnúť/zapnúť modem, MUX bez rámca 3 min → reštart modemu (`ovms_cellular.cpp:721-751, 905-916`); pretečenie UART sa vyprázdni a počíta (`:190-200`) | **OVMS** | **p69**. Odpadne kód CCH (týždeň opráv OTA 20.–26.10.) a AT sokety; 27.10. po OTA nešli záznamy cez modem 40 min (príčina neznáma). Pozor: ovládač SIM7600 v OVMS má popis „Experimental support“ (štúdia 18.10.) |
+| K2 | **GPS** | v1F: `AT+CGNSSINFO` / `AT+CGPSINFO` pri každom zázname na tej istej linke ako dáta | NMEA na vlastnom kanáli, modem posiela sám (`AT+CGPSNMEA=258`, `AT+CGPSINFOCFG=5,258`, `simcom_7600.cpp:91-95`); manuál V3.00 17.2.16: `<time>` 0–255 s → 1 s ide | **OVMS** | súčasť p69, interval 1 s |
+| K3 | Čas z GPS | NTP len pri WiFi (`main.cpp` `configTime`); systémový čas z GPS sa nenastavuje (v kóde v2O nie je `settimeofday`) | voliteľne čas z GPS (`modem enable.gpstime`, `gsmnmea.cpp:247, 420`) | **OVMS** | pri p69 nastaviť čas z GPS (bez WiFi dnes čas záznamov z RTC) |
+| K4 | Fronta, ACK servera, náhrada zo SD | v1F `txqueue` (PSRAM rezerva, ACK po uložení, SD replay, overené 0 strát) | server v3 MQTT QoS0, nič sa pri výpadku nebufferuje (štúdia 28.9.) | **v1F** | ponechať |
+| K5 | SD karta | v1F jeden zapisovač s potvrdením (`sdwriter`), nikdy neformátuje (overené 18.10.) | `sdcard(..., autoformat)` → `format_if_mount_failed` (`sdcard.cpp:115`) | **v1F** | ponechať |
+| K6 | OTA | v1F/v2O: pull-OTA, staging na SD, SHA256, pokračovanie (Range), značka obrazu, potvrdenie serveru, pravidlá flashu | HTTP (nie HTTPS) z `api.openvehicles.com`, kontrola len veľkosti (`ovms_ota.cpp:1606-1640`) | **v1F** | ponechať logiku; prenos po p69 cez lwIP (rovnaký HTTPS kód ako WiFi), CCH preč |
+| K7 | CAN1 (ESP32 TWAI) | ESP-IDF `twai_*`, len počúvanie, počíta missed/overrun; obnova z bus-off v `canbus1.cpp` nie je | vlastný ovládač s obchádzkami chýb čipu (bus-off errata `esp32can.cpp:191-226`, plný reset keď obnova zlyhá `:857`) | **OVMS** (pri vysielaní) | NEOVERENÉ, či sa nás týka: v počúvaní čip nevysiela; `READ` vysiela – preveriť bus-off pri READ |
+| K8 | CAN2/3 (MCP2515) | vlastný podľa OVMS3 (hladinové IRQ, BFPCTRL, sleep) | OVMS ovládač, prerábaný 07–08/2026 | rovnaké | ponechať |
+| K9 | Spánok | vlastný: ULP 12 V + časovač + 3 h hlásenie (overené 27.10.) | hlboký spánok len pri slabej 12 V, budenie časovačom | **v2O** | ponechať |
+| K10 | 12 V meranie | ADC1 ch0 / 195,7 (hodnota OVMS) | to isté (`system.adc factor12v`) | rovnaké | kalibrovať na kus (nekalibrované) |
+| K11 | Napájanie modemu | PWRKEY 200 ms zap., `AT+CPOF` alebo 2,6 s vyp. | PWRKEY cyklus 500 ms zap. / 3000 ms vyp. (`simcom_7600.cpp:157, 165`) | blízke | pri p69 prevziať časy OVMS |
+| K12 | WiFi | 2 pevné siete, sken + pripojenie, opakovanie 30 s (`main.cpp`) | režimy client / AP / apclient, skenovanie, reconnect, kvalita signálu (`esp32wifi.cpp`) | OVMS (viac funkcií) | nízka priorita; AP na servis zvážiť |
+| K13 | Lokálna web stránka / `/api/control` | bez prihlásenia (D4/D5) | webserver s prihlásením (session, `web_framework.cpp:522`) | **OVMS** | pred finálom heslo alebo vypnúť (D5) |
+| K14 | Watchdog | v kóde v2O žiadne `esp_task_wdt`; či beží TWDT z konfigurácie Arduina – NEOVERENÉ | mená úloh pri WDT sa ukladajú do boot dát a hlásia (`ovms_boot.cpp:682-687`) | **OVMS** | pridať hlásenie WDT do riadku BOOT |
+| K15 | Protokol na server | v1F Freematics UDP → FleetNest | OVMS v2/v3 na vlastný server | **v1F** | ponechať |
+
+Poradie podľa dopadu: **K1+K2+K3 (p69)** → K13 (D5) → K14 → K7 → K11 (s p69) → K12.
