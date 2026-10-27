@@ -5,6 +5,7 @@
 #include <driver/adc.h>
 #include <esp32/ulp.h>
 #include <soc/rtc.h>
+#include <soc/sens_reg.h>
 #include "canbus1.h"
 #include "txqueue.h"
 #include "ota.h"
@@ -26,7 +27,7 @@ void prepareRestart(const char* why);  // main.cpp
 // RTC slow memory, start reserved for the ULP (CONFIG_ULP_COPROC_RESERVE_MEM 512 B = 128 words)
 // p62 (27.10.2026): counters of one sleep, read at the wake - where does the ULP wake fail?
 enum { ULP_THR = 0, ULP_LAST = 1, ULP_RUNS = 2, ULP_MIN = 3, ULP_MAX = 4, ULP_OVER = 5, ULP_NRDY = 6,
-       ULP_WAKES = 7, ULP_PROG = 10 };
+       ULP_WAKES = 7, ULP_STAGE = 8, ULP_PROG = 10 };
 
 RTC_DATA_ATTR static time_t s_nextReport;     // time() of the next parked report (time() runs on in deep sleep)
 RTC_DATA_ATTR static uint8_t s_falseWakes;    // ULP wakes not confirmed by the 5 s reading, in a row
@@ -41,7 +42,8 @@ static uint32_t s_otaWaitSince, s_reportAt, s_recAt;
 static bool s_reportFix, s_reportRecDone;
 static volatile uint32_t s_testS, s_testAt;   // SLEEP_TEST / SLEEP_ULP from the web
 static volatile bool s_testUlp;
-static void standbyTestNow(uint32_t seconds, bool ulp);
+static volatile uint8_t s_testVariant;
+static void standbyTestNow(uint32_t seconds, bool ulp, uint8_t variant);
 static bool ulpMeasure(unsigned* sum, uint32_t* raw);
 
 bool standbyParkedBoot() { return s_parked; }
@@ -54,50 +56,72 @@ static uint16_t rawX4(float volts) { return (uint16_t)(volts * ADC_12V_FACTOR_SB
 // p55 (27.10.2026, as ESP-IDF 4.4 examples/system/ulp_fsm/ulp_adc): WAKE only when the RTC
 // controller is ready (RTC_CNTL_RDY_FOR_WAKEUP, else WAKE has no effect - ulp_instruction_set.rst),
 // not ready = halt and try at the next period; after WAKE the ULP timer stops (ulp_run starts it again)
-static bool ulpStart(uint16_t thrX4)
+// p64 (27.10.2026, car: n=0 = the program never counted a run in deep sleep; the counter came after the
+// ADC): variant 0 = as before + stage marks (1 = run started, 2 = the 4 ADC reads done); 1 = the same with
+// the SAR ADC power forced on at every run (SENS_SAR_MEAS_WAIT2_REG FORCE_XPD_SAR = 3, sens_reg.h);
+// 2 = no ADC at all, only the run counter - does the ULP run in deep sleep?
+RTC_DATA_ATTR static uint8_t s_ulpVariant;
+static bool ulpStart(uint16_t thrX4, uint8_t variant = 0)
 {
-  const ulp_insn_t prog[] = {
-    I_MOVI(R3, 0),
-    I_ADC(R1, 0, 0), I_ADDR(R3, R3, R1),
-    I_ADC(R1, 0, 0), I_ADDR(R3, R3, R1),
-    I_ADC(R1, 0, 0), I_ADDR(R3, R3, R1),
-    I_ADC(R1, 0, 0), I_ADDR(R3, R3, R1),
-    I_MOVI(R2, ULP_LAST), I_ST(R3, R2, 0),
-    I_MOVI(R2, ULP_RUNS), I_LD(R1, R2, 0), I_ADDI(R1, R1, 1), I_ST(R1, R2, 0),   // p62 runs++
-    I_MOVI(R2, ULP_MIN), I_LD(R0, R2, 0),
-    I_SUBR(R0, R3, R0),                 // sum - min: overflow = a new minimum
-    M_BXF(10), M_BX(11),
-    M_LABEL(10), I_ST(R3, R2, 0),
-    M_LABEL(11),
-    I_MOVI(R2, ULP_MAX), I_LD(R0, R2, 0),
-    I_SUBR(R0, R0, R3),                 // max - sum: overflow = a new maximum
-    M_BXF(12), M_BX(13),
-    M_LABEL(12), I_ST(R3, R2, 0),
-    M_LABEL(13),
-    I_MOVI(R2, ULP_THR), I_LD(R0, R2, 0),
-    I_SUBR(R0, R3, R0),                 // sum - threshold: overflow = below
-    M_BXF(1),
-    I_MOVI(R2, ULP_OVER), I_LD(R1, R2, 0), I_ADDI(R1, R1, 1), I_ST(R1, R2, 0),   // p62 over++
-    I_RD_REG(RTC_CNTL_LOW_POWER_ST_REG, RTC_CNTL_RDY_FOR_WAKEUP_S, RTC_CNTL_RDY_FOR_WAKEUP_S),
-    I_ANDI(R0, R0, 1),
-    M_BXZ(2),                           // not ready for the wake: next period
-    I_MOVI(R2, ULP_WAKES), I_LD(R1, R2, 0), I_ADDI(R1, R1, 1), I_ST(R1, R2, 0),  // p62 wakes++
-    I_WAKE(),
-    I_END(),                            // ULP timer off - the woken chip takes over
-    M_LABEL(1),
-    I_HALT(),
-    M_LABEL(2),
-    I_MOVI(R2, ULP_NRDY), I_LD(R1, R2, 0), I_ADDI(R1, R1, 1), I_ST(R1, R2, 0),   // p62 not ready++
-    I_HALT()
-  };
+  static ulp_insn_t prog[96];
+  size_t n = 0;
+#define ADD(...) do { const ulp_insn_t t_[] = {__VA_ARGS__}; \
+    for (size_t i_ = 0; i_ < sizeof(t_) / sizeof(t_[0]) && n < 96; i_++) prog[n++] = t_[i_]; } while (0)
+#define INC(word) ADD(I_MOVI(R2, word), I_LD(R1, R2, 0), I_ADDI(R1, R1, 1), I_ST(R1, R2, 0))
+#define STAGE(v) ADD(I_MOVI(R1, v), I_MOVI(R2, ULP_STAGE), I_ST(R1, R2, 0))
+  if (variant == 1) ADD(I_WR_REG(SENS_SAR_MEAS_WAIT2_REG, SENS_FORCE_XPD_SAR_S, SENS_FORCE_XPD_SAR_S + 1,
+                                  SENS_FORCE_XPD_SAR_PU));
+  INC(ULP_RUNS);
+  STAGE(1);
+  if (variant == 2) {
+    ADD(I_HALT());
+  } else {
+    ADD(I_MOVI(R3, 0),
+         I_ADC(R1, 0, 0), I_ADDR(R3, R3, R1),
+         I_ADC(R1, 0, 0), I_ADDR(R3, R3, R1),
+         I_ADC(R1, 0, 0), I_ADDR(R3, R3, R1),
+         I_ADC(R1, 0, 0), I_ADDR(R3, R3, R1));
+    STAGE(2);
+    ADD(I_MOVI(R2, ULP_LAST), I_ST(R3, R2, 0),
+         I_MOVI(R2, ULP_MIN), I_LD(R0, R2, 0),
+         I_SUBR(R0, R3, R0),               // sum - min: overflow = a new minimum
+         M_BXF(10), M_BX(11),
+         M_LABEL(10), I_ST(R3, R2, 0),
+         M_LABEL(11),
+         I_MOVI(R2, ULP_MAX), I_LD(R0, R2, 0),
+         I_SUBR(R0, R0, R3),               // max - sum: overflow = a new maximum
+         M_BXF(12), M_BX(13),
+         M_LABEL(12), I_ST(R3, R2, 0),
+         M_LABEL(13),
+         I_MOVI(R2, ULP_THR), I_LD(R0, R2, 0),
+         I_SUBR(R0, R3, R0),               // sum - threshold: overflow = below
+         M_BXF(1));
+    INC(ULP_OVER);
+    ADD(I_RD_REG(RTC_CNTL_LOW_POWER_ST_REG, RTC_CNTL_RDY_FOR_WAKEUP_S, RTC_CNTL_RDY_FOR_WAKEUP_S),
+         I_ANDI(R0, R0, 1),
+         M_BXZ(2));                       // not ready for the wake: next period
+    INC(ULP_WAKES);
+    ADD(I_WAKE(),
+         I_END(),                          // ULP timer off - the woken chip takes over
+         M_LABEL(1),
+         I_HALT(),
+         M_LABEL(2));
+    INC(ULP_NRDY);
+    ADD(I_HALT());
+  }
+#undef ADD
+#undef INC
+#undef STAGE
+  if (n >= 96) return false;
   RTC_SLOW_MEM[ULP_THR] = thrX4;
   RTC_SLOW_MEM[ULP_LAST] = 0;
   RTC_SLOW_MEM[ULP_RUNS] = 0; RTC_SLOW_MEM[ULP_MIN] = 0xFFFF; RTC_SLOW_MEM[ULP_MAX] = 0;
   RTC_SLOW_MEM[ULP_OVER] = 0; RTC_SLOW_MEM[ULP_NRDY] = 0; RTC_SLOW_MEM[ULP_WAKES] = 0;
+  RTC_SLOW_MEM[ULP_STAGE] = 0;
+  s_ulpVariant = variant;
   adc1_config_width(ADC_WIDTH_BIT_12);
   adc1_config_channel_atten(ADC1_CHANNEL_0, ADC_ATTEN_DB_11);   // as analogRead (Arduino default 11 dB)
   adc1_ulp_enable();
-  size_t n = sizeof(prog) / sizeof(ulp_insn_t);
   if (ulp_process_macros_and_load(ULP_PROG, prog, &n) != ESP_OK) return false;
   ulp_set_wakeup_period(0, STANDBY_ULP_PERIOD_US);
   if (ulp_run(ULP_PROG) != ESP_OK) return false;
@@ -105,7 +129,7 @@ static bool ulpStart(uint16_t thrX4)
 }
 
 // deep sleep until the 12 V rises (ULP) or the parked report is due (timer); no return
-static void sleepNow(bool ulp, uint32_t forceSeconds = 0)
+static void sleepNow(bool ulp, uint32_t forceSeconds = 0, uint8_t variant = 0)
 {
   time_t now = time(nullptr);
   uint32_t secs = forceSeconds;
@@ -115,7 +139,7 @@ static void sleepNow(bool ulp, uint32_t forceSeconds = 0)
   }
   esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
   s_ulpArmed = 0;
-  if (ulp && !ulpStart(rawX4(ENGINE_OFF_VOLTAGE) + s_thrRaise)) Serial.println("[STANDBY] ULP start failed - timer only");
+  if (ulp && !ulpStart(rawX4(ENGINE_OFF_VOLTAGE) + s_thrRaise, variant)) Serial.println("[STANDBY] ULP start failed - timer only");
   else if (ulp) s_ulpArmed = 1;
   esp_sleep_enable_timer_wakeup((uint64_t)secs * 1000000ULL);
   lastStep("deep sleep %lus", (unsigned long)secs);
@@ -131,8 +155,9 @@ void standbyEarly()
   esp_sleep_wakeup_cause_t c = esp_sleep_get_wakeup_cause();
   unsigned ulpSum = RTC_SLOW_MEM[ULP_LAST] & 0xFFFF;   // the ULP's last 4-sample sum
   if (s_ulpArmed)                     // runs, min/max sum, sums >= threshold, not ready, WAKE issued
-    snprintf(s_ulpStats, sizeof(s_ulpStats), "ULP n=%u lo=%u hi=%u ov=%u nr=%u wk=%u",
-             (unsigned)(RTC_SLOW_MEM[ULP_RUNS] & 0xFFFF), (unsigned)(RTC_SLOW_MEM[ULP_MIN] & 0xFFFF),
+    snprintf(s_ulpStats, sizeof(s_ulpStats), "ULP v%u n=%u st=%u lo=%u hi=%u ov=%u nr=%u wk=%u",
+             (unsigned)s_ulpVariant, (unsigned)(RTC_SLOW_MEM[ULP_RUNS] & 0xFFFF),
+             (unsigned)(RTC_SLOW_MEM[ULP_STAGE] & 0xFFFF), (unsigned)(RTC_SLOW_MEM[ULP_MIN] & 0xFFFF),
              (unsigned)(RTC_SLOW_MEM[ULP_MAX] & 0xFFFF), (unsigned)(RTC_SLOW_MEM[ULP_OVER] & 0xFFFF),
              (unsigned)(RTC_SLOW_MEM[ULP_NRDY] & 0xFFFF), (unsigned)(RTC_SLOW_MEM[ULP_WAKES] & 0xFFFF));
   s_ulpArmed = 0;
@@ -198,14 +223,16 @@ void standbyRemote(const char* cmd)
   if (!strcmp(cmd, "ULP_READ")) { s_remote = 1; return; }
   if (!strcmp(cmd, "STANDBY?")) { s_remote = 2; return; }
   if (strncmp(cmd, "SLEEP_ULP=", 10)) return;
-  unsigned long sec = strtoul(cmd + 10, nullptr, 10);
+  char* e = nullptr;
+  unsigned long sec = strtoul(cmd + 10, &e, 10);
+  unsigned long var = (e && *e == ',') ? strtoul(e + 1, nullptr, 10) : 0;   // p64: ,<variant 0..2>
   char m[64];
-  if (sec < 10 || sec > 600) snprintf(m, sizeof(m), "CMD SLEEP_ULP=%lu ERR 10..600 s", sec);
+  if (sec < 10 || sec > 600 || var > 2) snprintf(m, sizeof(m), "CMD %s ERR 10..600 s, variant 0..2", cmd);
   else if (!strncmp(s_wake, "ULP_TEST", 8) && millis() < 300000UL)
-    snprintf(m, sizeof(m), "CMD SLEEP_ULP=%lu not again, woke %lus ago", sec, (unsigned long)(millis() / 1000));
+    snprintf(m, sizeof(m), "CMD %s not again, woke %lus ago", cmd, (unsigned long)(millis() / 1000));
   else {
-    standbyTest(sec, true);
-    snprintf(m, sizeof(m), "CMD SLEEP_ULP=%lu sleep in ~2 s", sec);
+    standbyTest(sec, true, (uint8_t)var);
+    snprintf(m, sizeof(m), "CMD %s sleep in ~2 s", cmd);
   }
   statusLine(m);
 }
@@ -233,7 +260,7 @@ static void remoteTick()
 void standbyTick()
 {
   remoteTick();
-  if (s_testS && millis() - s_testAt > 2000) standbyTestNow(s_testS, s_testUlp);   // the HTTP answer went out first
+  if (s_testS && millis() - s_testAt > 2000) standbyTestNow(s_testS, s_testUlp, s_testVariant);   // the HTTP answer went out first
   if (!STANDBY_AUTO) return;          // 21.10.2026: the ULP did not wake at the engine start - off until tested
   static uint32_t lastCheck;
   if (millis() - lastCheck < 1000) return;
@@ -269,9 +296,12 @@ void standbyTick()
   goStandby();
 }
 
-void standbyTest(uint32_t seconds, bool ulp) { s_testUlp = ulp; s_testS = seconds; s_testAt = millis(); }   // web: runs from loop()
+void standbyTest(uint32_t seconds, bool ulp, uint8_t variant)
+{
+  s_testUlp = ulp; s_testVariant = variant; s_testS = seconds; s_testAt = millis();
+}   // web: runs from loop()
 
-static void standbyTestNow(uint32_t seconds, bool ulp)
+static void standbyTestNow(uint32_t seconds, bool ulp, uint8_t variant)
 {
   char m[64];
   snprintf(m, sizeof(m), "STANDBY TEST %lus %s", (unsigned long)seconds, ulp ? "ULP + timer" : "(timer only)");
@@ -282,7 +312,7 @@ static void standbyTestNow(uint32_t seconds, bool ulp)
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
   s_ulpTest = ulp ? 1 : 0;
-  sleepNow(ulp, seconds);
+  sleepNow(ulp, seconds, variant);
 }
 
 // ULP_READ: the ULP measures while the chip is awake (threshold never reached = no wake), 1 s;
