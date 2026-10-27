@@ -118,3 +118,26 @@ FleetNest: OVMS sa hlási ako zariadenie typu NestBox_v2O (hodnota `ovms`) – v
 4. Odber v spánku a pri krátkom prebúdzaní **zmerať** (USB merač / v aute) – podľa toho interval N.
 
 **Na rozhodnutie po teste:** ktorá zbernica sa v Peugeote budí prvá (odomknutie, dvere) – ukáže nahrávka 3/8 a 6/14.
+
+## 7. Ladiace funkcie – ROZHODNÚŤ pred finálnym firmvérom (Vojtech 2026-10-27: „zapíš rozhodnutie, či nechať alebo odstrániť“)
+
+Rozhodnutie je **OTVORENÉ** – do finálneho fw sa rieši pri každom bode zvlášť. Stav overený v kóde 2026-10-27
+(fw „Oct 27 2026 08:31:15“, NestBox d1c09d8):
+
+| # | Čo | Kde | Čo môže vo finále robiť | Návrh |
+|---|----|-----|-------------------------|-------|
+| D1 | Spánok s časovačom / s ULP na požiadanie: `SLEEP_TEST=`, `SLEEP_ULP=` | `web.cpp:145-152`, `standby.cpp` | box zaspí na príkaz aj v aute; pri bežiacom motore ho ULP má hneď zobudiť (NEOVERENÉ do testu) → reštart + medzera v dátach | po teste vypnúť prepínačom pri builde |
+| D2 | `ULP_READ` | `standby.cpp` `ulpMeasure` | `loop()` stojí ~1,35 s (web, WiFi, standby); CAN1 číta vlastná úloha (`canbus1.cpp:80`) → CAN1 nedotknuté; CAN2/3 sniff NEOVERENÉ | po teste vypnúť |
+| D3 | Príkazy z FleetNestu `ULP_READ`, `STANDBY?`, `SLEEP_ULP=` (p59) | `teleclient.cpp`, FleetNest `commands.py` | ako D1/D2, ale na diaľku (cez mobilnú sieť); zadať ich smie správca firmy | po teste vypnúť vo fw aj vo FleetNeste |
+| D4 | `AT=<príkaz>` priamo do modemu | `web.cpp` | ľubovoľný AT príkaz modemu z lokálnej WiFi; v `web.cpp` som nenašiel žiadne overenie prístupu (heslo) | odstrániť alebo vypnúť |
+| D5 | Lokálna webstránka `/api/control` (VEH=, CELL=, SNIFF…, RESTART) | `web.cpp` | kto je na rovnakej WiFi, mení nastavenia bez hesla (pozri D4) | rozhodnúť: heslo / len servis |
+| D6 | Riadky stavu do FleetNestu (PID 0x399): kroky OTA, diagnostika CCH (p42, front 24 riadkov), `BOOT reset/wake`, `WIFI <sieť> IP`, `CMD …` | `ota.cpp`, `main.cpp` | malé dáta navyše cez mobilnú sieť (iba pri udalosti) | ponechať (BOOT/WIFI/OTA), CCH diagnostiku po vyriešení OTA cez sieť zmenšiť |
+| D7 | Flash OTA aj pri bežiacom motore, keď `veh` je prázdne (motor sa nerozozná) | `ota.cpp:26-31`, `telemetry.cpp:337` | flash a reštart za jazdy | **pred finálom opraviť** (p56: motor podľa napätia) – na test povolené (81) |
+| D8 | `STANDBY_AUTO 0` – automatický spánok vypnutý | `standby.h:23` | v2O v aute nespí, stále odoberá prúd | **pred finálom zapnúť** po úspešnom teste ULP |
+| D9 | Automatické čítania K0 (BSI/CMM DIDs) surovo do PID 0x39F | `telemetry.cpp` | dotazy do auta každých 10 min | rozhodnúť: funkcia alebo ladenie |
+| D10 | FleetNest admin: príkaz s ľubovoľným textom bez kontroly | FleetNest `apps/telemetry/admin.py` `CommandAdmin` | obíde kontrolu príkazov (firmvér neznáme ignoruje) | zakázať pridávanie v admine alebo volať `commands.validate` |
+
+Spôsob (návrh, na schválenie): ladiace funkcie D1–D4 za jeden prepínač pri builde (napr. `NESTBOX_DIAG`), teraz 1,
+vo finálnom builde 0 – kód ostane v repozitári, vo finálnom firmvéri nebude.
+Poznámka: časť 6 vyššie („ESP32 v spánku ADC nesleduje“) je prekonaná – ULP koprocesor meria 12 V aj v spánku
+(`standby.cpp`, overené podľa ESP-IDF 4.4 `ulp_fsm/ulp_adc`); funkčnosť v aute ukáže test.
