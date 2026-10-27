@@ -47,6 +47,8 @@ static uint16_t s_port = 6001;               // freematics-ota LISTEN_PORT (v1F 
 static volatile bool s_req;
 static volatile bool s_busy;                 // a check / download runs (standby waits)
 bool otaBusy() { return s_busy; }
+static uint8_t s_retries;                    // p74: a broken download is tried again after 60 s,
+static uint32_t s_retryAt;                   // resumed from the partial file, at most 10 times
 static volatile bool s_staged;               // a verified image waits on SD for the engine to stop
 static uint8_t s_buf[OTA_CHUNK];
 
@@ -294,6 +296,7 @@ static void check()
   c.stop();
   if (body.indexOf("\"available\": true") < 0 && body.indexOf("\"available\":true") < 0) {
     otaLog("OTA-PULL NO_UPDATE");
+    s_retries = 0;
     return;
   }
   int si = body.indexOf("\"size\":");
@@ -379,6 +382,7 @@ static void check()
     snprintf(m, sizeof(m), "OTA-PULL ERR=RECV %u/%u http=%d in %ums", (unsigned)written, (unsigned)size, code,
              (unsigned)(millis() - t0));
     otaLog(m);                                // the partial file stays: the next check resumes
+    if (s_retries < 10) { s_retries++; s_retryAt = millis(); }   // p74
     return;
   }
   uint8_t dig[32];
@@ -406,6 +410,7 @@ static void check()
   c.stop();
   s_staged = true;
   otaLog("OTA-PULL STAGED (flash when the engine is off)");
+  s_retries = 0;
 }
 
 // flash from SD (v1F performPullOtaFlash), then restart
@@ -492,6 +497,13 @@ static void otaTask(void*)
   vTaskDelay(pdMS_TO_TICKS(60000));          // after the boot: network and clock first
   for (;;) {
     if (s_staged && flashAllowed()) flashStaged();
+    if (s_retryAt && millis() - s_retryAt > 60000) {   // p74: resume the broken download
+      s_retryAt = 0;
+      char m[40];
+      snprintf(m, sizeof(m), "OTA-PULL RETRY %u/10", (unsigned)s_retries);
+      otaLog(m);
+      s_req = true;
+    }
     if (s_req || !last || millis() - last > OTA_PERIODIC_MS) {
       bool req = s_req;
       s_req = false;
