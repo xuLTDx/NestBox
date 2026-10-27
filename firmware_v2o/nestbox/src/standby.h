@@ -25,6 +25,7 @@
 
 void standbyEarly();          // first in setup(): a deep-sleep wake - confirm or sleep again (no return)
 bool standbyParkedBoot();     // this boot is the 3-hour parked report
+const char* standbyUlpStats(); // p62: counters of the last ULP sleep ("" = none) - one PID 0x399 line
 const char* standbyWakeName();// why this boot: "-", "VOLTAGE", "REPORT", "TEST"
 void standbyTick();           // loop()
 void standbyTest(uint32_t seconds, bool ulp);   // /api/control SLEEP_TEST=<s> (timer) / SLEEP_ULP=<s> (ULP + timer): sleep in ~2 s

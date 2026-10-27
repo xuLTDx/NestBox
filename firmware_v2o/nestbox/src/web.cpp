@@ -147,9 +147,9 @@ static int handlerControl(UrlHandlerParam* param)
     uint32_t sec = strtoul(cmd + 11, nullptr, 10);
     if (sec < 10 || sec > 3600) n = snprintf(buf, bufsize, "ERR 10..3600 s");
     else { standbyTest(sec, false); n = snprintf(buf, bufsize, "OK sleep %lu s in ~2 s", (unsigned long)sec); }
-  } else if (!strncmp(cmd, "SLEEP_ULP=", 10)) {      // car: deep sleep with the ULP (>= 12.8 V wakes), timer after <s> (10..60)
+  } else if (!strncmp(cmd, "SLEEP_ULP=", 10)) {      // car: deep sleep with the ULP (>= 12.8 V wakes), timer after <s> (10..600)
     uint32_t sec = strtoul(cmd + 10, nullptr, 10);
-    if (sec < 10 || sec > 60) n = snprintf(buf, bufsize, "ERR 10..60 s");
+    if (sec < 10 || sec > 600) n = snprintf(buf, bufsize, "ERR 10..600 s");
     else { standbyTest(sec, true); n = snprintf(buf, bufsize, "OK sleep %lu s with ULP in ~2 s", (unsigned long)sec); }
   } else if (!strcmp(cmd, "ULP_READ")) {
     n = standbyUlpRead(buf, bufsize);

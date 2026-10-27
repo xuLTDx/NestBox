@@ -153,6 +153,7 @@ void setup()
     char ln[120] = "BOOT ";                   // p58: reset reason + wake to FleetNest (the BOOT event is SD only)
     bootResetInfo(ln + 5, sizeof(ln) - 5);
     statusLine(ln);
+    if (standbyUlpStats()[0] && esp_reset_reason() == ESP_RST_DEEPSLEEP) statusLine(standbyUlpStats());   // p62
   }
 
   WiFi.mode(WIFI_STA);
