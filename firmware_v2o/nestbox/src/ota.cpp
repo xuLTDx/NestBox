@@ -71,6 +71,8 @@ static void otaLog(const char* text)
   portEXIT_CRITICAL(&s_mux);
 }
 
+void statusLine(const char* text) { otaLog(text); }
+
 int otaTakeStatus(uint8_t* out, int cap)
 {
   int n = 0;

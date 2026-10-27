@@ -104,6 +104,9 @@ static void wifiTick()
   for (uint32_t t = millis(); millis() - t < WIFI_JOIN_MS && WiFi.status() != WL_CONNECTED;) delay(100);
   if (WiFi.status() == WL_CONNECTED) {
     Serial.printf("[WIFI] %s IP %s\n", WIFI_NETS[best][0], WiFi.localIP().toString().c_str());
+    char ln[64];                              // p58: the box's address on a phone hotspot, seen in FleetNest
+    snprintf(ln, sizeof(ln), "WIFI %s IP %s", WIFI_NETS[best][0], WiFi.localIP().toString().c_str());
+    statusLine(ln);
     configTime(0, 0, "pool.ntp.org");        // the sniff file's clock line
   } else {
     Serial.println("[WIFI] join timeout");
@@ -146,6 +149,11 @@ void setup()
   sniffInit();
   telemetryBegin(s_bootId, s_sdOk);
   otaBegin();                                 // pull-OTA (needs the NVS handle opened by telemetryBegin)
+  {
+    char ln[120] = "BOOT ";                   // p58: reset reason + wake to FleetNest (the BOOT event is SD only)
+    bootResetInfo(ln + 5, sizeof(ln) - 5);
+    statusLine(ln);
+  }
 
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
