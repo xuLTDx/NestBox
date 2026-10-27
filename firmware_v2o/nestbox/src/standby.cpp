@@ -38,6 +38,7 @@ static bool s_reportFix, s_reportRecDone;
 static volatile uint32_t s_testS, s_testAt;   // SLEEP_TEST / SLEEP_ULP from the web
 static volatile bool s_testUlp;
 static void standbyTestNow(uint32_t seconds, bool ulp);
+static bool ulpMeasure(unsigned* sum, uint32_t* raw);
 
 bool standbyParkedBoot() { return s_parked; }
 const char* standbyWakeName() { return s_wake; }
@@ -155,8 +156,52 @@ static void goStandby()
   sleepNow(true);
 }
 
+// p59: the tests from FleetNest (cell or WiFi) - CMD=ULP_READ | STANDBY? | SLEEP_ULP=<10..60>;
+// run from loop() like the web ones, the answer = one PID 0x399 line "CMD <command> ..." (<= 60 chars:
+// CStorage::log byte buffer). The server resends until it sees the answer or the BOOT wake=ULP_TEST
+// line, so a SLEEP_ULP within 5 min after a ULP_TEST wake is not done again.
+static volatile uint8_t s_remote;      // 1 ULP_READ, 2 STANDBY?
+
+void standbyRemote(const char* cmd)
+{
+  if (!strcmp(cmd, "ULP_READ")) { s_remote = 1; return; }
+  if (!strcmp(cmd, "STANDBY?")) { s_remote = 2; return; }
+  if (strncmp(cmd, "SLEEP_ULP=", 10)) return;
+  unsigned long sec = strtoul(cmd + 10, nullptr, 10);
+  char m[64];
+  if (sec < 10 || sec > 60) snprintf(m, sizeof(m), "CMD SLEEP_ULP=%lu ERR 10..60 s", sec);
+  else if (!strncmp(s_wake, "ULP_TEST", 8) && millis() < 300000UL)
+    snprintf(m, sizeof(m), "CMD SLEEP_ULP=%lu not again, woke %lus ago", sec, (unsigned long)(millis() / 1000));
+  else {
+    standbyTest(sec, true);
+    snprintf(m, sizeof(m), "CMD SLEEP_ULP=%lu sleep in ~2 s", sec);
+  }
+  statusLine(m);
+}
+
+static void remoteTick()
+{
+  uint8_t r = s_remote;
+  if (!r) return;
+  s_remote = 0;
+  char m[64];
+  if (r == 1) {
+    unsigned sum;
+    uint32_t raw;
+    if (!ulpMeasure(&sum, &raw)) snprintf(m, sizeof(m), "CMD ULP_READ ERR ULP start");
+    else if (sum == 0xFFFF) snprintf(m, sizeof(m), "CMD ULP_READ ulp=none ard=%.2fV(%lu)",
+                                     raw / 4.0f / ADC_12V_FACTOR_SB, (unsigned long)raw);
+    else snprintf(m, sizeof(m), "CMD ULP_READ ulp=%.2fV(%u) ard=%.2fV(%lu)", sum / 4.0f / ADC_12V_FACTOR_SB,
+                  sum, raw / 4.0f / ADC_12V_FACTOR_SB, (unsigned long)raw);
+  } else {
+    snprintf(m, sizeof(m), "CMD STANDBY? v=%.2f eng=%d wake=%s", read12V(), telemetryEngineOn() ? 1 : 0, s_wake);
+  }
+  statusLine(m);
+}
+
 void standbyTick()
 {
+  remoteTick();
   if (s_testS && millis() - s_testAt > 2000) standbyTestNow(s_testS, s_testUlp);   // the HTTP answer went out first
   if (!STANDBY_AUTO) return;          // 21.10.2026: the ULP did not wake at the engine start - off until tested
   static uint32_t lastCheck;
@@ -211,17 +256,25 @@ static void standbyTestNow(uint32_t seconds, bool ulp)
 
 // ULP_READ: the ULP measures while the chip is awake (threshold never reached = no wake), 1 s;
 // its 4-sample sum next to analogRead - the same input and scale? (21.10.2026)
-int standbyUlpRead(char* buf, int cap)
+static bool ulpMeasure(unsigned* sum, uint32_t* raw)   // false = the ULP did not start
 {
   RTC_SLOW_MEM[ULP_LAST] = 0xFFFF;
-  if (!ulpStart(0xFFFF)) return snprintf(buf, cap, "ERR ULP start");
+  if (!ulpStart(0xFFFF)) return false;
   delay(1100);
   ulp_timer_stop();
   delay(250);                          // a run in progress ends
-  unsigned sum = RTC_SLOW_MEM[ULP_LAST] & 0xFFFF;
+  *sum = RTC_SLOW_MEM[ULP_LAST] & 0xFFFF;
   esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ULP);
-  uint32_t raw = 0;
-  for (int i = 0; i < 4; i++) raw += analogRead(36);   // adc1_get_raw: the ADC back from the ULP
+  *raw = 0;
+  for (int i = 0; i < 4; i++) *raw += analogRead(36);  // adc1_get_raw: the ADC back from the ULP
+  return true;
+}
+
+int standbyUlpRead(char* buf, int cap)
+{
+  unsigned sum;
+  uint32_t raw;
+  if (!ulpMeasure(&sum, &raw)) return snprintf(buf, cap, "ERR ULP start");
   return snprintf(buf, cap, "ulp_sum4=%u%s ulp_v=%.2f arduino_sum4=%lu v=%.2f thr_sum4=%u",
                   sum, sum == 0xFFFF ? " (ULP wrote nothing)" : "", sum / 4.0f / ADC_12V_FACTOR_SB,
                   (unsigned long)raw, raw / 4.0f / ADC_12V_FACTOR_SB, (unsigned)rawX4(ENGINE_OFF_VOLTAGE));

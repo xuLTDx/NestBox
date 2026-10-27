@@ -5,6 +5,7 @@
 #include "udpmsg.h"
 #include "sniff.h"
 #include "nbread.h"
+#include "standby.h"
 #include <sys/time.h>
 
 extern const char FW_BUILD_STR[];
@@ -199,6 +200,11 @@ void TeleClientUDP::onMessage(char* msg, UdpRx* rx)
       snprintf(m, sizeof(m), "NET CMD_READ #%u %s", (unsigned)seq, r ? "refused" : "accepted");
       Serial.println(m);
       logNetEvent(m);
+    }
+    if (cmdp && (!strcmp(cmdp + 4, "ULP_READ") || !strcmp(cmdp + 4, "STANDBY?") ||
+                 !strncmp(cmdp + 4, "SLEEP_ULP=", 10))) {   // p59: sleep tests from FleetNest (standby.h)
+      Serial.printf("[UDP] CMD:%s\n", cmdp + 4);
+      standbyRemote(cmdp + 4);
     }
     if (cmdp && !strncmp(cmdp + 4, "RESEND=", 7)) {
       uint32_t f = (uint32_t)strtoul(cmdp + 11, 0, 10);

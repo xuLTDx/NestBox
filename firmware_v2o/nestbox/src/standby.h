@@ -29,4 +29,5 @@ const char* standbyWakeName();// why this boot: "-", "VOLTAGE", "REPORT", "TEST"
 void standbyTick();           // loop()
 void standbyTest(uint32_t seconds, bool ulp);   // /api/control SLEEP_TEST=<s> (timer) / SLEEP_ULP=<s> (ULP + timer): sleep in ~2 s
 int standbyUlpRead(char* buf, int cap);         // /api/control ULP_READ
+void standbyRemote(const char* cmd);            // p59: CMD=ULP_READ | STANDBY? | SLEEP_ULP=<s> from FleetNest
 int standbyStatus(char* buf, int cap);

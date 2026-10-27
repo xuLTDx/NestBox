@@ -71,7 +71,13 @@ static void otaLog(const char* text)
   portEXIT_CRITICAL(&s_mux);
 }
 
-void statusLine(const char* text) { otaLog(text); }
+// <= 56 chars: as byte codes ("101;" = 4 chars each) the record line stays in CStorage::log's 256 B
+void statusLine(const char* text)
+{
+  char t[57];
+  snprintf(t, sizeof(t), "%s", text);
+  otaLog(t);
+}
 
 int otaTakeStatus(uint8_t* out, int cap)
 {
