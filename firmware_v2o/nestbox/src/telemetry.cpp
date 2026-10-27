@@ -417,6 +417,9 @@ static void cellTask(void*)
       char m[120];
       snprintf(m, sizeof(m), "CELL %s apn_profile=%s", s_cell.status(), s_cell.storedApn());
       logNetEvent(m);
+      snprintf(m, sizeof(m), "CELL %.26s mux=%d gps=%c/%d", s_cell.status(), s_cell.muxOn() ? 1 : 0,
+               s_cell.gpsMode(), s_cell.gpsStartOk() ? 1 : 0);
+      statusLine(m);                             // p69: visible in FleetNest (Stav zariadenia)
     }
     if (!s_cellOn && s_cellUp) { s_cellUp = false; s_cell.stop(); logNetEvent("CELL OFF"); }
     if (s_cellUp && s_cell.muxDead()) {           // p69: no good CMUX frame for 3 min (OVMS) -> restart
