@@ -172,10 +172,26 @@ void CellLink::powerOff()
   unlock();
 }
 
+static void diagText(char* out, int cap, const char* prefix, const char* in);
+
+// p71: one UDP line - the answer on the data port (m_buf) and on port 3 (m_urc); after each
+// open the first 3 good and 12 bad results, so a working link does not flood
+void CellLink::udpNote(const char* what, bool ok)
+{
+  if (!udpDiag || (ok ? m_udpOk++ >= 3 : m_udpErr++ >= 12)) return;
+  char both[200], t[120];
+  portENTER_CRITICAL(&m_spin);
+  snprintf(both, sizeof(both), "%.*s U:%.*s", 100, m_buf, 80, m_urc);
+  portEXIT_CRITICAL(&m_spin);
+  diagText(t, sizeof(t), what, both);
+  udpDiag(t);
+}
+
 bool CellLink::open(const char* host, uint16_t port)
 {
   if (!m_netOpen) return false;
   lock();
+  m_udpOk = m_udpErr = 0;
   char c[120];
   snprintf(c, sizeof(c), "AT+CDNSGIP=\"%s\"\r", host);
   if (at(c, 10000)) {                  // +CDNSGIP: 1,"host","1.2.3.4"
@@ -187,12 +203,13 @@ bool CellLink::open(const char* host, uint16_t port)
       if (q && q - p < (int)sizeof(m_ip)) { memcpy(m_ip, p, q - p); m_ip[q - p] = 0; }
     }
   }
-  if (!m_ip[0]) { unlock(); return false; }
+  if (!m_ip[0]) { udpNote("UDP DNS ERR ", false); unlock(); return false; }
   m_port = port;
   if (m_sockOpen) at("AT+CIPCLOSE=0\r", 2000);
   at("AT+CIPRXGET=1\r");
   snprintf(c, sizeof(c), "AT+CIPOPEN=0,\"UDP\",\"%s\",%u,8000\r", m_ip, port);
   m_sockOpen = at(c, 3000);
+  udpNote(m_sockOpen ? "UDP OPEN OK " : "UDP OPEN ERR ", m_sockOpen);
   unlock();
   return m_sockOpen;
 }
@@ -211,9 +228,10 @@ bool CellLink::send(const char* data, unsigned int len)
   char c[80];
   int n = snprintf(c, sizeof(c), "AT+CIPSEND=0,%u,\"%s\",%u\r", len, m_ip, m_port);
   linkWrite((const uint8_t*)c, n);
-  waitFor("\r\n>", "\r\nERROR", 1000);   // the prompt, then the bytes
+  bool prompt = waitFor("\r\n>", "\r\nERROR", 1000);   // the prompt, then the bytes
   linkWrite((const uint8_t*)data, len);
   bool ok = waitFor("+CIPSEND:", "\r\nERROR", 2000);
+  udpNote(ok ? "UDP SEND OK " : prompt ? "UDP SEND ERR " : "UDP SEND NOPROMPT ", ok);
   unlock();
   return ok;
 }
@@ -238,6 +256,8 @@ int CellLink::receive(char* buf, int cap, unsigned int timeoutMs)
         memcpy(buf, nl + 1, n);
       }
     }
+    if (n > 0) { char w[24]; snprintf(w, sizeof(w), "UDP RX %d ", n); udpNote(w, true); }
+    else if (millis() - t >= timeoutMs && timeoutMs >= 1000) udpNote("UDP RX NONE ", false);   // not the 10 ms inbound polls
     unlock();
     if (n > 0) return n;
     if (millis() - t >= timeoutMs) break;

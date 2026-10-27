@@ -89,7 +89,12 @@ public:
   // HTTPS diagnostics (p42, 2026-10-26: OTA over cellular ended with META_HTTP0) - the modem's
   // AT+CCH* answers into the record (PID 0x399); set by ota.cpp, nullptr = none
   void (*diag)(const char*) = nullptr;
+  // p71 (27.10.2026: no UDP records over cellular with CMUX, HTTPS fine) - the modem's AT+CIP*
+  // answers (data port + port 3 URCs); set by ota.cpp, which sends them over HTTPS; nullptr = none
+  void (*udpDiag)(const char*) = nullptr;
 private:
+  int m_udpOk = 0, m_udpErr = 0;
+  void udpNote(const char* what, bool ok);
   // p69 CMUX state
   volatile bool m_muxOn = false;
   bool m_muxWanted = true;

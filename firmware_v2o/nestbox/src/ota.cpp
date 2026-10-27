@@ -111,6 +111,28 @@ bool otaSet(const char* key, const char* value)
 
 void otaRequest() { s_req = true; }
 
+// -------------------------------------------------- p71 UDP diagnostics ---
+// The cellular UDP link's answers (cellmodem udpDiag): to SD, and over HTTPS to the OTA server
+// as GET .../diag?l=<lines> - the server logs every request line (a 404 is fine), so they are
+// readable while the records themselves do not get through.
+#define UDP_DIAG_Q 16
+static char s_d[UDP_DIAG_Q][120];
+static uint8_t s_dHead, s_dCount;
+static uint32_t s_dAt;
+
+static void udpDiagNote(const char* text)
+{
+  logNetEvent(text);
+  Serial.println(text);
+  portENTER_CRITICAL(&s_mux);
+  uint8_t slot = (s_dHead + s_dCount) % UDP_DIAG_Q;
+  if (s_dCount == UDP_DIAG_Q) s_dHead = (s_dHead + 1) % UDP_DIAG_Q;
+  else s_dCount++;
+  strncpy(s_d[slot], text, sizeof(s_d[0]) - 1);
+  s_d[slot][sizeof(s_d[0]) - 1] = 0;
+  portEXIT_CRITICAL(&s_mux);
+}
+
 // ---------------------------------------------------------------- HTTP ---
 // One HTTPS connection: WiFi (WiFiClientSecure) or the modem's own TLS (AT+CCH*, 2026-10-20 -
 // over cellular when there is no WiFi; NOT TESTED: the data link did not come up on USB power).
@@ -180,7 +202,7 @@ static int httpGet(OtaConn& c, const char* path, size_t rangeFrom, long* len)
 {
   c.rn = c.rp = 0;
   if (!c.connect(s_host, s_port)) return -1;
-  char req[400];
+  char req[900];
   int n = snprintf(req, sizeof(req), "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n", path, s_host);
   if (rangeFrom) n += snprintf(req + n, sizeof(req) - n, "Range: bytes=%u-\r\n", (unsigned)rangeFrom);
   snprintf(req + n, sizeof(req) - n, "\r\n");
@@ -430,6 +452,40 @@ static void flashStaged()
   esp_restart();
 }
 
+// p71: the waiting lines, as many as fit into one GET (encoded, '~' between lines)
+static void udpDiagUpload(CellLink* cell)
+{
+  static char path[700];
+  int n = snprintf(path, sizeof(path), "/api/nestbox/ota/%s/diag?l=", s_token);
+  int sent = 0;
+  for (;;) {
+    char line[120];
+    portENTER_CRITICAL(&s_mux);
+    bool have = sent < s_dCount;
+    if (have) strcpy(line, s_d[(s_dHead + sent) % UDP_DIAG_Q]);
+    portEXIT_CRITICAL(&s_mux);
+    if (!have || n + (int)strlen(line) * 3 + 2 >= (int)sizeof(path)) break;
+    if (sent) path[n++] = '~';
+    for (const char* p = line; *p; p++) {
+      char ch = *p;
+      if (isalnum((unsigned char)ch) || ch == '-' || ch == '_' || ch == '.') path[n++] = ch;
+      else n += snprintf(path + n, sizeof(path) - n, "%%%02X", (unsigned char)ch);
+    }
+    path[n] = 0;
+    sent++;
+  }
+  if (!sent) return;
+  s_cc.m = cell;
+  long len = 0;
+  int code = httpGet(s_cc, path, 0, &len);
+  s_cc.stop();
+  if (code < 0) return;                        // no connection: the lines wait for the next try
+  portENTER_CRITICAL(&s_mux);
+  s_dHead = (s_dHead + sent) % UDP_DIAG_Q;
+  s_dCount -= sent;
+  portEXIT_CRITICAL(&s_mux);
+}
+
 static void otaTask(void*)
 {
   uint32_t last = 0;
@@ -446,6 +502,14 @@ static void otaTask(void*)
         check();
         s_busy = false;
       }
+    }
+    CellLink* cell = telemetryCellLink();     // p71
+    if (cell && !cell->udpDiag) cell->udpDiag = udpDiagNote;
+    if (cell && s_dCount && s_token[0] && WiFi.status() != WL_CONNECTED && millis() - s_dAt > 20000) {
+      s_dAt = millis();
+      s_busy = true;
+      udpDiagUpload(cell);
+      s_busy = false;
     }
     vTaskDelay(pdMS_TO_TICKS(2000));
   }
