@@ -167,7 +167,7 @@ Kód sa podľa tejto tabuľky NEMENÍ bez rozhodnutia.
 | K11 | Napájanie modemu | PWRKEY 200 ms zap., `AT+CPOF` alebo 2,6 s vyp. | PWRKEY cyklus 500 ms zap. / 3000 ms vyp. (`simcom_7600.cpp:157, 165`) | blízke | pri p69 prevziať časy OVMS |
 | K12 | WiFi | 2 pevné siete, sken + pripojenie, opakovanie 30 s (`main.cpp`) | režimy client / AP / apclient, skenovanie, reconnect, kvalita signálu (`esp32wifi.cpp`) | OVMS (viac funkcií) | nízka priorita; AP na servis zvážiť |
 | K13 | Lokálna web stránka / `/api/control` | bez prihlásenia (D4/D5) | webserver s prihlásením (session, `web_framework.cpp:522`) | **OVMS** | pred finálom heslo alebo vypnúť (D5) |
-| K14 | Watchdog | v kóde v2O žiadne `esp_task_wdt`; či beží TWDT z konfigurácie Arduina – NEOVERENÉ | mená úloh pri WDT sa ukladajú do boot dát a hlásia (`ovms_boot.cpp:682-687`) | **OVMS** | pridať hlásenie WDT do riadku BOOT |
+| K14 | Watchdog | v2O v riadku BOOT hlási dôvod resetu (aj `TASK_WDT`) a posledný krok (`laststep`) | pri resete watchdogom ukladá mená zaseknutých úloh do RTC a vypíše ich v `boot status` (`ovms_boot.cpp:221-224`) – **ale na ESP-IDF ≥ 4 len "(unavailable)"** (`ovms_boot.cpp:686-689`); my sme na IDF 4.4 | **nič navyše** | zrušené (opravené 27.10. po otázke Vojtecha) |
 | K15 | Protokol na server | v1F Freematics UDP → FleetNest | OVMS v2/v3 na vlastný server | **v1F** | ponechať |
 
-Poradie podľa dopadu: **K1+K2+K3 (p69)** → K13 (D5) → K14 → K7 → K11 (s p69) → K12.
+Poradie podľa dopadu: **K1+K2+K3 (p69)** → K13 (D5) → K7 → K11 (s p69) → K12.
