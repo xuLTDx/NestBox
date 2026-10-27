@@ -89,7 +89,13 @@ bool CellLink::start()
   m_sockOpen = false;
   snprintf(m_status, sizeof(m_status), "power");
   if (!alive()) {
-    pressKey(500);                     // SIM7600: >= 100 ms on, < 2500 ms never off; 500 ms as OVMS (K11)
+    // p72 = OVMS PowerOffOn (ovms_cellular.cpp:396, simcom_7600.cpp:165): the modem's state is unknown -
+    // after an ESP restart (OTA) it still runs, in CMUX, and answers no plain AT (27.10.2026 19:34).
+    // A power cycle works in any case: 3000 ms (off, or on when it was off), 5 s, 500 ms (on; < 2500 ms never off)
+    while (s_uart.available()) s_uart.read();
+    pressKey(3000);
+    delay(5000);
+    pressKey(500);
     uint32_t t = millis();
     while (!alive() && millis() - t < 25000) delay(500);
     if (!alive()) { snprintf(m_status, sizeof(m_status), "no answer after power key"); return false; }
