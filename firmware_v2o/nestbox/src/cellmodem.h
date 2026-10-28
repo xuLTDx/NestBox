@@ -92,7 +92,12 @@ public:
   // p71 (27.10.2026: no UDP records over cellular with CMUX, HTTPS fine) - the modem's AT+CIP*
   // answers (data port + port 3 URCs); set by ota.cpp, which sends them over HTTPS; nullptr = none
   void (*udpDiag)(const char*) = nullptr;
+  // p79: how the last start() got an answer - 0 already on, 1 after 3000 ms, 2 after 3000 + 500 ms
+  int startStep() const { return m_startStep; }
+  uint32_t startMs() const { return m_startMs; }
 private:
+  int m_startStep = 0;
+  uint32_t m_startMs = 0;
   int m_udpOk = 0, m_udpErr = 0;
   void udpNote(const char* what, bool ok);
   // p69 CMUX state

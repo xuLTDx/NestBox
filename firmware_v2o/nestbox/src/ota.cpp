@@ -14,6 +14,7 @@ extern const char FW_BUILD_STR[];
 extern nvs_handle_t nvs;
 void logNetEvent(const char* text);
 void prepareRestart(const char* why);
+void telemetryCellOff();
 bool telemetryEngineOn();
 class CellLink;
 CellLink* telemetryCellLink();
@@ -452,6 +453,10 @@ static void flashStaged()
   }
   sdLock(); SD.remove(OTA_PENDING_PATH); SD.remove(OTA_META_PATH); SD.remove(OTA_RESUME_PATH); sdUnlock();
   otaLog("OTA-PULL FLASH OK - restart");
+  // p79: the modem off first, as before the sleep (AT+CPOF; fully off after 25-26 s per the SIM7600G
+  // Hardware Design table 9) - the new firmware then finds it off and its start() step 1 powers it on
+  telemetryCellOff();
+  delay(27000);
   prepareRestart("OTA_FLASHED");
   delay(1500);
   esp_restart();

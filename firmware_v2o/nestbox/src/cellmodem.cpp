@@ -88,16 +88,29 @@ bool CellLink::start()
   m_netOpen = false;
   m_sockOpen = false;
   snprintf(m_status, sizeof(m_status), "power");
+  m_startStep = 0;
+  m_startMs = 0;
   if (!alive()) {
-    // p72 = OVMS PowerOffOn (ovms_cellular.cpp:396, simcom_7600.cpp:165): the modem's state is unknown -
-    // after an ESP restart (OTA) it still runs, in CMUX, and answers no plain AT (27.10.2026 19:34).
-    // A power cycle works in any case: 3000 ms (off, or on when it was off), 5 s, 500 ms (on; < 2500 ms never off)
+    // p79 (28.10.2026), times from SIM7600G Hardware Design V1.00 tables 8/9: PWRKEY >= 2.5 s powers a
+    // running modem off - fully off (STATUS low) only after 25-26 s; 100-500 ms powers an off modem on,
+    // UART ready after 13-14 s. The state at boot is unknown (after an OTA / crash restart it still runs,
+    // in CMUX - p72's 500 ms press came during the power-off and was lost, 27.10 19:34/20:00/20:15).
+    // 1) 3000 ms: an off modem comes on (answers within 30 s), a running one starts to power off;
+    // 2) no answer = it was running and is off after those 30 s: 500 ms, answer within 25 s.
+    uint32_t t0 = millis();
     while (s_uart.available()) s_uart.read();
     pressKey(3000);
-    delay(5000);
-    pressKey(500);
     uint32_t t = millis();
-    while (!alive() && millis() - t < 25000) delay(500);
+    while (!alive() && millis() - t < 30000) delay(500);
+    m_startStep = 1;
+    if (!alive()) {
+      while (s_uart.available()) s_uart.read();
+      pressKey(500);
+      t = millis();
+      while (!alive() && millis() - t < 25000) delay(500);
+      m_startStep = 2;
+    }
+    m_startMs = millis() - t0;
     if (!alive()) { snprintf(m_status, sizeof(m_status), "no answer after power key"); return false; }
   }
   at("ATE0\r");
