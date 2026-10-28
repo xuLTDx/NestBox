@@ -602,9 +602,66 @@ static bool probeTick()
   return true;
 }
 
+// ---- p86 (28.10.2026): DID scan of one ECU - 22 <DID> for every DID of a range; every positive
+// answer as an SD event line "SCAN <tx> <DID> <answer hex>" (download: /api/events/0), counts at the end
+// as a FleetNest line. Web: SCAN=<bus>,<tx hex>,<rx hex>,<from hex>,<to hex>; SCAN? ; SCAN=0 stops.
+// Only reading (service 22). To find what an ECU knows that the Diagbox DB does not list (speed sign).
+static volatile int32_t s_scanCur = -1;
+static uint32_t s_scanTo, s_scanTx, s_scanRx, s_scanOk, s_scanNrc, s_scanNone;
+static uint8_t s_scanBus;
+bool scanStart(const char* a)
+{
+  unsigned bus, tx, rx, from, to;
+  if (sscanf(a, "%u,%x,%x,%x,%x", &bus, &tx, &rx, &from, &to) != 5 || bus < 1 || bus > 3 || from > to || to > 0xFFFF) return false;
+  s_scanBus = bus; s_scanTx = tx; s_scanRx = rx; s_scanTo = to;
+  s_scanOk = s_scanNrc = s_scanNone = 0;
+  char m[80];
+  snprintf(m, sizeof(m), "SCAN start bus=%u %X->%X %04X-%04X", bus, tx, rx, from, to);
+  s_log.logEvent(m);
+  s_scanCur = from;
+  return true;
+}
+void scanStop() { s_scanCur = -1; }
+int scanStatus(char* buf, int cap)
+{
+  return snprintf(buf, cap, "%s %X cur=%04X to=%04X ok=%u nrc=%u none=%u", s_scanCur < 0 ? "idle" : "running",
+                  (unsigned)s_scanTx, (unsigned)(s_scanCur < 0 ? 0 : s_scanCur), (unsigned)s_scanTo,
+                  (unsigned)s_scanOk, (unsigned)s_scanNrc, (unsigned)s_scanNone);
+}
+static bool scanTick()
+{
+  if (s_scanCur < 0) return false;
+  if ((uint32_t)s_scanCur > s_scanTo) {
+    s_scanCur = -1;
+    char m[56];
+    snprintf(m, sizeof(m), "SCAN done %X ok=%u nrc=%u none=%u", (unsigned)s_scanTx,
+             (unsigned)s_scanOk, (unsigned)s_scanNrc, (unsigned)s_scanNone);
+    statusLine(m);
+    s_log.logEvent(m);
+    return true;
+  }
+  NbRead r = {};
+  r.bus = s_scanBus; r.txId = s_scanTx; r.rxId = s_scanRx;
+  r.req[0] = 0x22; r.req[1] = (uint8_t)(s_scanCur >> 8); r.req[2] = (uint8_t)s_scanCur; r.reqLen = 3;
+  static uint8_t resp[NB_READ_MAX];
+  int len = 0; uint8_t nrc = 0;
+  int res = busExchange(&r, resp, sizeof(resp), &len, &nrc);
+  if (res == NBR_OK) {
+    s_scanOk++;
+    char line[300];
+    int n = snprintf(line, sizeof(line), "SCAN %X %04X ", (unsigned)s_scanTx, (unsigned)s_scanCur);
+    for (int i = 0; i < len && n < (int)sizeof(line) - 3; i++) n += snprintf(line + n, sizeof(line) - n, "%02X", resp[i]);
+    s_log.logEvent(line);
+  } else if (res == NBR_NRC) s_scanNrc++;
+  else s_scanNone++;
+  s_scanCur++;
+  return true;
+}
+
 void readTick()
 {
   if (probeTick()) return;                  // p84: the probe owns the bus while it runs
+  if (scanTick()) return;                   // p86
   NbRead r;
   uint32_t seq;
   if (!nbReadTake(&r, &seq)) { autoReadTick(); return; }

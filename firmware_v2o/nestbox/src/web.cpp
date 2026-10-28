@@ -62,6 +62,9 @@ bool webApAllowed() { return s_apAllowed; }
 void webSetApAllowed(bool on) { s_apAllowed = on; s_webPrefs.putBool("ap", on); }
 
 void probeStart(int bus);                  // telemetry.cpp (p84)
+bool scanStart(const char* a);             // telemetry.cpp (p86)
+void scanStop();
+int scanStatus(char* buf, int cap);
 int probeStatus(char* buf, int cap);
 bool webSetPassword(const char* pw)
 {
@@ -155,6 +158,14 @@ static int handlerControl(UrlHandlerParam* param)
   } else if (!strncmp(cmd, "PROBE=", 6) && (cmd[6] == '1' || cmd[6] == '2' || cmd[6] == '3')) {   // p84
     probeStart(cmd[6] - '0');
     n = snprintf(buf, bufsize, "OK - PROBE? for the result (about 1-2 min)");
+  } else if (!strcmp(cmd, "SCAN=0")) {               // p86
+    scanStop();
+    n = snprintf(buf, bufsize, "OK stopped");
+  } else if (!strncmp(cmd, "SCAN=", 5)) {
+    n = snprintf(buf, bufsize, scanStart(cmd + 5) ? "OK - SCAN? for progress, answers in /api/events/0"
+                                                    : "ERR SCAN=<bus>,<tx>,<rx>,<from DID>,<to DID> (hex)");
+  } else if (!strcmp(cmd, "SCAN?")) {
+    n = scanStatus(buf, bufsize);
   } else if (!strcmp(cmd, "PROBE?")) {
     n = probeStatus(buf, bufsize);
   } else if (!strcmp(cmd, "OTA?")) {
