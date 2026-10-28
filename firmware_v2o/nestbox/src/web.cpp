@@ -61,6 +61,8 @@ static bool s_apAllowed;
 bool webApAllowed() { return s_apAllowed; }
 void webSetApAllowed(bool on) { s_apAllowed = on; s_webPrefs.putBool("ap", on); }
 
+void probeStart(int bus);                  // telemetry.cpp (p84)
+int probeStatus(char* buf, int cap);
 bool webSetPassword(const char* pw)
 {
   size_t n = strlen(pw);
@@ -150,6 +152,11 @@ static int handlerControl(UrlHandlerParam* param)
     int r = nbReadSubmit(cmd + 5, &seq);
     n = snprintf(buf, bufsize, r ? "ERR %d (#%u; 10 syntax, 11 not a reading service)" : "OK #%u - result in the next record (PID 0x39D) and the SD log",
                  r ? r : (int)seq, (unsigned)seq);
+  } else if (!strncmp(cmd, "PROBE=", 6) && (cmd[6] == '1' || cmd[6] == '2' || cmd[6] == '3')) {   // p84
+    probeStart(cmd[6] - '0');
+    n = snprintf(buf, bufsize, "OK - PROBE? for the result (about 1-2 min)");
+  } else if (!strcmp(cmd, "PROBE?")) {
+    n = probeStatus(buf, bufsize);
   } else if (!strcmp(cmd, "OTA?")) {
     n = otaStatus(buf, bufsize);
   } else if (!strcmp(cmd, "OTA_CHECK")) {           // pull-OTA check now (as the server's OTA_READY)
