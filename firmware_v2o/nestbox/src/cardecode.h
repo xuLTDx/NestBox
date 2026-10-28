@@ -36,6 +36,9 @@ struct CarValues {
   uint16_t fuelBsiCl; uint32_t fuelBsiAt;                   // p81 READ BSI D8C3, 0.01 L
   uint8_t ureaMeasRaw; uint32_t ureaMeasAt;                 // p81 READ CMM D558 raw
   uint16_t ureaEstMl; uint32_t ureaEstAt;                   // p81 READ CMM D517 byte 5 x 62.5 ml
+  uint8_t crew;     uint32_t crewAt;                        // p83 READ BSI D997/D998/D99F: bit0 driver belt,
+                                                            // bit1 passenger belt, bit2 passenger seated (verified 28.10)
+  uint8_t speedDisp; uint32_t speedDispAt;                  // p83 READ BSI D8F9 speed as on the cluster, km/h (verified 50/70)
 };
 
 void carSetProfile(const char* p);    // "K0" or "" (none)

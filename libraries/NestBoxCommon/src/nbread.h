@@ -29,7 +29,7 @@
 #define PID_READ_RESULT 0x39D
 #define NB_READ_MAX 128                // response bytes kept
 #define NB_READ_RECORD_MAX 56          // of them into the record (the SD line has all)
-#define NB_READ_REPEAT_MS 120000UL     // the same command again within this time: not sent again
+#define NB_READ_REPEAT_MS 0UL          // p82 (28.10.2026): no guard - a new READ with the same text was dropped for 2 min; a read done twice harms nothing
 
 enum NbReadResult {
   NBR_OK = 0,

@@ -54,6 +54,8 @@ const char* bootResetInfo(char* buf, int cap);   // main.cpp
 #define PID_FUEL_BSI   0x3A1     // p81: READ BSI D8C3 fuel, 0.01 L
 #define PID_UREA_MEAS  0x3A2     // p81: READ CMM D558 urea measured, raw byte (scale from a refill)
 #define PID_UREA_EST   0x3A3     // p81: READ CMM D517 urea estimated, ml
+#define PID_CREW       0x3A4     // p83: bit0 driver belt, bit1 passenger belt, bit2 passenger seated
+#define PID_SPEED_DISP 0x3A5     // p83: speed as on the cluster (BSI D8F9), km/h
 #define PID_ENGINE_EVENT      0x380   // v1F: 1 = START, 2 = STOP
 #define PID_ENGINE_EVENT_TIME 0x381   // v1F: unix time of the event
 #define CAR_FRESH_MS   5000
@@ -180,11 +182,13 @@ CellLink* telemetryCellLink() { return s_cellUp ? &s_cell : nullptr; }   // pull
 // (OBD 6/14, sniff 21.10.2026); on which bus the BSI answers is not known: CAN2 (OBD 3/8)
 // first, then CAN1 - the bus that answered is kept for the boot. Raw response into the next
 // record (PID 0x39F) and an SD event line; FleetNest stores it, decoding comes later.
-#define AUTO_READ_EVERY_MS 600000UL
+#define AUTO_READ_EVERY_MS 60000UL     // p83: every minute (crew / cluster speed), was 10 min
 #define AUTO_READ_GAP_MS   1000UL
-struct AutoRead { uint32_t tx, rx; uint8_t did[2]; uint8_t buses[2]; };
+struct AutoRead { uint32_t tx, rx; uint8_t did[6]; uint8_t buses[2]; };   // p83: up to 3 DIDs per request
 // p81 (28.10.2026): BSI and the CMM (Delphi DCM6.2) both answered on CAN2 = OBD 3/8 (READ 28.10)
 static const AutoRead K0_READS[] = {
+  {0x752, 0x652, {0xD9, 0x97, 0xD9, 0x98, 0xD9, 0x9F}, {2, 1}},   // p83 BSI: belts driver / passenger, passenger seated
+  {0x752, 0x652, {0xD8, 0xF9}, {2, 1}},   // p83 BSI: speed as on the cluster
   {0x752, 0x652, {0xD8, 0xC3}, {2, 1}},   // BSI: fuel measured x 0.01 L (verified 28.10)
   {0x6A8, 0x688, {0xD5, 0x58}, {2, 1}},   // CMM: urea volume measured (raw byte, scale at a refill)
   {0x6A8, 0x688, {0xD5, 0x17}, {2, 1}},   // CMM: urea volume estimated, byte 5 x 0.0625 L (DB)
@@ -246,7 +250,8 @@ static void autoReadTick()
   const AutoRead& a = K0_READS[next];
   NbRead r = {};
   r.txId = a.tx; r.rxId = a.rx;
-  r.req[0] = 0x22; r.req[1] = a.did[0]; r.req[2] = a.did[1]; r.reqLen = 3;
+  r.req[0] = 0x22; r.reqLen = 1;
+  for (int k = 0; k < 6 && a.did[k]; k += 2) { r.req[r.reqLen++] = a.did[k]; r.req[r.reqLen++] = a.did[k + 1]; }
   static uint8_t resp[NB_READ_MAX];
   int len = 0, res = NBR_NO_REPLY;
   uint8_t nrc = 0;
@@ -339,6 +344,8 @@ static void makeRecord(int event = 0, time_t when = 0)
   if (cv.fuelBsiAt && ms - cv.fuelBsiAt < 660000UL) r.u32(PID_FUEL_BSI, cv.fuelBsiCl);
   if (cv.ureaMeasAt && ms - cv.ureaMeasAt < 660000UL) r.u32(PID_UREA_MEAS, cv.ureaMeasRaw);
   if (cv.ureaEstAt && ms - cv.ureaEstAt < 660000UL) r.u32(PID_UREA_EST, cv.ureaEstMl);
+  if (cv.crewAt && ms - cv.crewAt < 90000UL) r.u32(PID_CREW, cv.crew);
+  if (cv.speedDispAt && ms - cv.speedDispAt < 90000UL) r.u32(PID_SPEED_DISP, cv.speedDisp);
   if (cv.ureaAt && ms - cv.ureaAt < CAR_FRESH_MS) {
     r.u32(PID_UREA_KM, cv.ureaKm);
     uint8_t* u = cv.urea;
