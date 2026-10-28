@@ -63,6 +63,7 @@ void webSetApAllowed(bool on) { s_apAllowed = on; s_webPrefs.putBool("ap", on); 
 
 void probeStart(int bus);                  // telemetry.cpp (p84)
 bool scanStart(const char* a);             // telemetry.cpp (p86)
+bool scanSetAuto(const char* a);
 void scanStop();
 int scanStatus(char* buf, int cap);
 int probeStatus(char* buf, int cap);
@@ -158,6 +159,8 @@ static int handlerControl(UrlHandlerParam* param)
   } else if (!strncmp(cmd, "PROBE=", 6) && (cmd[6] == '1' || cmd[6] == '2' || cmd[6] == '3')) {   // p84
     probeStart(cmd[6] - '0');
     n = snprintf(buf, bufsize, "OK - PROBE? for the result (about 1-2 min)");
+  } else if (!strncmp(cmd, "SCAN_AUTO=", 10)) {       // p86 loop at every engine start ("" = off)
+    n = snprintf(buf, bufsize, scanSetAuto(cmd + 10) ? "OK saved" : "ERR SCAN_AUTO=<bus>,<tx>,<rx>,<from>,<to> or empty");
   } else if (!strcmp(cmd, "SCAN=0")) {               // p86
     scanStop();
     n = snprintf(buf, bufsize, "OK stopped");

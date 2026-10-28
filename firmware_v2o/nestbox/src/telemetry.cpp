@@ -606,31 +606,77 @@ static bool probeTick()
 // answer as an SD event line "SCAN <tx> <DID> <answer hex>" (download: /api/events/0), counts at the end
 // as a FleetNest line. Web: SCAN=<bus>,<tx hex>,<rx hex>,<from hex>,<to hex>; SCAN? ; SCAN=0 stops.
 // Only reading (service 22). To find what an ECU knows that the Diagbox DB does not list (speed sign).
+// Loop mode (user 28.10: "nebude bežať stále?"): SCAN_AUTO=<same args> is kept in NVS; at every engine
+// START the scan starts and repeats until the engine stops - the first pass logs every answer, later
+// passes only the DIDs whose answer changed (a CRC per DID in PSRAM), so a sign change shows with its time.
 static volatile int32_t s_scanCur = -1;
-static uint32_t s_scanTo, s_scanTx, s_scanRx, s_scanOk, s_scanNrc, s_scanNone;
+static uint32_t s_scanFrom, s_scanTo, s_scanTx, s_scanRx, s_scanOk, s_scanNrc, s_scanNone, s_scanPass;
 static uint8_t s_scanBus;
-bool scanStart(const char* a)
+static bool s_scanLoop;
+static uint32_t* s_scanCrc;                   // one CRC per DID of the range (0 = no answer yet)
+static char s_scanAuto[40];
+static uint32_t crcOf(const uint8_t* d, int n) { uint32_t c = 2166136261u; for (int i = 0; i < n; i++) c = (c ^ d[i]) * 16777619u; return c | 1; }
+static bool scanParse(const char* a, unsigned* bus, unsigned* tx, unsigned* rx, unsigned* from, unsigned* to)
+{
+  return sscanf(a, "%u,%x,%x,%x,%x", bus, tx, rx, from, to) == 5 && *bus >= 1 && *bus <= 3 && *from <= *to && *to <= 0xFFFF;
+}
+static bool scanBegin(const char* a, bool loop)
 {
   unsigned bus, tx, rx, from, to;
-  if (sscanf(a, "%u,%x,%x,%x,%x", &bus, &tx, &rx, &from, &to) != 5 || bus < 1 || bus > 3 || from > to || to > 0xFFFF) return false;
-  s_scanBus = bus; s_scanTx = tx; s_scanRx = rx; s_scanTo = to;
-  s_scanOk = s_scanNrc = s_scanNone = 0;
+  if (!scanParse(a, &bus, &tx, &rx, &from, &to)) return false;
+  s_scanBus = bus; s_scanTx = tx; s_scanRx = rx; s_scanFrom = from; s_scanTo = to; s_scanLoop = loop;
+  s_scanOk = s_scanNrc = s_scanNone = 0; s_scanPass = 1;
+  if (s_scanCrc) { free(s_scanCrc); s_scanCrc = nullptr; }
+  s_scanCrc = (uint32_t*)ps_calloc(to - from + 1, sizeof(uint32_t));
   char m[80];
-  snprintf(m, sizeof(m), "SCAN start bus=%u %X->%X %04X-%04X", bus, tx, rx, from, to);
+  snprintf(m, sizeof(m), "SCAN start bus=%u %X->%X %04X-%04X%s", bus, tx, rx, from, to, loop ? " loop" : "");
   s_log.logEvent(m);
   s_scanCur = from;
   return true;
 }
+bool scanStart(const char* a) { return scanBegin(a, false); }
+bool scanSetAuto(const char* a)                // "" = off
+{
+  unsigned b, t, r, f, e;
+  if (a[0] && !scanParse(a, &b, &t, &r, &f, &e)) return false;
+  snprintf(s_scanAuto, sizeof(s_scanAuto), "%s", a);
+  nvs_set_str(nvs, "SCAN_AUTO", s_scanAuto); nvs_commit(nvs);
+  return true;
+}
+static void scanAutoTick()                     // from autoReadTick's START/STOP view
+{
+  static bool was;
+  static bool loaded;
+  if (!loaded) { size_t l = sizeof(s_scanAuto); nvs_get_str(nvs, "SCAN_AUTO", s_scanAuto, &l); loaded = true; }
+  bool on = s_engineOn;
+  if (on && !was && s_scanAuto[0]) scanBegin(s_scanAuto, true);
+  if (!on && was && s_scanLoop) { s_scanCur = -1; s_log.logEvent("SCAN loop stop (engine off)"); }
+  was = on;
+}
 void scanStop() { s_scanCur = -1; }
 int scanStatus(char* buf, int cap)
 {
-  return snprintf(buf, cap, "%s %X cur=%04X to=%04X ok=%u nrc=%u none=%u", s_scanCur < 0 ? "idle" : "running",
+  return snprintf(buf, cap, "%s%s pass=%u auto='%s' %X cur=%04X to=%04X ok=%u nrc=%u none=%u", s_scanCur < 0 ? "idle" : "running",
+                  s_scanLoop ? " loop" : "", (unsigned)s_scanPass, s_scanAuto,
                   (unsigned)s_scanTx, (unsigned)(s_scanCur < 0 ? 0 : s_scanCur), (unsigned)s_scanTo,
                   (unsigned)s_scanOk, (unsigned)s_scanNrc, (unsigned)s_scanNone);
 }
 static bool scanTick()
 {
   if (s_scanCur < 0) return false;
+  static uint32_t lastReq;                   // at most 20 requests/s: the BSI forwards each one to the
+  if (millis() - lastReq < 50) return true;  // slower body bus of the ECU (user 28.10: bus load)
+  lastReq = millis();
+  if ((uint32_t)s_scanCur > s_scanTo && s_scanLoop) {        // next pass
+    char m[64];
+    snprintf(m, sizeof(m), "SCAN pass %u done ok=%u nrc=%u none=%u", (unsigned)s_scanPass,
+             (unsigned)s_scanOk, (unsigned)s_scanNrc, (unsigned)s_scanNone);
+    s_log.logEvent(m);
+    if (s_scanPass == 1) statusLine(m);
+    s_scanPass++; s_scanOk = s_scanNrc = s_scanNone = 0;
+    s_scanCur = s_scanFrom;
+    return true;
+  }
   if ((uint32_t)s_scanCur > s_scanTo) {
     s_scanCur = -1;
     char m[56];
@@ -648,6 +694,10 @@ static bool scanTick()
   int res = busExchange(&r, resp, sizeof(resp), &len, &nrc);
   if (res == NBR_OK) {
     s_scanOk++;
+    uint32_t* slot = s_scanCrc ? &s_scanCrc[s_scanCur - s_scanFrom] : nullptr;
+    uint32_t c = crcOf(resp, len);
+    if (slot && *slot == c) { s_scanCur++; return true; }  // unchanged since the last pass: not logged
+    if (slot) *slot = c;
     char line[300];
     int n = snprintf(line, sizeof(line), "SCAN %X %04X ", (unsigned)s_scanTx, (unsigned)s_scanCur);
     for (int i = 0; i < len && n < (int)sizeof(line) - 3; i++) n += snprintf(line + n, sizeof(line) - n, "%02X", resp[i]);
@@ -660,6 +710,7 @@ static bool scanTick()
 
 void readTick()
 {
+  scanAutoTick();                           // p86 loop: start at engine START, stop at STOP
   if (probeTick()) return;                  // p84: the probe owns the bus while it runs
   if (scanTick()) return;                   // p86
   NbRead r;
