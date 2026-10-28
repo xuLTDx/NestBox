@@ -18,6 +18,9 @@
 // (data = the whole response, up to NB_READ_RECORD_MAX bytes), and an SD event line
 // with the request and the whole response.
 #pragma once
+#ifdef ARDUINO
+#include <Arduino.h>       // millis() in nbReadExchange (28.10.2026)
+#endif
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
@@ -102,7 +105,7 @@ struct NbCanPort {
 static inline int nbReadExchange(NbCanPort* p, const NbRead* r, uint8_t* resp, int cap, int* respLen, uint8_t* nrc)
 {
   const uint8_t PAD = 0x55;
-  const uint32_t TMO = 300, PENDING = 3000;
+  const uint32_t TMO = 1000, PENDING = 3000;   // 28.10: 300 ms was too short for the Peugeot CMM (answers came late)
   *respLen = 0;
   *nrc = 0;
   uint8_t f[8];
@@ -113,13 +116,25 @@ static inline int nbReadExchange(NbCanPort* p, const NbRead* r, uint8_t* resp, i
   uint8_t d[8], dlc = 0;
   uint32_t wait = TMO;
   int want = 0, got = 0;
+  // 28.10.2026 (v2O, Peugeot CMM on CAN2): answers came one request late - a late answer to the
+  // previous request (or another tester's) was taken. Only an answer to THIS request counts:
+  // 7F <our service> .., or <service+0x40> and, for 0x22, the same DID; anything else is skipped.
+  const uint8_t sid = r->req[0];
+  const bool did = sid == 0x22 && r->reqLen >= 3;
+  uint32_t deadline = millis() + TMO;
   for (;;) {
+    uint32_t now = millis();
+    if ((int32_t)(deadline - now) <= 0) return NBR_NO_REPLY;
+    wait = deadline - now;
     if (!p->recv(p->ctx, r->rxId, d, &dlc, wait)) return NBR_NO_REPLY;
     if (dlc < 2) continue;
     uint8_t pci = d[0] >> 4;
     if (pci == 0) {                                   // single frame
       int n = d[0] & 0x0F;
-      if (n >= 3 && d[1] == 0x7F && d[3] == 0x78) { wait = PENDING; continue; }   // response pending
+      bool ours = (n >= 3 && d[1] == 0x7F && d[2] == sid) ||
+                  (n >= 1 && d[1] == (uint8_t)(sid + 0x40) && (!did || (n >= 3 && d[2] == r->req[1] && d[3] == r->req[2])));
+      if (!ours) continue;                            // stale / foreign answer
+      if (n >= 3 && d[1] == 0x7F && d[3] == 0x78) { deadline = millis() + PENDING; continue; }   // response pending
       if (n > 7) n = 7;
       memcpy(resp, d + 1, n < cap ? n : cap);
       *respLen = n < cap ? n : cap;
@@ -127,6 +142,7 @@ static inline int nbReadExchange(NbCanPort* p, const NbRead* r, uint8_t* resp, i
       break;
     }
     if (pci == 1) {                                   // first frame: flow control, the rest
+      if (dlc < 5 || d[2] != (uint8_t)(sid + 0x40) || (did && (d[3] != r->req[1] || d[4] != r->req[2]))) continue;
       want = ((d[0] & 0x0F) << 8) | d[1];
       if (want > cap) want = cap;
       got = want < 6 ? want : 6;

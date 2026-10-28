@@ -48,6 +48,12 @@ const char* bootResetInfo(char* buf, int cap);   // main.cpp
 #define PID_RPM        0x10C     // rpm (v1F: OBD 0x0C | 0x100)
 #define PID_AUTO_READ  0x39F     // NEW: automatic diagnostic read (K0), "<item>;<bus>;<result>;<nrc>;<response bytes>"
 #define PID_ENG_STATE  0x39C     // NEW: K0 0x348 engine running state (1 off, 3 running, 4 stop-start ...)
+#define PID_COOLANT    0x105     // p81: K0 0x488 coolant C (v1F: OBD 0x05 | 0x100)
+#define PID_SPEED_CAN  0x10D     // p81: K0 0x38D speed km/h x 100 (v1F: OBD 0x0D | 0x100 - here x 100)
+#define PID_DOORS      0x3A0     // p81: K0 0x412 open doors bits: 1 driver 2 passenger 4 RL 8 RR 16 boot
+#define PID_FUEL_BSI   0x3A1     // p81: READ BSI D8C3 fuel, 0.01 L
+#define PID_UREA_MEAS  0x3A2     // p81: READ CMM D558 urea measured, raw byte (scale from a refill)
+#define PID_UREA_EST   0x3A3     // p81: READ CMM D517 urea estimated, ml
 #define PID_ENGINE_EVENT      0x380   // v1F: 1 = START, 2 = STOP
 #define PID_ENGINE_EVENT_TIME 0x381   // v1F: unix time of the event
 #define CAR_FRESH_MS   5000
@@ -177,12 +183,18 @@ CellLink* telemetryCellLink() { return s_cellUp ? &s_cell : nullptr; }   // pull
 #define AUTO_READ_EVERY_MS 600000UL
 #define AUTO_READ_GAP_MS   1000UL
 struct AutoRead { uint32_t tx, rx; uint8_t did[2]; uint8_t buses[2]; };
+// p81 (28.10.2026): BSI and the CMM (Delphi DCM6.2) both answered on CAN2 = OBD 3/8 (READ 28.10)
 static const AutoRead K0_READS[] = {
+  {0x752, 0x652, {0xD8, 0xC3}, {2, 1}},   // BSI: fuel measured x 0.01 L (verified 28.10)
+  {0x6A8, 0x688, {0xD5, 0x58}, {2, 1}},   // CMM: urea volume measured (raw byte, scale at a refill)
+  {0x6A8, 0x688, {0xD5, 0x17}, {2, 1}},   // CMM: urea volume estimated, byte 5 x 0.0625 L (DB)
+  {0x6A8, 0x688, {0xD5, 0x13}, {2, 1}},   // CMM: km before the urea refill (raw)
+  {0x6A8, 0x688, {0xD4, 0x15}, {2, 1}},   // CMM: coolant (raw, the DB's -40 not plausible 28.10)
   {0x752, 0x652, {0xDB, 0xED}, {2, 1}},   // BSI: km to the next service
   {0x752, 0x652, {0xDC, 0x5F}, {2, 1}},   // BSI: months to the next service
-  {0x6A8, 0x688, {0xD5, 0x1F}, {1, 0}},   // CMM: engine oil dilution (to be verified)
-  {0x6A8, 0x688, {0xD4, 0x29}, {1, 0}},   // CMM: oil pressure
-  {0x6A8, 0x688, {0xD5, 0x17}, {1, 0}},   // CMM: urea volume - both bytes kept (x0.001 L? to be verified at a refill)
+  {0x6A8, 0x688, {0xD5, 0x1F}, {2, 1}},   // CMM: engine oil dilution
+  {0x6A8, 0x688, {0xD4, 0x29}, {2, 1}},   // CMM: oil pressure
+  {0x74A, 0x64A, {0xD4, 0x09}, {1, 2}},   // CVM camera: speed sign read (no answer on CAN2 28.10)
 };
 #define K0_READS_N (sizeof(K0_READS) / sizeof(K0_READS[0]))
 static uint8_t s_autoBus[K0_READS_N];        // the bus that answered (0 = not known yet)
@@ -246,6 +258,7 @@ static void autoReadTick()
     res = busExchange(&r, resp, sizeof(resp), &len, &nrc);
     if (res == NBR_OK || res == NBR_NRC) { s_autoBus[next] = bus; break; }
   }
+  if (res == NBR_OK) carFromRead(a.tx, resp, len);      // p81: decoded values into the records
   autoReadPush((uint8_t)next, r.bus, res, nrc, resp, len);
   char line[300];
   nbReadLine(line, sizeof(line), 1000 + next, &r, res, nrc, resp, len);
@@ -319,6 +332,13 @@ static void makeRecord(int event = 0, time_t when = 0)
     r.u32(PID_FUEL_CAND, (uint32_t)(cv.fuelL * 10 + 0.5f));
     r.u32(PID_FUEL_RAW, cv.fuelRaw);
   }
+  // p81: doors / coolant / speed from CAN1, fuel / urea from the automatic reads (every 10 min: kept 11 min)
+  if (cv.doorsAt && ms - cv.doorsAt < CAR_FRESH_MS) r.u32(PID_DOORS, cv.doors);
+  if (cv.coolAt && ms - cv.coolAt < CAR_FRESH_MS) r.i32(PID_COOLANT, cv.coolC);
+  if (cv.speedAt && ms - cv.speedAt < CAR_FRESH_MS) r.u32(PID_SPEED_CAN, (uint32_t)(cv.speedKmh * 100 + 0.5f));
+  if (cv.fuelBsiAt && ms - cv.fuelBsiAt < 660000UL) r.u32(PID_FUEL_BSI, cv.fuelBsiCl);
+  if (cv.ureaMeasAt && ms - cv.ureaMeasAt < 660000UL) r.u32(PID_UREA_MEAS, cv.ureaMeasRaw);
+  if (cv.ureaEstAt && ms - cv.ureaEstAt < 660000UL) r.u32(PID_UREA_EST, cv.ureaEstMl);
   if (cv.ureaAt && ms - cv.ureaAt < CAR_FRESH_MS) {
     r.u32(PID_UREA_KM, cv.ureaKm);
     uint8_t* u = cv.urea;
