@@ -548,10 +548,23 @@ void telemetrySmsSetting(const char* cmd, char* out, int cap)
     const char* c = strchr(cmd + 4, ',');
     char num[24];
     snprintf(num, sizeof(num), "%.*s", c ? (int)(c - cmd - 4) : 0, cmd + 4);
-    if (!c || !smsNumberOk(num) || !c[1] || s_smsReq) { snprintf(out, cap, "CMD SMS ERR"); return; }
+    if (!c || !smsNumberOk(num) || !c[1]) { snprintf(out, cap, "CMD SMS ERR"); return; }
+    char text[sizeof(s_smsReqText)];
+    snprintf(text, sizeof(text), "%s", c + 1);
+    for (char* p = text; *p; p++) if (*p == '_') *p = ' ';
+    // PG-p9: the server may resend a command (lost UDP) - the same number + text within 10 min = sent once
+    static char lastNum[24], lastText[sizeof(s_smsReqText)];
+    static uint32_t lastAt;
+    if (lastAt && millis() - lastAt < 600000UL && !strcmp(lastNum, num) && !strcmp(lastText, text)) {
+      snprintf(out, cap, "CMD SMS queued (repeat ignored)");
+      return;
+    }
+    if (s_smsReq) { snprintf(out, cap, "CMD SMS ERR busy"); return; }
+    snprintf(lastNum, sizeof(lastNum), "%s", num);
+    snprintf(lastText, sizeof(lastText), "%s", text);
+    lastAt = millis();
     snprintf(s_smsReqNum, sizeof(s_smsReqNum), "%s", num);
-    snprintf(s_smsReqText, sizeof(s_smsReqText), "%s", c + 1);
-    for (char* p = s_smsReqText; *p; p++) if (*p == '_') *p = ' ';
+    snprintf(s_smsReqText, sizeof(s_smsReqText), "%s", text);
     s_fwdTo[0] = 0;                              // the answer goes into a status line, not forwarded
     snprintf(s_fwdFrom, sizeof(s_fwdFrom), "%s", num);
     s_smsReq = true;
