@@ -104,6 +104,13 @@ public:
   // PG-p4: where the link breaks - AT+CPING (manual V3.00 11.3.4) and AT+CDNSGIP
   int ping(const char* addr, int n);   // replies received (0..n), -1 = no ping summary from the modem
   bool dnsOk(const char* host);
+  // PG-p7 (2.11.2026, 4ka: roaming data on/off by SMS to 900): SMS in text mode (manual V3.00 4.2.x
+  // AT+CMGF / AT+CMGS / AT+CMGL / AT+CMGD) - needs only the registration, not the data session
+  bool smsSend(const char* num, const char* text);
+  // the first stored SMS: sender and text (UCS2 hex decoded, ASCII only), then deleted; false = none
+  bool smsTake(char* from, int fcap, char* text, int tcap);
+  // "<operator> home|roam|reg=<n>" from AT+COPS? and AT+CREG? (PG-p8 STAV answer)
+  void netInfo(char* out, int cap);
 private:
   volatile bool m_netLost = false;
   volatile int m_netLostErr = 0;

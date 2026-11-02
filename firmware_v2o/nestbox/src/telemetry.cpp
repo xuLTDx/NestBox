@@ -68,6 +68,7 @@ const char* bootResetInfo(char* buf, int cap);   // main.cpp
 #define ADC_12V_FACTOR 195.7f    // raw / factor = volts (OVMS default system.adc factor12v; this unit NOT calibrated)
 
 extern "C" uint8_t temprature_sens_read();
+extern const char FW_BUILD_STR[];
 
 nvs_handle_t nvs;                // txqueue.cpp uses it (v1F: the same "storage" namespace)
 static DataLog s_log;
@@ -467,6 +468,211 @@ static bool netCheck()
   return p8 > 0 || p1 > 0 || dns;
 }
 
+// ---- PG-p8 (2.11.2026): SMS channel - works with the registration only, no data session needed ----------
+// Settings (FleetNest command or web): SMS_ALLOW=<num>[,<num>[,<num>]] (the first = the car's owner) and
+// optional SMS_PIN=<4-8 chars> (a code in the text, not the SIM PIN); while SMS_ALLOW is empty no SMS command
+// is accepted. SMS from an allowed number ("<PIN> " in front when a PIN is set): "STAV" | "CELL RESTART" |
+// "OTA" | "SMS <number> <text>" (the box sends <text> to <number>; SMS from that number in the next 15 min
+// are forwarded to the one who asked - e.g. 900 "DATA MR STAV" of 4ka). FleetNest / web: SMS=<number>,<text>
+// ('_' = space; answers into a status line). Every received SMS: status line + SD, then deleted from the
+// SIM. A wrong PIN gets no answer (no cost, nothing to guess from).
+// Data outage: the modem answers, registered, no server answer for 30 min -> one SMS to the owner (the first
+// SMS_ALLOW number), at most once per 24 h.
+#define SMS_POLL_MS 60000UL
+#define SMS_FWD_MS  900000UL
+#define SMS_OUTAGE_MS 1800000UL
+static char s_smsAllow[64], s_smsPin[12];
+static char s_smsReqNum[24], s_smsReqText[120];
+static volatile bool s_smsReq;
+static char s_fwdFrom[24], s_fwdTo[24];       // forward SMS from s_fwdFrom to s_fwdTo until s_fwdUntil
+static uint32_t s_fwdUntil;
+
+static void smsLoad()
+{
+  size_t l = sizeof(s_smsAllow);
+  if (nvs_get_str(nvs, "SMS_ALLOW", s_smsAllow, &l) != ESP_OK) s_smsAllow[0] = 0;
+  l = sizeof(s_smsPin);
+  if (nvs_get_str(nvs, "SMS_PIN", s_smsPin, &l) != ESP_OK) s_smsPin[0] = 0;
+}
+
+static bool smsNumberOk(const char* n)        // digits, a leading '+', 3-20 chars
+{
+  int len = strlen(n);
+  if (len < 3 || len > 20) return false;
+  for (int i = 0; i < len; i++) if (!isdigit((unsigned char)n[i]) && !(i == 0 && n[i] == '+')) return false;
+  return true;
+}
+
+// the same number in +421... / 0... form: the last 9 digits (short numbers as they are)
+static bool smsSameNumber(const char* a, const char* b)
+{
+  int la = strlen(a), lb = strlen(b);
+  if (la < 9 || lb < 9) return !strcmp(a, b);
+  return !strcmp(a + la - 9, b + lb - 9);
+}
+
+static bool smsAllowed(const char* from)
+{
+  if (!s_smsAllow[0]) return false;
+  char list[64];
+  snprintf(list, sizeof(list), "%s", s_smsAllow);
+  for (char* t = strtok(list, ","); t; t = strtok(nullptr, ",")) if (smsSameNumber(t, from)) return true;
+  return false;
+}
+
+// SMS_ALLOW= / SMS_PIN= / SMS= from FleetNest or the web; the answer text into out
+void telemetrySmsSetting(const char* cmd, char* out, int cap)
+{
+  if (!strncmp(cmd, "SMS_ALLOW=", 10)) {
+    char list[64];
+    snprintf(list, sizeof(list), "%s", cmd + 10);
+    char chk[64];
+    snprintf(chk, sizeof(chk), "%s", list);
+    int n = 0;
+    bool ok = true;
+    for (char* t = strtok(chk, ","); t; t = strtok(nullptr, ",")) { n++; ok = ok && smsNumberOk(t); }
+    if (!ok || n > 3) { snprintf(out, cap, "CMD SMS_ALLOW ERR numbers"); return; }
+    nvs_set_str(nvs, "SMS_ALLOW", list); nvs_commit(nvs);
+    smsLoad();
+    snprintf(out, cap, "CMD SMS_ALLOW OK n=%d", n);
+  } else if (!strncmp(cmd, "SMS_PIN=", 8)) {
+    const char* p = cmd + 8;
+    int len = strlen(p);
+    bool ok = len == 0 || (len >= 4 && len <= 8);
+    for (int i = 0; ok && i < len; i++) ok = isalnum((unsigned char)p[i]);
+    if (!ok) { snprintf(out, cap, "CMD SMS_PIN ERR 4-8 a-z 0-9"); return; }
+    nvs_set_str(nvs, "SMS_PIN", p); nvs_commit(nvs);
+    smsLoad();
+    snprintf(out, cap, len ? "CMD SMS_PIN OK" : "CMD SMS_PIN OFF");   // never echoed
+  } else if (!strncmp(cmd, "SMS=", 4)) {
+    const char* c = strchr(cmd + 4, ',');
+    char num[24];
+    snprintf(num, sizeof(num), "%.*s", c ? (int)(c - cmd - 4) : 0, cmd + 4);
+    if (!c || !smsNumberOk(num) || !c[1] || s_smsReq) { snprintf(out, cap, "CMD SMS ERR"); return; }
+    snprintf(s_smsReqNum, sizeof(s_smsReqNum), "%s", num);
+    snprintf(s_smsReqText, sizeof(s_smsReqText), "%s", c + 1);
+    for (char* p = s_smsReqText; *p; p++) if (*p == '_') *p = ' ';
+    s_fwdTo[0] = 0;                              // the answer goes into a status line, not forwarded
+    snprintf(s_fwdFrom, sizeof(s_fwdFrom), "%s", num);
+    s_smsReq = true;
+    snprintf(out, cap, "CMD SMS queued");
+  }
+}
+
+static void smsStatusLine(const char* tag, const char* from, const char* text)
+{
+  char full[200];
+  snprintf(full, sizeof(full), "%s %s: %s", tag, from, text);
+  logNetEvent(full);                             // the whole text on SD
+  char m[57];
+  snprintf(m, sizeof(m), "%s", full);            // FleetNest: up to 3 lines of 56
+  statusLine(m);
+  int n = strlen(full);
+  for (int at = 56; at < n && at < 168; at += 56) { snprintf(m, sizeof(m), "%s", full + at); statusLine(m); }
+}
+
+static void smsSendLogged(const char* num, const char* text)
+{
+  bool ok = s_cell.smsSend(num, text);
+  char m[57];
+  snprintf(m, sizeof(m), "SMS OUT %s %s", num, ok ? "ok" : "ERR");
+  statusLine(m);
+  logNetEvent(m);
+}
+
+// one received SMS: a command from an allowed number, a forwarded answer, or only logged
+static void smsHandle(const char* from, const char* text)
+{
+  if (s_fwdUntil && millis() < s_fwdUntil && smsSameNumber(from, s_fwdFrom)) {
+    smsStatusLine("SMS IN", from, text);
+    if (s_fwdTo[0]) {
+      char f[160];
+      snprintf(f, sizeof(f), "%s: %s", from, text);
+      smsSendLogged(s_fwdTo, f);
+    }
+    return;
+  }
+  bool allowed = smsAllowed(from);
+  int pl = strlen(s_smsPin);
+  if (pl) pl++;                                  // "<PIN> "
+  if (!allowed || (pl && (strncmp(text, s_smsPin, pl - 1) || text[pl - 1] != ' '))) {
+    smsStatusLine(allowed ? "SMS IN badpin" : "SMS IN", from, allowed ? "-" : text);   // a wrong PIN is not echoed
+    return;
+  }
+  const char* c = text + pl;
+  char m[57];
+  snprintf(m, sizeof(m), "SMS CMD %s: %.30s", from, c);
+  statusLine(m);
+  logNetEvent(m);
+  char reply[160];
+  if (!strncasecmp(c, "STAV", 4)) {
+    char net[40];
+    s_cell.netInfo(net, sizeof(net));
+    snprintf(reply, sizeof(reply), "%s fw %s %s rssi=%d data=%s q=%lu gps=%.5f,%.5f %s", devid, FW_BUILD_STR, net,
+             s_cell.rssi(), s_cell.up() ? "up" : "DOWN", (unsigned long)txqPending(), s_fix.lat, s_fix.lng,
+             s_engineOn ? "engine" : "off");
+  } else if (!strncasecmp(c, "CELL RESTART", 12)) {
+    strcpy(s_cellRestartWhy, "SMS");
+    s_cellRestartReq = true;
+    snprintf(reply, sizeof(reply), "%s CELL RESTART ok", devid);
+  } else if (!strncasecmp(c, "OTA", 3)) {
+    otaRequest();
+    snprintf(reply, sizeof(reply), "%s OTA check ok", devid);
+  } else if (!strncasecmp(c, "SMS ", 4)) {
+    char num[24];
+    const char* sp = strchr(c + 4, ' ');
+    snprintf(num, sizeof(num), "%.*s", sp ? (int)(sp - c - 4) : 0, c + 4);
+    if (!sp || !smsNumberOk(num) || !sp[1]) {
+      snprintf(reply, sizeof(reply), "%s SMS ERR: <PIN> SMS <cislo> <text>", devid);
+    } else {
+      smsSendLogged(num, sp + 1);
+      snprintf(s_fwdFrom, sizeof(s_fwdFrom), "%s", num);
+      snprintf(s_fwdTo, sizeof(s_fwdTo), "%s", from);
+      s_fwdUntil = millis() + SMS_FWD_MS;
+      snprintf(reply, sizeof(reply), "%s SMS to %s sent, answers forwarded 15 min", devid, num);
+    }
+  } else {
+    snprintf(reply, sizeof(reply), "%s ? STAV | CELL RESTART | OTA | SMS <cislo> <text>", devid);
+  }
+  smsSendLogged(from, reply);
+}
+
+// cellTask: a queued SMS= and the SIM's received SMS (every minute; the modem answers AT)
+static void smsTick()
+{
+  static uint32_t lastPoll;
+  if (!s_cellOn || s_standby || !s_cell.alive_() || otaBusy()) return;
+  if (s_smsReq) {
+    smsSendLogged(s_smsReqNum, s_smsReqText);
+    s_fwdUntil = millis() + SMS_FWD_MS;
+    s_smsReq = false;
+    lastPoll = 0;
+  }
+  if (lastPoll && millis() - lastPoll < SMS_POLL_MS) return;
+  lastPoll = millis();
+  char from[24], text[170];
+  for (int i = 0; i < 5 && s_cell.smsTake(from, sizeof(from), text, sizeof(text)); i++) smsHandle(from, text);
+  if (s_fwdUntil && millis() >= s_fwdUntil) s_fwdUntil = 0;
+  // data outage -> the owner
+  static uint32_t aliveSince, lastAlert;
+  if (!aliveSince) aliveSince = millis();
+  uint32_t ref = (int32_t)(s_client.lastSyncTime - aliveSince) > 0 ? s_client.lastSyncTime : aliveSince;
+  if (s_smsAllow[0] && millis() - ref > SMS_OUTAGE_MS && (!lastAlert || millis() - lastAlert > 86400000UL)) {
+    char net[40];
+    s_cell.netInfo(net, sizeof(net));
+    if (strstr(net, " home") || strstr(net, " roam")) {   // SMS needs the registration
+      lastAlert = millis();
+      char owner[24], m[160];
+      snprintf(owner, sizeof(owner), "%.*s", (int)strcspn(s_smsAllow, ","), s_smsAllow);
+      snprintf(m, sizeof(m), "%s BEZ DAT %lu min: %s rssi=%d data=%s q=%lu gps=%.5f,%.5f fw %s", devid,
+               (unsigned long)((millis() - ref) / 60000), net, s_cell.rssi(), s_cell.up() ? "up" : "DOWN",
+               (unsigned long)txqPending(), s_fix.lat, s_fix.lng, FW_BUILD_STR);
+      statusLine("SMS ALERT no data 30 min");
+      smsSendLogged(owner, m);
+    }
+  }
+}
+
 // the modem: started when CELL=1, again every 5 min after a failure
 static void cellTask(void*)
 {
@@ -550,6 +756,7 @@ static void cellTask(void*)
     } else if (!s_cellUp) {
       s_cellRestartReq = false;                      // nothing to restart
     }
+    smsTick();                                       // PG-p8
     vTaskDelay(pdMS_TO_TICKS(1000));
   }
 }
@@ -631,6 +838,7 @@ void telemetryBegin(uint32_t bootId, bool sdOk)
   // APN of the home operator (4ka, as v1F CELL_APN "internet"); it stays the same in roaming -
   // only the visited network changes, the modem picks it. CELL_APN= overrides (stored).
   loadApn();
+  smsLoad();                                     // PG-p8
   s_cell.setApn(s_apn);
   uint8_t mux = 1;                               // p69: CMUX on unless CELL_MUX=0 (local web)
   nvs_get_u8(nvs, "CELL_MUX", &mux);

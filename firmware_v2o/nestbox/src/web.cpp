@@ -25,6 +25,7 @@ void telemetrySetMux(bool on);   // telemetry.cpp (p69)
 #include "page.h"
 #include "cardecode.h"
 #include "ota.h"
+#include "teleclient.h"
 #include "nbread.h"
 
 extern const char FW_BUILD_STR[];
@@ -173,6 +174,9 @@ static int handlerControl(UrlHandlerParam* param)
     n = probeStatus(buf, bufsize);
   } else if (!strcmp(cmd, "OTA?")) {
     n = otaStatus(buf, bufsize);
+  } else if (!strncmp(cmd, "SMS_ALLOW=", 10) || !strncmp(cmd, "SMS_PIN=", 8) || !strncmp(cmd, "SMS=", 4)) {   // PG-p8
+    telemetrySmsSetting(cmd, buf, bufsize);
+    n = strlen(buf);
   } else if (!strcmp(cmd, "OTA_CHECK")) {           // pull-OTA check now (as the server's OTA_READY)
     otaRequest();
     n = snprintf(buf, bufsize, "OK");

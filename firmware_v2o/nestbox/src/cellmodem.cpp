@@ -280,6 +280,115 @@ int CellLink::ping(const char* addr, int n)
   return got;
 }
 
+bool CellLink::smsSend(const char* num, const char* text)
+{
+  if (!m_alive) return false;
+  lock();
+  bool ok = at("AT+CMGF=1\r") && at("AT+CSCS=\"IRA\"\r");
+  if (ok) {
+    while (linkAvail()) linkRead();
+    m_len = 0;
+    m_buf[0] = 0;
+    portENTER_CRITICAL(&m_spin);
+    m_urcLen = 0;
+    m_urc[0] = 0;
+    portEXIT_CRITICAL(&m_spin);
+    char c[48];
+    int n = snprintf(c, sizeof(c), "AT+CMGS=\"%s\"\r", num);
+    linkWrite((const uint8_t*)c, n);
+    ok = waitFor(">", "ERROR", 5000);           // the prompt, then the text and Ctrl-Z
+    if (ok) {
+      linkWrite((const uint8_t*)text, strlen(text));
+      const uint8_t z = 0x1A;
+      linkWrite(&z, 1);
+      ok = waitFor("+CMGS:", "ERROR", 60000);   // up to 60 s on a weak network
+    } else {
+      const uint8_t esc = 0x1B;                 // no prompt: cancel
+      linkWrite(&esc, 1);
+    }
+  }
+  unlock();
+  return ok;
+}
+
+// "00E100640061" (UCS2 hex) -> ASCII, Slovak letters without the accent, anything else '?'
+static bool ucs2Hex(const char* s, char* out, int cap)
+{
+  int n = strlen(s);
+  if (n < 4 || n % 4) return false;
+  for (int i = 0; i < n; i++) if (!isxdigit((unsigned char)s[i])) return false;
+  static const uint16_t from[] = {0xE1, 0xE4, 0x10D, 0x10F, 0xE9, 0xED, 0x13A, 0x13E, 0x148, 0xF3, 0xF4, 0x155, 0x161,
+                                  0x165, 0xFA, 0xFD, 0x17E, 0xC1, 0x10C, 0x10E, 0xC9, 0xCD, 0x13D, 0x147, 0xD3, 0x160,
+                                  0x164, 0xDA, 0xDD, 0x17D};
+  static const char to[] = "aacdeillnoorstuyzACDEILNOSTUYZ";
+  int o = 0;
+  for (int i = 0; i < n && o < cap - 1; i += 4) {
+    char h[5] = {s[i], s[i + 1], s[i + 2], s[i + 3], 0};
+    uint16_t u = (uint16_t)strtoul(h, nullptr, 16);
+    char ch = '?';
+    if (u >= 32 && u < 127) ch = (char)u;
+    else if (u == '\n' || u == '\r') ch = ' ';
+    else for (unsigned k = 0; k < sizeof(from) / sizeof(from[0]); k++) if (from[k] == u) { ch = to[k]; break; }
+    out[o++] = ch;
+  }
+  out[o] = 0;
+  return true;
+}
+
+bool CellLink::smsTake(char* from, int fcap, char* text, int tcap)
+{
+  if (!m_alive) return false;
+  from[0] = text[0] = 0;
+  lock();
+  bool got = false;
+  if (at("AT+CMGF=1\r") && at("AT+CSCS=\"IRA\"\r") && at("AT+CMGL=\"ALL\"\r", 5000)) {
+    // +CMGL: <index>,"<stat>","<from>",,"<time>"\r\n<text>\r\n ... OK
+    char* p = strstr(m_buf, "+CMGL: ");
+    if (p) {
+      int idx = atoi(p + 7);
+      char* q = strchr(p, ',');                 // ,"REC UNREAD","+421...",
+      q = q ? strchr(q + 1, ',') : nullptr;
+      if (q && q[1] == '"') {
+        char* e = strchr(q + 2, '"');
+        if (e) snprintf(from, fcap, "%.*s", (int)(e - q - 2), q + 2);
+      }
+      char* b = strstr(p, "\r\n");
+      if (b) {
+        b += 2;
+        char* e = strstr(b, "\r\n");
+        char body[200];
+        snprintf(body, sizeof(body), "%.*s", e ? (int)(e - b) : (int)strlen(b), b);
+        if (!ucs2Hex(body, text, tcap)) {
+          int o = 0;
+          for (char* s = body; *s && o < tcap - 1; s++) text[o++] = (*s >= 32 && *s < 127) ? *s : '?';
+          text[o] = 0;
+        }
+      }
+      char c[24];
+      snprintf(c, sizeof(c), "AT+CMGD=%d\r", idx);
+      at(c, 5000);                              // deleted: logged once only
+      got = true;
+    }
+  }
+  unlock();
+  return got;
+}
+
+void CellLink::netInfo(char* out, int cap)
+{
+  char op[24] = "?";
+  int st = -1;
+  lock();
+  if (at("AT+COPS?\r", 3000, "+COPS:")) {      // +COPS: 0,0,"Plus",7
+    char* p = strchr(strstr(m_buf, "+COPS:"), '"');
+    char* e = p ? strchr(p + 1, '"') : nullptr;
+    if (p && e) snprintf(op, sizeof(op), "%.*s", (int)(e - p - 1), p + 1);
+  }
+  if (at("AT+CREG?\r", 1000, "+CREG: 0,")) st = strstr(m_buf, "+CREG: 0,")[9] - '0';
+  unlock();
+  snprintf(out, cap, "%s %s", op, st == 1 ? "home" : st == 5 ? "roam" : st >= 0 ? (st == 2 ? "search" : "noreg") : "?");
+}
+
 bool CellLink::dnsOk(const char* host)
 {
   if (!m_netOpen || m_netLost) return false;

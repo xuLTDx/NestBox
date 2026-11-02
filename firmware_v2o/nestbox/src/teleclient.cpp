@@ -233,6 +233,11 @@ void TeleClientUDP::onMessage(char* msg, UdpRx* rx)
       standbyRemote(cmdp + 4);
     }
 #endif
+    if (cmdp && !strncmp(cmdp + 4, "SMS", 3)) {      // PG-p8: SMS_ALLOW= / SMS_PIN= / SMS=<number>,<text>
+      char m[57];
+      telemetrySmsSetting(cmdp + 4, m, sizeof(m));
+      statusLine(m);
+    }
     if (cmdp && !strncmp(cmdp + 4, "RESEND=", 7)) {
       uint32_t f = (uint32_t)strtoul(cmdp + 11, 0, 10);
       bool started = txqResendRequest(f);

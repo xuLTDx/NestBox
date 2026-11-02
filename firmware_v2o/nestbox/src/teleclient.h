@@ -57,4 +57,5 @@ extern char devid[12];
 void genDeviceID(char* buf);
 void logNetEvent(const char* text);   // main.cpp: an "FE,NET ..." line in the SD data file
 void otaReadyRequested();             // telemetry.cpp: server command OTA_READY
-void telemetryApnCommand(const char* arg);   // telemetry.cpp: server APN= (nbapn.h)
+void telemetryApnCommand(const char* arg);
+void telemetrySmsSetting(const char* cmd, char* out, int cap);   // PG-p8: SMS_ALLOW= / SMS_PIN= / SMS=   // telemetry.cpp: server APN= (nbapn.h)
