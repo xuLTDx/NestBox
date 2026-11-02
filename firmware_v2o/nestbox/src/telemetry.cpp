@@ -199,6 +199,19 @@ static const AutoRead K0_READS[] = {
   {0x6A8, 0x688, {0xD5, 0x1F}, {2, 1}},   // CMM: engine oil dilution
   {0x6A8, 0x688, {0xD4, 0x29}, {2, 1}},   // CMM: oil pressure
   {0x74A, 0x64A, {0xD4, 0x09}, {1, 2}},   // CVM camera: speed sign read (no answer on CAN2 28.10)
+  // PG-p5 (2.11.2026): all fuel / urea candidates of the Diagbox DB, raw only (PID 0x39F + SD), to find
+  // the one that follows the gauge and the receipts. Appended: items 0-11 keep their numbers.
+  // BSI2010_EV: D8C4 fuel calculated, D8C5 fuel displayed, D8E1 range calculated
+  {0x752, 0x652, {0xD8, 0xC4, 0xD8, 0xC5, 0xD8, 0xE1}, {2, 1}},
+  // BSI2010_EV: D8C2 gauge sender impedance, D8C7 consumption instant, D8C8 consumption trip 1 average
+  {0x752, 0x652, {0xD8, 0xC2, 0xD8, 0xC7, 0xD8, 0xC8}, {2, 1}},
+  {0x75F, 0x65F, {0xD7, 0x03}, {2, 1}},   // cluster: fuel gauge needle (D703 changed in the 29.10 scan)
+  {0x75F, 0x65F, {0xD7, 0x02}, {2, 1}},   // cluster: D702 (DB: rev counter needle; fell in the 29.10 scan)
+  {0x6A8, 0x688, {0xD5, 0x5A}, {2, 1}},   // CMM DCM62: fuel added at the last refill (DB x0.5 L)
+  {0x6A8, 0x688, {0xD5, 0x7E}, {2, 1}},   // CMM DCM62: diesel additive (DPF) remaining, ml (DB)
+  {0x6A8, 0x688, {0xD5, 0x6A}, {2, 1}},   // CMM DCM62: fuel level minimum (flag)
+  {0x6A8, 0x688, {0xD5, 0x68}, {2, 1}},   // CMM DCM62: urea injected, x0.015625 mg/stroke (DB)
+  {0x6A8, 0x688, {0xD5, 0x6D}, {2, 1}},   // CMM DCM62: urea tank temperature, -40 (DB)
 };
 #define K0_READS_N (sizeof(K0_READS) / sizeof(K0_READS[0]))
 static uint8_t s_autoBus[K0_READS_N];        // the bus that answered (0 = not known yet)
