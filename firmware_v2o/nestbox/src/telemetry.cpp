@@ -429,10 +429,36 @@ static void recordTask(void*)
   }
 }
 
+// PG-p1 (2.11.2026): (b) data session not back within 15 min -> modem restart; (c, PG-p4) on the modem
+// and no server answer (ACK / reply / ping) for 15 min -> network check (asked by netTask, done here):
+// internet works = the server's side, no restart; internet down = restart, again at the earliest in 60 min
+#define CELL_NET_RESTART_MS 900000UL
+#define CELL_ACK_RESTART_MS 900000UL
+#define CELL_ACK_RESTART_GAP_MS 3600000UL
+static volatile bool s_cellRestartReq, s_netCheckReq;
+static char s_cellRestartWhy[40];
+
+// PG-p4: one line - pings 8.8.8.8 / 1.1.1.1, DNS google.com, our server (DNS + ping, information only)
+static bool netCheck()
+{
+  int p8 = s_cell.ping("8.8.8.8", 2);
+  int p1 = s_cell.ping("1.1.1.1", 2);
+  bool dns = s_cell.dnsOk("google.com");
+  bool sdns = s_cell.dnsOk(SERVER_HOST);
+  int ps = sdns ? s_cell.ping(SERVER_HOST, 2) : -1;
+  char m[57];
+  snprintf(m, sizeof(m), "NETCHK p8=%d/2 p1=%d/2 dns=%s srv_dns=%s srv=%d/2", p8, p1, dns ? "ok" : "err",
+           sdns ? "ok" : "err", ps);
+  statusLine(m);
+  if (s_cell.udpDiag) s_cell.udpDiag(m);           // also over HTTPS (OTA server log) when that works
+  return p8 > 0 || p1 > 0 || dns;
+}
+
 // the modem: started when CELL=1, again every 5 min after a failure
 static void cellTask(void*)
 {
   uint32_t lastTry = 0;
+  uint32_t lostAt = 0, lastReopen = 0, tries = 0, ackRestartAt = 0;
   for (;;) {
     if (s_cellOn && !s_cellUp && !s_standby && (!lastTry || millis() - lastTry > 300000UL)) {
       lastTry = millis();
@@ -457,6 +483,60 @@ static void cellTask(void*)
       s_cell.stop();
       lastTry = 0;
     }
+    // PG-p1 (a): the modem closed the data session - open it again every 30 s (when registered)
+    if (s_cellUp && s_cell.netLost()) {
+      char m[57];
+      if (!lostAt) {
+        lostAt = millis();
+        lastReopen = 0;
+        tries = 0;
+        snprintf(m, sizeof(m), "CELL NET LOST err=%d", s_cell.netLostErr());
+        statusLine(m);
+      }
+      if (!otaBusy() && (!lastReopen || millis() - lastReopen >= 30000UL)) {   // never inside a CCH download
+        lastReopen = millis();
+        tries++;
+        if (s_cell.netReopen()) {
+          snprintf(m, sizeof(m), "CELL NETOPEN OK after %lus tries=%lu", (unsigned long)((millis() - lostAt) / 1000),
+                   (unsigned long)tries);
+          statusLine(m);
+          lostAt = 0;
+        }
+      }
+      if (lostAt && millis() - lostAt > CELL_NET_RESTART_MS) {   // (b)
+        strcpy(s_cellRestartWhy, "no data session 15 min");
+        s_cellRestartReq = true;
+      }
+    }
+    // PG-p4 (c): the server did not answer for 15 min - where is the problem?
+    if (ackRestartAt && (int32_t)(s_client.lastSyncTime - ackRestartAt) > 0) ackRestartAt = 0;   // answers again
+    if (s_netCheckReq) {
+      s_netCheckReq = false;
+      if (s_cellUp && !s_cell.netLost() && !otaBusy()) {
+        if (netCheck()) {
+          statusLine("SERVER NO ANSWER internet ok");
+        } else if (!ackRestartAt || millis() - ackRestartAt >= CELL_ACK_RESTART_GAP_MS) {
+          ackRestartAt = millis();
+          strcpy(s_cellRestartWhy, "no internet");
+          s_cellRestartReq = true;
+        } else {
+          statusLine("NO INTERNET restart waits (60 min)");
+        }
+      }
+    }
+    if (s_cellUp && s_cellRestartReq) {
+      char m[57];
+      snprintf(m, sizeof(m), "CELL RESTART %s", s_cellRestartWhy);
+      statusLine(m);
+      logNetEvent(m);
+      s_cellUp = false;
+      s_cell.stop();
+      lastTry = 0;                                   // started again right away (then every 5 min as before)
+      lostAt = 0;
+      s_cellRestartReq = false;
+    } else if (!s_cellUp) {
+      s_cellRestartReq = false;                      // nothing to restart
+    }
     vTaskDelay(pdMS_TO_TICKS(1000));
   }
 }
@@ -467,6 +547,7 @@ static void netTask(void*)
   static char pkt[TXQ_PACKET_BUF];
   s_client.reset();
   NetLink* cur = nullptr;
+  uint32_t linkSince = 0;
   for (;;) {
     // WiFi first, the modem when WiFi is not there (v1F: cellular fallback)
     NetLink* want = s_wifi.up() ? (NetLink*)&s_wifi : (s_cellUp ? (NetLink*)&s_cell : nullptr);
@@ -474,6 +555,7 @@ static void netTask(void*)
       if (cur) cur->close();
       s_client.login = false;
       cur = want;
+      linkSince = millis();
       s_client.setLink(cur);
       char m[40];
       snprintf(m, sizeof(m), "NET LINK %s", cur ? cur->name() : "none");
@@ -484,6 +566,15 @@ static void netTask(void*)
     if (!cur) {
       vTaskDelay(pdMS_TO_TICKS(1000));
       continue;
+    }
+    // PG-p1 (c): on the modem, session not reported lost, but no server answer for 15 min -> modem restart
+    if (cur == &s_cell && !s_cell.netLost()) {
+      uint32_t ref = s_client.lastSyncTime;
+      if ((int32_t)(linkSince - ref) > 0) ref = linkSince;   // the last answer on WiFi does not count
+      if (millis() - ref > CELL_ACK_RESTART_MS) {
+        s_netCheckReq = true;                        // PG-p4: cellTask checks the network, decides
+        linkSince = millis();                        // the next check in 15 min (if still no answer)
+      }
     }
     if (!s_client.login) {
       bool ok = s_client.connect();

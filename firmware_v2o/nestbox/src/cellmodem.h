@@ -48,7 +48,7 @@ struct GnssFix {
 class CellLink : public NetLink {
 public:
   const char* name() override { return "CELL"; }
-  bool up() override { return m_netOpen; }
+  bool up() override { return m_netOpen && !m_netLost; }
   bool open(const char* host, uint16_t port) override;
   bool send(const char* data, unsigned int len) override;
   int receive(char* buf, int cap, unsigned int timeoutMs) override;
@@ -95,7 +95,19 @@ public:
   // p79: how the last start() got an answer - 0 already on, 1 after 3000 ms, 2 after 3000 + 500 ms
   int startStep() const { return m_startStep; }
   uint32_t startMs() const { return m_startMs; }
+  // PG-p1 (2.11.2026, Peugeot 10:49-11:38: CIPOPEN "network not opened" for 50 min, only the socket was
+  // retried): the modem closed the data session itself - +CIPEVENT: NETWORK CLOSED UNEXPECTEDLY or
+  // CIPOPEN err 1/2 (manual V3.00 11.4 / 11.6); cellTask then calls netReopen() (11.4: NETCLOSE, NETOPEN)
+  bool netLost() const { return m_netLost; }
+  int netLostErr() const { return m_netLostErr; }   // 1/2 = CIPOPEN error, 0 = +CIPEVENT
+  bool netReopen();            // registered -> CIPCLOSE, NETCLOSE, NETOPEN; true = the session is open again
+  // PG-p4: where the link breaks - AT+CPING (manual V3.00 11.3.4) and AT+CDNSGIP
+  int ping(const char* addr, int n);   // replies received (0..n), -1 = no ping summary from the modem
+  bool dnsOk(const char* host);
 private:
+  volatile bool m_netLost = false;
+  volatile int m_netLostErr = 0;
+  bool registered();           // AT+CREG? home / roaming
   int m_startStep = 0;
   uint32_t m_startMs = 0;
   int m_udpOk = 0, m_udpErr = 0;

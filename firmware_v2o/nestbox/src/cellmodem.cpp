@@ -87,6 +87,8 @@ bool CellLink::start()
   begin();
   m_netOpen = false;
   m_sockOpen = false;
+  m_netLost = false;
+  m_netLostErr = 0;
   snprintf(m_status, sizeof(m_status), "power");
   m_startStep = 0;
   m_startMs = 0;
@@ -228,9 +230,95 @@ bool CellLink::open(const char* host, uint16_t port)
   at("AT+CIPRXGET=1\r");
   snprintf(c, sizeof(c), "AT+CIPOPEN=0,\"UDP\",\"%s\",%u,8000\r", m_ip, port);
   m_sockOpen = at(c, 3000);
+  if (!m_sockOpen) {                   // PG-p1: the error code (+CIPOPEN: 0,<err>) comes as a URC on port 3
+    waitFor("+CIPOPEN: 0,", nullptr, 500);
+    int err = -1;
+    portENTER_CRITICAL(&m_spin);
+    const char* p = strstr(m_urc, "+CIPOPEN: 0,");
+    if (p) err = atoi(p + 12);
+    portEXIT_CRITICAL(&m_spin);
+    if (err < 0) { const char* q = strstr(m_buf, "+CIPOPEN: 0,"); if (q) err = atoi(q + 12); }
+    if (err == 1 || err == 2) { m_netLostErr = err; m_netLost = true; }   // network failure / not opened
+  }
   udpNote(m_sockOpen ? "UDP OPEN OK " : "UDP OPEN ERR ", m_sockOpen);
   unlock();
   return m_sockOpen;
+}
+
+// "+CPING: 3,<sent>,<recvd>,..." (the manual's example has no space after the colon) - recvd or -1
+static int pingSummary(const char* s)
+{
+  for (const char* p = s ? strstr(s, "+CPING:") : nullptr; p; p = strstr(p + 7, "+CPING:")) {
+    const char* q = p + 7;
+    while (*q == ' ') q++;
+    if (q[0] != '3' || q[1] != ',') continue;
+    const char* r = strchr(q + 2, ',');
+    if (r) return atoi(r + 1);
+  }
+  return -1;
+}
+
+int CellLink::ping(const char* addr, int n)
+{
+  if (!m_netOpen || m_netLost) return -1;
+  char c[80];
+  snprintf(c, sizeof(c), "AT+CPING=\"%s\",1,%d,32,1000,10000,255\r", addr, n);
+  lock();
+  int got = -1;
+  if (at(c, 2000)) {                   // OK first, then one line per reply and the summary (type 3)
+    uint32_t t = millis();
+    while (got < 0 && millis() - t < 10000UL + n * 1000UL + 2000UL) {
+      waitFor("+CPING:", nullptr, 200);
+      portENTER_CRITICAL(&m_spin);
+      int u = pingSummary(m_urc);
+      portEXIT_CRITICAL(&m_spin);
+      got = u >= 0 ? u : pingSummary(m_buf);
+      if (got < 0) delay(50);
+    }
+  }
+  unlock();
+  return got;
+}
+
+bool CellLink::dnsOk(const char* host)
+{
+  if (!m_netOpen || m_netLost) return false;
+  char c[96];
+  snprintf(c, sizeof(c), "AT+CDNSGIP=\"%s\"\r", host);
+  return at(c, 10000, "+CDNSGIP: 1,");   // error: "+CDNSGIP: 0,<err>" + ERROR
+}
+
+bool CellLink::registered()
+{
+  if (!at("AT+CREG?\r", 1000, "+CREG: 0,")) return false;
+  char* p = strstr(m_buf, "+CREG: 0,");
+  return p && (p[9] == '1' || p[9] == '5' || p[9] == '6');
+}
+
+// PG-p1 (a): manual V3.00 11.4 - after NETWORK CLOSED UNEXPECTEDLY close the sockets, AT+NETCLOSE, then
+// AT+NETOPEN again; only when the modem is registered (no signal = no 15 s NETOPEN blocking the UART)
+bool CellLink::netReopen()
+{
+  lock();
+  bool ok = false;
+  if (registered()) {
+    if (m_sockOpen) at("AT+CIPCLOSE=0\r", 2000);
+    m_sockOpen = false;
+    at("AT+NETCLOSE\r", 10000, "+NETCLOSE:");
+    at("AT+NETOPEN\r", 15000, "+NETOPEN:");
+    portENTER_CRITICAL(&m_spin);
+    ok = strstr(m_urc, "+NETOPEN: 0") != nullptr;
+    portEXIT_CRITICAL(&m_spin);
+    ok = ok || strstr(m_buf, "+NETOPEN: 0") || at("AT+NETOPEN?\r", 2000, "+NETOPEN: 1");
+    if (ok) {
+      at("AT+CIPRXGET=1\r");
+      m_netOpen = true;
+      m_netLostErr = 0;
+      m_netLost = false;
+    }
+  }
+  unlock();
+  return ok;
 }
 
 bool CellLink::send(const char* data, unsigned int len)
@@ -827,6 +915,7 @@ void CellLink::portLine(int ch, char* line)
   if (strstr(line, "RECV EVENT")) m_recvEvent = true;
   if (!strncmp(line, "+CCHRECV: 0,", 12) || !strncmp(line, "+CCHRECV:0,", 11)) { m_recvEvent = true; m_recvEnd = true; }
   if (strstr(line, "PEER_CLOSED") || !strncmp(line, "+CCHCLOSE", 9)) m_peerClosed = true;
+  if (strstr(line, "+CIPEVENT:") && strstr(line, "NETWORK CLOSED")) { m_netLostErr = 0; m_netLost = true; }   // PG-p1
   const char* d = strstr(line, "+CCHRECV: DATA,");
   if (d) {                                         // "<id>,<len>" then <len> raw bytes on this port
     const char* q = strchr(d + 15, ',');
