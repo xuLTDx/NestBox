@@ -53,7 +53,12 @@ const char* bootResetInfo(char* buf, int cap);   // main.cpp
 #define PID_DOORS      0x3A0     // p81: K0 0x412 open doors bits: 1 driver 2 passenger 4 RL 8 RR 16 boot
 #define PID_FUEL_BSI   0x3A1     // p81: READ BSI D8C3 fuel, 0.01 L
 #define PID_UREA_MEAS  0x3A2     // p81: READ CMM D558 urea measured, raw byte (scale from a refill)
-#define PID_UREA_EST   0x3A3     // p81: READ CMM D517 urea estimated, ml
+// 0x3A3 (p81 D517 "ml") no longer sent - PG-p10: the 1-byte x 62.5 decoding was wrong, see 0x3A6
+#define PID_UREA_D517  0x3A6     // PG-p10: READ CMM D517 2 bytes raw (AdBlue remaining candidate)
+#define PID_FUEL_CALC  0x3A7     // PG-p10: READ BSI D8C4 fuel calculated, 0.01 L
+#define PID_FUEL_PCT   0x3A8     // PG-p10: READ BSI D8C5 fuel displayed, %
+#define PID_REFUEL_VOL 0x3A9     // PG-p12: K0 0x432 byte 4 added fuel volume, raw
+#define PID_REFUEL_CNT 0x3AA     // PG-p12: K0 0x432 byte 6 bits 2-0 refuel counter
 #define PID_CREW       0x3A4     // p83: bit0 driver belt, bit1 passenger belt, bit2 passenger seated
 #define PID_SPEED_DISP 0x3A5     // p83: speed as on the cluster (BSI D8F9), km/h
 #define PID_ENGINE_EVENT      0x380   // v1F: 1 = START, 2 = STOP
@@ -192,7 +197,7 @@ static const AutoRead K0_READS[] = {
   {0x752, 0x652, {0xD8, 0xF9}, {2, 1}},   // p83 BSI: speed as on the cluster
   {0x752, 0x652, {0xD8, 0xC3}, {2, 1}},   // BSI: fuel measured x 0.01 L (verified 28.10)
   {0x6A8, 0x688, {0xD5, 0x58}, {2, 1}},   // CMM: urea volume measured (raw byte, scale at a refill)
-  {0x6A8, 0x688, {0xD5, 0x17}, {2, 1}},   // CMM: urea volume estimated, byte 5 x 0.0625 L (DB)
+  {0x6A8, 0x688, {0xD5, 0x17}, {2, 1}},   // CMM: urea remaining estimated, 2 bytes raw (PG-p10, unit NEOVERENÉ)
   {0x6A8, 0x688, {0xD5, 0x13}, {2, 1}},   // CMM: km before the urea refill (raw)
   {0x6A8, 0x688, {0xD4, 0x15}, {2, 1}},   // CMM: coolant (raw, the DB's -40 not plausible 28.10)
   {0x752, 0x652, {0xDB, 0xED}, {2, 1}},   // BSI: km to the next service
@@ -213,6 +218,9 @@ static const AutoRead K0_READS[] = {
   {0x6A8, 0x688, {0xD5, 0x6A}, {2, 1}},   // CMM DCM62: fuel level minimum (flag)
   {0x6A8, 0x688, {0xD5, 0x68}, {2, 1}},   // CMM DCM62: urea injected, x0.015625 mg/stroke (DB)
   {0x6A8, 0x688, {0xD5, 0x6D}, {2, 1}},   // CMM DCM62: urea tank temperature, -40 (DB)
+  // PG-p11 (3.11.2026): BSI2010_EV D8C6 fuel flap state (DB: 0 open, 1 closed); read only while the
+  // engine runs, so a refuel with the engine off is mostly not seen - kept as raw data only
+  {0x752, 0x652, {0xD8, 0xC6}, {2, 1}},
 };
 #define K0_READS_N (sizeof(K0_READS) / sizeof(K0_READS[0]))
 static uint8_t s_autoBus[K0_READS_N];        // the bus that answered (0 = not known yet)
@@ -357,7 +365,15 @@ static void makeRecord(int event = 0, time_t when = 0)
   if (cv.speedAt && ms - cv.speedAt < CAR_FRESH_MS) r.u32(PID_SPEED_CAN, (uint32_t)(cv.speedKmh * 100 + 0.5f));
   if (cv.fuelBsiAt && ms - cv.fuelBsiAt < 660000UL) r.u32(PID_FUEL_BSI, cv.fuelBsiCl);
   if (cv.ureaMeasAt && ms - cv.ureaMeasAt < 660000UL) r.u32(PID_UREA_MEAS, cv.ureaMeasRaw);
-  if (cv.ureaEstAt && ms - cv.ureaEstAt < 660000UL) r.u32(PID_UREA_EST, cv.ureaEstMl);
+  if (cv.ureaEstAt && ms - cv.ureaEstAt < 90000UL) r.u32(PID_UREA_D517, cv.ureaEstRaw);
+  if (cv.fuelCalcAt && ms - cv.fuelCalcAt < 90000UL) {
+    r.u32(PID_FUEL_CALC, cv.fuelCalcCl);
+    r.u32(PID_FUEL_PCT, cv.fuelDispPct);
+  }
+  if (cv.refuelAt && ms - cv.refuelAt < CAR_FRESH_MS) {
+    r.u32(PID_REFUEL_VOL, cv.refuelVol);
+    r.u32(PID_REFUEL_CNT, cv.refuelCnt);
+  }
   if (cv.crewAt && ms - cv.crewAt < 90000UL) r.u32(PID_CREW, cv.crew);
   if (cv.speedDispAt && ms - cv.speedDispAt < 90000UL) r.u32(PID_SPEED_DISP, cv.speedDisp);
   if (cv.ureaAt && ms - cv.ureaAt < CAR_FRESH_MS) {
@@ -388,6 +404,38 @@ static void makeRecord(int event = 0, time_t when = 0)
   r.push(ts);
 }
 
+// PG-p11 + PG-p12 (3.11.2026): the refuel candidates side by side, compared later with the receipts.
+// The level at the last engine STOP is kept (0x612 raw, the last BSI D8C3 / D8C4 reads); when the
+// 0x432 refuel counter changes: one status line (+ SD) with the counter, 0x432 byte 4 and the levels
+// before / now. The first counter seen after boot only arms it (no line). '-' = not known this boot.
+// Sensors cap at 70.0 L, a full tank is ~74.6 L (receipts 28.10 / 2.11) - the comparison shows which fits.
+static void refuelTick(const CarValues& cv)
+{
+  static bool wasOn, armed;
+  static uint8_t lastCnt;
+  static int stop612 = -1, stopC3 = -1, stopC4 = -1;
+  if (wasOn && !s_engineOn) {                  // STOP: the level before a refuel
+    stop612 = cv.fuelAt ? cv.fuelRaw : -1;
+    stopC3 = cv.fuelBsiAt ? cv.fuelBsiCl : -1;
+    stopC4 = cv.fuelCalcAt ? cv.fuelCalcCl : -1;
+  }
+  wasOn = s_engineOn;
+  if (!cv.refuelAt) return;
+  if (!armed) { armed = true; lastCnt = cv.refuelCnt; return; }
+  if (cv.refuelCnt == lastCnt) return;
+  char b612[8], bc3[8], bc4[8], n612[8];
+  if (stop612 >= 0) snprintf(b612, sizeof(b612), "%d", stop612); else strcpy(b612, "-");
+  if (stopC3 >= 0) snprintf(bc3, sizeof(bc3), "%d", stopC3); else strcpy(bc3, "-");
+  if (stopC4 >= 0) snprintf(bc4, sizeof(bc4), "%d", stopC4); else strcpy(bc4, "-");
+  if (cv.fuelAt && millis() - cv.fuelAt < CAR_FRESH_MS) snprintf(n612, sizeof(n612), "%u", cv.fuelRaw); else strcpy(n612, "-");
+  char m[57];
+  snprintf(m, sizeof(m), "REFUEL cnt %u>%u b4 %u 612 %s>%s C3 %s C4 %s",
+           lastCnt, cv.refuelCnt, cv.refuelVol, b612, n612, bc3, bc4);
+  lastCnt = cv.refuelCnt;
+  statusLine(m);
+  logNetEvent(m);
+}
+
 static void engineTick()
 {
   CarValues cv = carValues();
@@ -405,6 +453,7 @@ static void engineTick()
     logNetEvent("ENGINE STOP");
     makeRecord(2, when);
   }
+  refuelTick(cv);
 }
 
 // p67 (27.10.2026, as v1F telelogger.ino 2874-2882 DATA_INTERVAL_TABLE / STATIONARY_TIME_TABLE):

@@ -19,7 +19,11 @@
 //   0x38D VEHICLE_DYNAMICS_WHEELS   bytes 1-2 x 0.01 = speed km/h (0xFFFF invalid)
 //   plus values from the automatic reads (telemetry.cpp K0_READS): BSI D8C3 fuel x 0.01 L
 //   (= 44.3 L vs 0x612 44.5 L and BSI D8C4 44.71 L, 28.10), CMM D558 urea volume measured (raw
-//   byte, 0xB9 on 28.10 - scale unknown: the refill will show), CMM D517 byte 5 x 0.0625 L
+//   byte, 0xB9 on 28.10 - scale unknown: the refill will show), CMM D517 2 bytes raw (PG-p10)
+//   PG-p12 (3.11.2026, Diagbox frame list, seen by the box itself in sniff S31 28.10):
+//   0x432 BSI_CABIN_DATA_6 byte 4 = added fuel volume (raw; 28.10: 0x66 -> 0x31 = 49 at 13:29:39 UTC,
+//                           receipt 30.42 L, gauge 44.5 -> 70.0 - scale NEOVERENÉ),
+//                           byte 6 bits 2-0 = refuel counter (28.10: 4 -> 5 at 13:31:29)
 // Each value is kept with the time it came; a record takes only fresh ones.
 #pragma once
 #include <Arduino.h>
@@ -35,7 +39,10 @@ struct CarValues {
   float speedKmh;   uint32_t speedAt;                       // p81 0x38D
   uint16_t fuelBsiCl; uint32_t fuelBsiAt;                   // p81 READ BSI D8C3, 0.01 L
   uint8_t ureaMeasRaw; uint32_t ureaMeasAt;                 // p81 READ CMM D558 raw
-  uint16_t ureaEstMl; uint32_t ureaEstAt;                   // p81 READ CMM D517 byte 5 x 62.5 ml
+  uint16_t ureaEstRaw; uint32_t ureaEstAt;                  // PG-p10 READ CMM D517 both bytes raw (was byte 5 x 62.5 ml -
+                                                            // wrong: 19189 -> 18452 over ~800 km, unit NEOVERENÉ)
+  uint16_t fuelCalcCl; uint8_t fuelDispPct; uint32_t fuelCalcAt;   // PG-p10 READ BSI D8C4 x 0.01 L, D8C5 %
+  uint8_t refuelVol; uint8_t refuelCnt; uint32_t refuelAt;  // PG-p12 0x432 byte 4 added fuel (raw), byte 6 bits 2-0 counter
   uint8_t crew;     uint32_t crewAt;                        // p83 READ BSI D997/D998/D99F: bit0 driver belt,
                                                             // bit1 passenger belt, bit2 passenger seated (verified 28.10)
   uint8_t speedDisp; uint32_t speedDispAt;                  // p83 READ BSI D8F9 speed as on the cluster, km/h (verified 50/70)

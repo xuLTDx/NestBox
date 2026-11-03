@@ -63,6 +63,10 @@ void carDecode(uint32_t id, bool ext, uint8_t dlc, const uint8_t* d)
       s_v.speedKmh = raw * 0.01f; s_v.speedAt = now;
       portEXIT_CRITICAL(&s_mux);
     }
+  } else if (id == 0x432 && dlc >= 6) {      // PG-p12 added fuel volume + refuel counter
+    portENTER_CRITICAL(&s_mux);
+    s_v.refuelVol = d[3]; s_v.refuelCnt = d[5] & 0x07; s_v.refuelAt = now;
+    portEXIT_CRITICAL(&s_mux);
   } else if (id == 0x5A8 && dlc >= 8) {
     portENTER_CRITICAL(&s_mux);
     s_v.ureaKm = ((uint32_t)d[0] << 7) | (d[1] >> 1);
@@ -80,7 +84,11 @@ void carFromRead(uint32_t txId, const uint8_t* r, int len)
   portENTER_CRITICAL(&s_mux);
   if (txId == 0x752 && did == 0xD8C3 && len >= 5) { s_v.fuelBsiCl = ((uint16_t)r[3] << 8) | r[4]; s_v.fuelBsiAt = now; }
   else if (txId == 0x6A8 && did == 0xD558) { s_v.ureaMeasRaw = r[3]; s_v.ureaMeasAt = now; }
-  else if (txId == 0x6A8 && did == 0xD517 && len >= 5) { s_v.ureaEstMl = (uint16_t)(r[4] * 62.5f + 0.5f); s_v.ureaEstAt = now; }
+  else if (txId == 0x6A8 && did == 0xD517 && len >= 5) { s_v.ureaEstRaw = ((uint16_t)r[3] << 8) | r[4]; s_v.ureaEstAt = now; }
+  // PG-p10: 62 D8C4 hh ll D8C5 pp D8E1 hh ll (item 12, 3.11: 13 D2 = 50.74 L, 48 = 72 %)
+  else if (txId == 0x752 && did == 0xD8C4 && len >= 8 && r[5] == 0xD8 && r[6] == 0xC5) {
+    s_v.fuelCalcCl = ((uint16_t)r[3] << 8) | r[4]; s_v.fuelDispPct = r[7]; s_v.fuelCalcAt = now;
+  }
   else if (txId == 0x752 && did == 0xD8F9 && r[3] != 0xFF) { s_v.speedDisp = r[3]; s_v.speedDispAt = now; }
   else if (txId == 0x752 && did == 0xD997 && len >= 10 && r[4] == 0xD9 && r[5] == 0x98 && r[7] == 0xD9 && r[8] == 0x9F) {
     s_v.crew = (r[3] & 1) | ((r[6] & 1) << 1) | ((r[9] & 1) << 2); s_v.crewAt = now;    // 62 D997 v D998 v D99F v
