@@ -204,7 +204,8 @@ static const AutoRead K0_READS[] = {
   {0x752, 0x652, {0xDC, 0x5F}, {2, 1}},   // BSI: months to the next service
   {0x6A8, 0x688, {0xD5, 0x1F}, {2, 1}},   // CMM: engine oil dilution
   {0x6A8, 0x688, {0xD4, 0x29}, {2, 1}},   // CMM: oil pressure
-  {0x74A, 0x64A, {0xD4, 0x09}, {1, 2}},   // CVM camera: speed sign read (no answer on CAN2 28.10)
+  // CVM camera: speed sign read - PG-p13 (3.11.2026): never answered on either bus (187x no reply), not read
+  {0x74A, 0x64A, {0xD4, 0x09}, {0, 0}},
   // PG-p5 (2.11.2026): all fuel / urea candidates of the Diagbox DB, raw only (PID 0x39F + SD), to find
   // the one that follows the gauge and the receipts. Appended: items 0-11 keep their numbers.
   // BSI2010_EV: D8C4 fuel calculated, D8C5 fuel displayed, D8E1 range calculated
@@ -217,7 +218,8 @@ static const AutoRead K0_READS[] = {
   {0x6A8, 0x688, {0xD5, 0x7E}, {2, 1}},   // CMM DCM62: diesel additive (DPF) remaining, ml (DB)
   {0x6A8, 0x688, {0xD5, 0x6A}, {2, 1}},   // CMM DCM62: fuel level minimum (flag)
   {0x6A8, 0x688, {0xD5, 0x68}, {2, 1}},   // CMM DCM62: urea injected, x0.015625 mg/stroke (DB)
-  {0x6A8, 0x688, {0xD5, 0x6D}, {2, 1}},   // CMM DCM62: urea tank temperature, -40 (DB)
+  // CMM DCM62: urea tank temperature - PG-p13: always NRC 0x31 (not supported, 134x), not read
+  {0x6A8, 0x688, {0xD5, 0x6D}, {0, 0}},
   // PG-p11 (3.11.2026): BSI2010_EV D8C6 fuel flap state (DB: 0 open, 1 closed); read only while the
   // engine runs, so a refuel with the engine off is mostly not seen - kept as raw data only
   {0x752, 0x652, {0xD8, 0xC6}, {2, 1}},
@@ -270,6 +272,10 @@ static void autoReadTick()
   if (on && next < 0 && lastRound && millis() - lastRound >= AUTO_READ_EVERY_MS) next = 0;
   if (next < 0 || millis() - lastItem < AUTO_READ_GAP_MS) return;
   const AutoRead& a = K0_READS[next];
+  if (!a.buses[0]) {                    // PG-p13: buses {0, 0} = item switched off, its number stays
+    if (++next >= (int)K0_READS_N) { next = -1; lastRound = millis(); }
+    return;
+  }
   NbRead r = {};
   r.txId = a.tx; r.rxId = a.rx;
   r.req[0] = 0x22; r.reqLen = 1;
