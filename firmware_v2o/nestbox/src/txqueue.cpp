@@ -625,27 +625,163 @@ static void replayEnd(const char* why)
   s_replayRecs = 0;
   s_replaySkip = 0;
 }
-static bool sdStopKey(uint32_t file, uint32_t ts)
+// stop where the queue takes over (its oldest record that has an SD copy). PG-p19: taken as a copy under
+// the lock before the card is read. It only moves forward (records leave the queue at its tail), so a read
+// with an old copy stops early at worst - the next packet goes on (the replay ends only when a build finds
+// nothing more, see txqOnAck)
+struct SdStop { bool have; uint32_t file, ts; };
+static SdStop sdStopNow()
 {
-  // stop where the queue takes over (its oldest record that has an SD copy)
+  SdStop s = {false, 0, 0};
   uint32_t pos = H->tail;
   for (uint32_t i = 0; i < H->count; i++) {
     pos = norm(pos);
     QEnt* e = ent(pos);
-    if (e->file) return file > e->file || (file == e->file && ts >= e->ts);
+    if (e->file) { s.have = true; s.file = e->file; s.ts = e->ts; return s; }
     pos = nextPos(pos);
   }
-  return false;
+  return s;
+}
+static bool sdStopKey(const SdStop& s, uint32_t file, uint32_t ts)
+{
+  return s.have && (file > s.file || (file == s.file && ts >= s.ts));
 }
 
-static int buildSdPacket(char* out, int cap, const char* devid, Flight* f)
+// PG-p19 (3.11.2026): one replay packet is read from the card WITHOUT the queue lock.
+// why: txqPush() (the record task, every record) waits for the queue lock without a limit, and the card
+// was read under it - Peugeot 3.11 boot 147/149: each RESEND stopped the records 66-76 s (before PG-p14
+// the whole files were read at once), the missing seconds are not on SD either (records never made).
+// The card can be slow by itself (the SD writer's fsync, OTA/sniff writes under sdLock), so no queue
+// state is touched while reading: sdReadPacket() works on a copy of the cursor (SdRead), buildSdPacket()
+// applies the result under the lock - unless a RESEND set a new cursor meanwhile (s_sdGen), then the
+// read is dropped and done again from the new cursor. sdLock stays (user 3.11, PG35).
+// Only the net task builds packets (txqNextPacket), so s_recBuf and the flight are not shared.
+struct SdRead {
+  // in: the cursor and what the read needs from the queue
+  uint32_t file, boot, ts, pos, curFile, myBoot;
+  SdStop stop;
+  // out
+  bool opened, eof, done;
+  uint32_t nextTs, nextPos, skip;
+  int recLen, nrec;
+};
+static char s_recBuf[TXQ_PACKET_MAX + 700];  // a record is never cut: start one only below TXQ_PACKET_MAX
+static uint32_t s_sdGen;                      // +1 when a RESEND sets the cursor anew
+
+static void sdReadPacket(SdRead& r)
 {
   char path[24];
-  sprintf(path, "/DATA/%u.CSV", (unsigned)s_sdFile);
+  sprintf(path, "/DATA/%u.CSV", (unsigned)r.file);
   sdLock();
   File file = SD.open(path, FILE_READ);
   if (!file) {
     sdUnlock();
+    r.opened = false;
+    return;
+  }
+  r.opened = true;
+  if (r.pos) file.seek(r.pos);
+  char line[160];
+  char* recBuf = s_recBuf;
+  int recLen = 0;         // records accepted into the packet
+  int cur = -1;           // start of the record being read in recBuf, -1 = skipping
+  bool curHasData = false, curHasTime = false;
+  uint32_t curTs = 0, curPos = 0;
+  bool eof = false, done = false;
+  uint32_t nextTs = 0, nextPos = 0;
+  int nrec = 0;           // PG-p14: records in this packet
+  while (true) {
+    uint32_t linePos = file.position();
+    int n = file.available() ? file.readBytesUntil('\n', line, sizeof(line) - 1) : -1;
+    if (n < 0) {
+      eof = true;
+      if (r.file == r.curFile && cur >= 0) {
+        // the file being written: its last record may still be growing - not
+        // sent now, read again (complete) from its start next time
+        recLen = cur;  // cur = where its ",0:<ts>" began
+        nrec--;
+        nextTs = curTs;
+        nextPos = curPos;
+        cur = -1;
+      } else {
+        nextTs = curTs ? curTs + 1 : r.ts;
+        nextPos = linePos;
+      }
+      break;
+    }
+    line[n] = 0;
+    char* comma = strchr(line, ',');
+    if (!comma) continue;
+    *comma = 0;
+    const char* key = line;
+    const char* val = comma + 1;
+    if (!strcmp(key, "FE")) {
+      if (!strncmp(val, "BOOTID=", 7)) r.boot = strtoul(val + 7, 0, 10);
+      // PG-p14: v2O files before the BOOTID line have only "FE,BOOT <n> ID=<devid> ..." (telemetry.cpp)
+      else if (!r.boot && !strncmp(val, "BOOT ", 5) && val[5] >= '1' && val[5] <= '9' && strstr(val, " ID="))
+        r.boot = strtoul(val + 5, 0, 10);
+      continue;
+    }
+    if (!strcmp(key, "0")) {
+      uint32_t ts = strtoul(val, 0, 10);
+      if (cur >= 0 && !curHasData) { recLen = cur; nrec--; }  // an empty record: leave it out
+      else if (cur >= 0 && !curHasTime && r.boot == r.myBoot && clockValid())
+        recLen += timeFields(recBuf + recLen, sizeof(s_recBuf) - recLen, curTs);
+      cur = -1;  // the previous record (if any) is complete
+      if (!r.boot) { r.skip++; continue; }  // file without a boot id (old firmware): not replayable
+      if (ts < r.ts) continue;
+      if (sdStopKey(r.stop, r.file, ts)) { done = true; nextTs = ts; nextPos = linePos; break; }
+      if (recLen >= TXQ_PACKET_MAX) { nextTs = ts; nextPos = linePos; break; }
+      cur = recLen;
+      nrec++;
+      curHasData = false;
+      curHasTime = false;
+      if (recLen) recBuf[recLen++] = ',';
+      recLen += snprintf(recBuf + recLen, sizeof(s_recBuf) - recLen, "0:%u", (unsigned)ts);
+      curTs = ts;
+      curPos = linePos;
+      continue;
+    }
+    if (cur < 0) continue;
+    curHasData = true;
+    if (!strcmp(key, "10")) curHasTime = true;
+    int kl = strlen(key), vl = strlen(val);
+    if (recLen + kl + vl + 2 < (int)sizeof(s_recBuf)) {
+      recBuf[recLen++] = ',';
+      memcpy(recBuf + recLen, key, kl); recLen += kl;
+      recBuf[recLen++] = ':';
+      memcpy(recBuf + recLen, val, vl); recLen += vl;
+    }
+  }
+  if (cur >= 0 && !curHasData) { recLen = cur; nrec--; }
+  else if (cur >= 0 && !curHasTime && r.boot == r.myBoot && clockValid())
+    recLen += timeFields(recBuf + recLen, sizeof(s_recBuf) - recLen, curTs);
+  file.close();
+  sdUnlock();
+  r.eof = eof;
+  r.done = done;
+  r.nextTs = nextTs;
+  r.nextPos = nextPos;
+  r.recLen = recLen;
+  r.nrec = nrec;
+}
+
+// called by txqNextPacket() holding the queue lock ONCE (it is released here while the card is read)
+static int buildSdPacket(char* out, int cap, const char* devid, Flight* f)
+{
+  SdRead r = {};
+  r.file = s_sdFile; r.boot = s_sdBoot; r.ts = s_sdTs; r.pos = s_sdPos;
+  r.curFile = s_file; r.myBoot = s_boot;
+  r.stop = sdStopNow();
+  uint32_t gen = s_sdGen;
+  unlock();
+  sdReadPacket(r);
+  lock();
+  // a RESEND (or the end) meanwhile: next time from the new cursor
+  if (gen != s_sdGen || !s_sdActive || s_sdFile != r.file || s_sdPos != r.pos || s_sdTs != r.ts) return 0;
+  s_sdBoot = r.boot;
+  s_replaySkip += r.skip;
+  if (!r.opened) {
     if (!s_maxFile) {
       // no SD file this boot (no card / card gone): keep the cursor in NVS
       // for a boot that has the card, send the queue meanwhile
@@ -667,111 +803,32 @@ static int buildSdPacket(char* out, int cap, const char* devid, Flight* f)
     }
     return 0;
   }
-  if (s_sdPos) file.seek(s_sdPos);
-  char line[160];
-  static char recBuf[TXQ_PACKET_MAX + 700];  // a record is never cut: start one only below TXQ_PACKET_MAX
-  int recLen = 0;         // records accepted into the packet
-  int cur = -1;           // start of the record being read in recBuf, -1 = skipping
-  bool curHasData = false, curHasTime = false;
-  uint32_t curTs = 0, curPos = 0;
-  bool eof = false, done = false;
-  uint32_t nextTs = 0, nextPos = 0;
-  int nrec = 0;           // PG-p14: records in this packet
-  while (true) {
-    uint32_t linePos = file.position();
-    int n = file.available() ? file.readBytesUntil('\n', line, sizeof(line) - 1) : -1;
-    if (n < 0) {
-      eof = true;
-      if (s_sdFile == s_file && cur >= 0) {
-        // the file being written: its last record may still be growing - not
-        // sent now, read again (complete) from its start next time
-        recLen = cur;  // cur = where its ",0:<ts>" began
-        nrec--;
-        nextTs = curTs;
-        nextPos = curPos;
-        cur = -1;
-      } else {
-        nextTs = curTs ? curTs + 1 : s_sdTs;
-        nextPos = linePos;
-      }
-      break;
-    }
-    line[n] = 0;
-    char* comma = strchr(line, ',');
-    if (!comma) continue;
-    *comma = 0;
-    const char* key = line;
-    const char* val = comma + 1;
-    if (!strcmp(key, "FE")) {
-      if (!strncmp(val, "BOOTID=", 7)) s_sdBoot = strtoul(val + 7, 0, 10);
-      // PG-p14: v2O files before the BOOTID line have only "FE,BOOT <n> ID=<devid> ..." (telemetry.cpp)
-      else if (!s_sdBoot && !strncmp(val, "BOOT ", 5) && val[5] >= '1' && val[5] <= '9' && strstr(val, " ID="))
-        s_sdBoot = strtoul(val + 5, 0, 10);
-      continue;
-    }
-    if (!strcmp(key, "0")) {
-      uint32_t ts = strtoul(val, 0, 10);
-      if (cur >= 0 && !curHasData) { recLen = cur; nrec--; }  // an empty record: leave it out
-      else if (cur >= 0 && !curHasTime && s_sdBoot == s_boot && clockValid())
-        recLen += timeFields(recBuf + recLen, sizeof(recBuf) - recLen, curTs);
-      cur = -1;  // the previous record (if any) is complete
-      if (!s_sdBoot) { s_replaySkip++; continue; }  // file without a boot id (old firmware): not replayable
-      if (ts < s_sdTs) continue;
-      if (sdStopKey(s_sdFile, ts)) { done = true; nextTs = ts; nextPos = linePos; break; }
-      if (recLen >= TXQ_PACKET_MAX) { nextTs = ts; nextPos = linePos; break; }
-      cur = recLen;
-      nrec++;
-      curHasData = false;
-      curHasTime = false;
-      if (recLen) recBuf[recLen++] = ',';
-      recLen += snprintf(recBuf + recLen, sizeof(recBuf) - recLen, "0:%u", (unsigned)ts);
-      curTs = ts;
-      curPos = linePos;
-      continue;
-    }
-    if (cur < 0) continue;
-    curHasData = true;
-    if (!strcmp(key, "10")) curHasTime = true;
-    int kl = strlen(key), vl = strlen(val);
-    if (recLen + kl + vl + 2 < (int)sizeof(recBuf)) {
-      recBuf[recLen++] = ',';
-      memcpy(recBuf + recLen, key, kl); recLen += kl;
-      recBuf[recLen++] = ':';
-      memcpy(recBuf + recLen, val, vl); recLen += vl;
-    }
-  }
-  if (cur >= 0 && !curHasData) { recLen = cur; nrec--; }
-  else if (cur >= 0 && !curHasTime && s_sdBoot == s_boot && clockValid())
-    recLen += timeFields(recBuf + recLen, sizeof(recBuf) - recLen, curTs);
-  (void)curPos;
-  file.close();
-  sdUnlock();
-  if (!recLen) {
-    if (done || (eof && s_sdFile >= s_maxFile)) {
-      ev("REPLAY end file=%u ts=%u done=%d eof=%d stop=%u", (unsigned)s_sdFile, (unsigned)s_sdTs, done, eof,
-         (unsigned)nextTs);
+  if (!r.recLen) {
+    if (r.done || (r.eof && s_sdFile >= s_maxFile)) {
+      ev("REPLAY end file=%u ts=%u done=%d eof=%d stop=%u", (unsigned)s_sdFile, (unsigned)s_sdTs, r.done, r.eof,
+         (unsigned)r.nextTs);
       s_sdActive = false;
-      replayEnd(done ? "done" : "eof");
+      replayEnd(r.done ? "done" : "eof");
       return 0;
     }
-    if (eof) {
+    if (r.eof) {
       ev("REPLAY eof file=%u -> next", (unsigned)s_sdFile);
       s_sdFile++; s_sdTs = 0; s_sdPos = 0; s_sdBoot = 0;
     }
     return 0;
   }
   ev("REPLAY pkt=%u file=%u from=%u next=%u done=%d eof=%d", (unsigned)f->no, (unsigned)s_sdFile,
-     (unsigned)s_sdTs, (unsigned)nextTs, done, eof);
-  s_replayRecs += nrec;
+     (unsigned)s_sdTs, (unsigned)r.nextTs, r.done, r.eof);
+  s_replayRecs += r.nrec;
   f->sd = true;
-  f->sdEof = eof;
-  f->sdDone = done;
-  f->sdNextTs = nextTs;
-  f->sdNextPos = nextPos;
+  f->sdEof = r.eof;
+  f->sdDone = r.done;
+  f->sdNextTs = r.nextTs;
+  f->sdNextPos = r.nextPos;
   int o = header(out, cap, devid, s_sdBoot, f->no);
   out[o++] = ',';
-  memcpy(out + o, recBuf, recLen);
-  o += recLen;
+  memcpy(out + o, s_recBuf, r.recLen);
+  o += r.recLen;
   return tailer(out, o, cap);
 }
 
@@ -974,6 +1031,7 @@ void txqResendFrom(uint32_t fileId)
 {
   lock();
   s_sdActive = fileId != 0;
+  s_sdGen++;     // PG-p19: a replay read running now (without the lock) is dropped, not applied
   s_sdFile = fileId;
   s_sdBoot = 0;  // read from the file's BOOTID line
   s_replayRecs = 0;

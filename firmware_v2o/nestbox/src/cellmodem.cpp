@@ -531,25 +531,31 @@ static int fields(char* s, char** tok, int max)
   return nt;
 }
 
-bool CellLink::gnss(GnssFix* f)
+int CellLink::gnssPushed(GnssFix* f)
 {
   memset(f, 0, sizeof(*f));
-  if (!m_mux || !m_alive) return false;
-  if (m_muxOn) {                       // p69: the modem pushes RMC + GNS on port 1 every second
-    uint32_t now = millis();
-    if (m_nmeaAt && now - m_nmeaAt < 10000) {
-      portENTER_CRITICAL(&m_spin);
-      GnssFix c = m_nfix;
-      uint32_t r = m_rmcAt, g = m_gnsAt;
-      portEXIT_CRITICAL(&m_spin);
-      if (!r || now - r > 3000 || !c.valid) return false;
-      if (!g || now - g > 3000) { c.sats = 0; c.hdop = 0; }
-      *f = c;
-      return true;
-    }
-    if (m_gpsAt && now - m_gpsAt < 20000) return false;   // NMEA not started yet
-    // no NMEA on port 1 for 10 s: the old AT query (on port 2) as a fallback
+  if (!m_mux || !m_alive) return 0;
+  if (!m_muxOn) return -1;
+  // p69: the modem pushes RMC + GNS on port 1 every second
+  uint32_t now = millis();
+  if (m_nmeaAt && now - m_nmeaAt < 10000) {
+    portENTER_CRITICAL(&m_spin);
+    GnssFix c = m_nfix;
+    uint32_t r = m_rmcAt, g = m_gnsAt;
+    portEXIT_CRITICAL(&m_spin);
+    if (!r || now - r > 3000 || !c.valid) return 0;
+    if (!g || now - g > 3000) { c.sats = 0; c.hdop = 0; }
+    *f = c;
+    return 1;
   }
+  if (m_gpsAt && now - m_gpsAt < 20000) return 0;   // NMEA not started yet
+  return -1;                           // no NMEA on port 1 for 10 s: only the AT query (port 2) can read it
+}
+
+bool CellLink::gnss(GnssFix* f)
+{
+  int p = gnssPushed(f);
+  if (p >= 0) return p == 1;
   char line[200];
   char* tok[24];
   // CGNSSINFO first (has the satellite count); SIM7600G V2.0.2 in the Peugeot (21.10.2026)

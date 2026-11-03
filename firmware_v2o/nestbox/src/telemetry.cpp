@@ -82,19 +82,33 @@ static WifiLink s_wifi;
 static CellLink s_cell;
 static volatile bool s_cellOn;               // NVS CELL (default 0 until tested on 12 V)
 static volatile bool s_cellUp;
-static GnssFix s_fix;                        // last valid reading
+static GnssFix s_fix;                        // last valid reading - read and written only through fixGet / fixSet
+// PG-p19 (3.11.2026): the record task never waits for the modem. why: makeRecord() asked the modem itself
+// (AT+CSQ every record, the AT GNSS query when no NMEA) and waited for its lock without a limit; a pull-OTA
+// over the modem holds that lock up to 5 s per read (CellLink::tlsReadMux) - Peugeot 3.11 boot 149/151/152:
+// 4-5 s without records exactly during OTA-PULL (not on SD either). As v1F (telelogger.ino 3413: the RSSI
+// read in the network task, 2548: the record only takes the variable). The record now takes the NMEA fix
+// (memory, CellLink::gnssPushed) or the last values cellTask read from the modem (s_fix, s_csq).
+static portMUX_TYPE s_fixMux = portMUX_INITIALIZER_UNLOCKED;   // s_fix is written by the record, cell and loop tasks
+static GnssFix fixGet() { portENTER_CRITICAL(&s_fixMux); GnssFix f = s_fix; portEXIT_CRITICAL(&s_fixMux); return f; }
+static void fixSet(const GnssFix& f) { portENTER_CRITICAL(&s_fixMux); s_fix = f; portEXIT_CRITICAL(&s_fixMux); }
+static volatile int s_csq;                   // dBm from cellTask (0 = unknown)
+static volatile uint32_t s_csqAt;            // millis() of that reading
+#define CSQ_EVERY_MS 10000UL                 // cellTask reads it this often
+#define CSQ_FRESH_MS 30000UL                 // older = not put into the record
 // p66: GNSS start mode for the boot after a GPS_TEST sleep (one-shot), time to the first fix reported once
 RTC_DATA_ATTR static char s_gpsNext;
 static bool s_ttffSent;
 void telemetryGpsStartNext(char mode) { s_gpsNext = mode; }
 static void ttffCheck()
 {
-  if (s_ttffSent || !s_fix.valid || !s_cell.gpsStartedAt()) return;
+  GnssFix fx = fixGet();
+  if (s_ttffSent || !fx.valid || !s_cell.gpsStartedAt()) return;
   s_ttffSent = true;
   char m[57];
   snprintf(m, sizeof(m), "GPS ttff=%lus boot=%lus mode=%c ok=%d sats=%u",
-           (unsigned long)((s_fix.at - s_cell.gpsStartedAt()) / 1000), (unsigned long)(s_fix.at / 1000),
-           s_cell.gpsMode(), s_cell.gpsStartOk() ? 1 : 0, (unsigned)s_fix.sats);
+           (unsigned long)((fx.at - s_cell.gpsStartedAt()) / 1000), (unsigned long)(fx.at / 1000),
+           s_cell.gpsMode(), s_cell.gpsStartOk() ? 1 : 0, (unsigned)fx.sats);
   statusLine(m);
 }
 static char s_apn[40] = "internet";          // the CELL_APN in force (NVS), home operator 4ka
@@ -126,7 +140,7 @@ int telemetryStatus(char* buf, int size)
   int n = snprintf(buf, size, "devid=%s login=%d link=%s cell=%d/%s mux=%d/%lu/%lu fix=%d sats=%u tx=%lu txB=%lu rxB=%lu file=%lu rec_s=%lu ota_req=%d ",
                    devid, s_client.login ? 1 : 0, s_client.link ? s_client.link->name() : "-", s_cellOn ? 1 : 0,
                    s_cell.status(), s_cell.muxOn() ? 1 : 0, (unsigned long)s_cell.muxFrames(),
-                   (unsigned long)s_cell.muxErrors(), s_fix.valid ? 1 : 0, (unsigned)s_fix.sats, (unsigned long)s_client.txCount,
+                   (unsigned long)s_cell.muxErrors(), fixGet().valid ? 1 : 0, (unsigned)fixGet().sats, (unsigned long)s_client.txCount,
                    (unsigned long)s_client.txBytes, (unsigned long)s_client.rxBytes, (unsigned long)s_log.id(),
                    (unsigned long)s_recS, s_otaReq ? 1 : 0);
   txqStatus(buf + n, size - n);
@@ -168,8 +182,8 @@ bool telemetryRecordDone() { return !s_recNow; }
 bool telemetryPollFix()
 {
   GnssFix g;
-  if (!s_cellOn || !s_cell.gnss(&g)) return false;
-  s_fix = g;
+  if (!s_cellOn || !s_cell.gnss(&g)) return false;   // the loop task (standby), not the record task
+  fixSet(g);
   ttffCheck();
   return true;
 }
@@ -318,27 +332,28 @@ static void makeRecord(int event = 0, time_t when = 0)
     }
   }
   GnssFix g;
-  if (s_cellOn && s_cell.gnss(&g)) { s_fix = g; ttffCheck(); }
-  bool fresh = s_fix.valid && millis() - s_fix.at < 5000;
+  if (s_cellOn && s_cell.gnssPushed(&g) == 1) { fixSet(g); ttffCheck(); }   // PG-p19: memory only, no AT
+  GnssFix fx = fixGet();         // the NMEA fix above, or the AT reading of cellTask
+  bool fresh = fx.valid && millis() - fx.at < 5000;
   if (fresh && event) {          // an event record carries the event's time (above), the position only
-    r.f(PID_GPS_LATITUDE, s_fix.lat, "%f");
-    r.f(PID_GPS_LONGITUDE, s_fix.lng, "%f");
-    if (s_fix.sats) r.u32(PID_GPS_SAT_COUNT, s_fix.sats);
+    r.f(PID_GPS_LATITUDE, fx.lat, "%f");
+    r.f(PID_GPS_LONGITUDE, fx.lng, "%f");
+    if (fx.sats) r.u32(PID_GPS_SAT_COUNT, fx.sats);
   } else if (fresh) {                   // as v1F processGPS(): the GNSS time also sets the clock
     struct tm t = {};
-    t.tm_mday = s_fix.date / 10000; t.tm_mon = (s_fix.date / 100) % 100 - 1; t.tm_year = s_fix.date % 100 + 100;
-    t.tm_hour = s_fix.time / 1000000; t.tm_min = (s_fix.time / 10000) % 100; t.tm_sec = (s_fix.time / 100) % 100;
+    t.tm_mday = fx.date / 10000; t.tm_mon = (fx.date / 100) % 100 - 1; t.tm_year = fx.date % 100 + 100;
+    t.tm_hour = fx.time / 1000000; t.tm_min = (fx.time / 10000) % 100; t.tm_sec = (fx.time / 100) % 100;
     time_t gnow = mktime(&t), now0 = time(nullptr);
     if (gnow > 1735689600 && (now0 > gnow + 2 || now0 < gnow - 2)) { struct timeval tv = {gnow, 0}; settimeofday(&tv, nullptr); }
-    r.u32(0x10, s_fix.time);
-    r.u32(0x11, s_fix.date);
-    r.f(PID_GPS_LATITUDE, s_fix.lat, "%f");
-    r.f(PID_GPS_LONGITUDE, s_fix.lng, "%f");
-    r.f(PID_GPS_ALTITUDE, s_fix.alt, "%.1f");
-    r.f(PID_GPS_SPEED, s_fix.kph, "%.1f");
-    r.u32(PID_GPS_HEADING, s_fix.heading);
-    if (s_fix.sats) r.u32(PID_GPS_SAT_COUNT, s_fix.sats);
-    if (s_fix.hdop > 0) r.u32(PID_GPS_HDOP, (uint32_t)(s_fix.hdop + 0.5f));
+    r.u32(0x10, fx.time);
+    r.u32(0x11, fx.date);
+    r.f(PID_GPS_LATITUDE, fx.lat, "%f");
+    r.f(PID_GPS_LONGITUDE, fx.lng, "%f");
+    r.f(PID_GPS_ALTITUDE, fx.alt, "%.1f");
+    r.f(PID_GPS_SPEED, fx.kph, "%.1f");
+    r.u32(PID_GPS_HEADING, fx.heading);
+    if (fx.sats) r.u32(PID_GPS_SAT_COUNT, fx.sats);
+    if (fx.hdop > 0) r.u32(PID_GPS_HDOP, (uint32_t)(fx.hdop + 0.5f));
   }
   time_t now = time(nullptr);
   if (!fresh && !event && now > 1735689600) {   // no fix: date and time from the clock as v1F addTimeOf()
@@ -350,7 +365,7 @@ static void makeRecord(int event = 0, time_t when = 0)
   r.f(PID_BATTERY_VOLTAGE, read12V() * 100, "%.0f");    // v1F: 0.01 V units (FleetNest: /100 V)
   r.i32(PID_DEVICE_TEMP, (int32_t)((temprature_sens_read() - 32) / 1.8f));
   if (WiFi.status() == WL_CONNECTED) r.i32(PID_CSQ, WiFi.RSSI());
-  else if (s_cellUp) { int q = s_cell.rssi(); if (q) r.i32(PID_CSQ, q); }
+  else if (s_cellUp && s_csq && millis() - s_csqAt < CSQ_FRESH_MS) r.i32(PID_CSQ, s_csq);   // PG-p19: cellTask's reading
   if (sniffActive()) r.u32(PID_SNIFF_LEFT, sniffMinutesLeft());
   static uint32_t lastFrames;
   Can1Stats cs = can1Stats();
@@ -472,7 +487,8 @@ static uint32_t recordEveryMs()
   uint32_t ms = millis();
   if (!lastCheck || ms - lastCheck >= 1000) {
     lastCheck = ms;
-    bool gpsMove = s_fix.valid && ms - s_fix.at < 5000 && s_fix.kph >= 3.0f;
+    GnssFix fx = fixGet();
+    bool gpsMove = fx.valid && ms - fx.at < 5000 && fx.kph >= 3.0f;
     moving = s_engineOn || read12V() >= ENGINE_OFF_VOLTAGE || gpsMove;
     if (moving || !lastMove) lastMove = ms;
   }
@@ -677,7 +693,7 @@ static void smsHandle(const char* from, const char* text)
     char net[40];
     s_cell.netInfo(net, sizeof(net));
     snprintf(reply, sizeof(reply), "%s fw %s %s rssi=%d data=%s q=%lu gps=%.5f,%.5f %s", devid, FW_BUILD_STR, net,
-             s_cell.rssi(), s_cell.up() ? "up" : "DOWN", (unsigned long)txqPending(), s_fix.lat, s_fix.lng,
+             s_cell.rssi(), s_cell.up() ? "up" : "DOWN", (unsigned long)txqPending(), fixGet().lat, fixGet().lng,
              s_engineOn ? "engine" : "off");
   } else if (!strncasecmp(c, "CELL RESTART", 12)) {
     strcpy(s_cellRestartWhy, "SMS");
@@ -734,7 +750,7 @@ static void smsTick()
       snprintf(owner, sizeof(owner), "%.*s", (int)strcspn(s_smsAllow, ","), s_smsAllow);
       snprintf(m, sizeof(m), "%s BEZ DAT %lu min: %s rssi=%d data=%s q=%lu gps=%.5f,%.5f fw %s", devid,
                (unsigned long)((millis() - ref) / 60000), net, s_cell.rssi(), s_cell.up() ? "up" : "DOWN",
-               (unsigned long)txqPending(), s_fix.lat, s_fix.lng, FW_BUILD_STR);
+               (unsigned long)txqPending(), fixGet().lat, fixGet().lng, FW_BUILD_STR);
       statusLine("SMS ALERT no data 30 min");
       smsSendLogged(owner, m);
     }
@@ -823,6 +839,18 @@ static void cellTask(void*)
       s_cellRestartReq = false;
     } else if (!s_cellUp) {
       s_cellRestartReq = false;                      // nothing to restart
+    }
+    // PG-p19 (3.11.2026): the modem values the record takes - the record never asks the modem itself
+    // (see s_fix). A busy modem (OTA download, CMUX) only delays these readings here, never a record.
+    if (s_cellOn && !s_standby) {
+      GnssFix g;
+      if (s_cell.gnssPushed(&g) < 0 && s_cell.gnss(&g)) { fixSet(g); ttffCheck(); }   // no NMEA: the AT query
+    }
+    static uint32_t lastCsq;
+    if (s_cellUp && !s_standby && (!lastCsq || millis() - lastCsq >= CSQ_EVERY_MS)) {
+      lastCsq = millis();
+      int q = s_cell.rssi();
+      if (q) { s_csq = q; s_csqAt = millis(); }
     }
     smsTick();                                       // PG-p8
     vTaskDelay(pdMS_TO_TICKS(1000));
@@ -1117,6 +1145,7 @@ void readTick()
 int telemetryLive(char* buf, int size)
 {
   CarValues cv = carValues();
+  GnssFix fx = fixGet();
   uint32_t ms = millis();
   auto age = [&](uint32_t at) -> long { return at ? (long)(ms - at) : -1L; };
   return snprintf(buf, size,
@@ -1127,7 +1156,7 @@ int telemetryLive(char* buf, int size)
       "\"can1\":{\"frames\":%lu,\"kbit\":%lu,\"found\":%d,\"last_age\":%ld},\"file\":%lu,\"pending\":%lu}",
       read12V(), s_engineOn ? 1 : 0, carProfile(), cv.rpm, age(cv.rpmAt), cv.engState, (unsigned long)cv.odoKm, age(cv.odoAt),
       cv.fuelL, age(cv.fuelAt), (unsigned long)cv.ureaKm, age(cv.ureaAt),
-      s_fix.valid ? 1 : 0, s_fix.lat, s_fix.lng, s_fix.kph, (unsigned)s_fix.sats, age(s_fix.at),
+      fx.valid ? 1 : 0, fx.lat, fx.lng, fx.kph, (unsigned)fx.sats, age(fx.at),
       s_client.link ? s_client.link->name() : "-", s_client.login ? 1 : 0, s_cell.status(),
       (unsigned long)s_client.txCount, (unsigned long)s_client.txBytes,
       (unsigned long)can1Stats().frames, (unsigned long)can1Stats().kbit, can1Stats().speedFound ? 1 : 0,

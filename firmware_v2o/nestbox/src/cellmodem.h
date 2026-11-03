@@ -59,6 +59,10 @@ public:
   void stop();                 // network closed, modem powered off
   void powerOff();             // stop() under the lock (standby, from another task)
   bool gnss(GnssFix* out);     // one AT+CGNSSINFO reading, CGPSINFO when empty (modem on, network not needed)
+  // PG-p19 (3.11.2026): the fix the modem pushes as NMEA (CMUX port 1) - memory only, never waits for the
+  // modem. 1 = fix, 0 = NMEA running, no fix now, -1 = no NMEA (only the AT query of gnss() can read it).
+  // why: the record task must never wait for the modem (OTA holds it up to 5 s per read - see telemetry.cpp)
+  int gnssPushed(GnssFix* out);
   bool alive_() { return m_alive; }
   // p66: how the next start() switches GNSS on - 'N' AT+CGPS=1,1 (as before), 'H' AT+CGPSHOT, 'C' AT+CGPSCOLD
   // (SIM7500_SIM7600 GNSS Application Note V2.00 3.1: only with GNSS off - after power on it is)
