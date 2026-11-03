@@ -245,6 +245,9 @@ void TeleClientUDP::onMessage(char* msg, UdpRx* rx)
       snprintf(m, sizeof(m), "NET CMD_RESEND file=%u %s", (unsigned)f, started ? "start" : "running");
       Serial.println(m);
       logNetEvent(m);
+      // PG-p14: to FleetNest too (before: SD only - the server never saw the command taken)
+      snprintf(m, sizeof(m), "CMD RESEND=%u %s", (unsigned)f, started ? "start" : "running");
+      statusLine(m);
     }
     return;
   }

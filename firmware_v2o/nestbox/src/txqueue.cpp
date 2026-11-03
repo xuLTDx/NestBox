@@ -613,6 +613,18 @@ static int tailer(char* out, int n, int cap)
 }
 
 // ---- SD replay: read records back from /DATA/<file>.CSV ----
+// PG-p14: how a replay ends goes to FleetNest as a status line (before: only in TEST_TXQ builds)
+void statusLine(const char* text);   // ota.cpp
+static uint32_t s_replayRecs, s_replaySkip;   // records put into replay packets / skipped (no boot id)
+static void replayEnd(const char* why)
+{
+  char m[57];
+  snprintf(m, sizeof(m), "REPLAY end file=%u sent=%u skip=%u %s", (unsigned)s_sdFile, (unsigned)s_replayRecs,
+           (unsigned)s_replaySkip, why);
+  statusLine(m);
+  s_replayRecs = 0;
+  s_replaySkip = 0;
+}
 static bool sdStopKey(uint32_t file, uint32_t ts)
 {
   // stop where the queue takes over (its oldest record that has an SD copy)
@@ -651,6 +663,7 @@ static int buildSdPacket(char* out, int cap, const char* devid, Flight* f)
       s_sdActive = false;
       s_replayAbandoned++;
       Serial.printf("[TXQ] SD replay ended: /DATA/%u.CSV missing\n", (unsigned)s_sdFile);
+      replayEnd("missing");
     }
     return 0;
   }
@@ -663,6 +676,7 @@ static int buildSdPacket(char* out, int cap, const char* devid, Flight* f)
   uint32_t curTs = 0, curPos = 0;
   bool eof = false, done = false;
   uint32_t nextTs = 0, nextPos = 0;
+  int nrec = 0;           // PG-p14: records in this packet
   while (true) {
     uint32_t linePos = file.position();
     int n = file.available() ? file.readBytesUntil('\n', line, sizeof(line) - 1) : -1;
@@ -672,6 +686,7 @@ static int buildSdPacket(char* out, int cap, const char* devid, Flight* f)
         // the file being written: its last record may still be growing - not
         // sent now, read again (complete) from its start next time
         recLen = cur;  // cur = where its ",0:<ts>" began
+        nrec--;
         nextTs = curTs;
         nextPos = curPos;
         cur = -1;
@@ -689,19 +704,23 @@ static int buildSdPacket(char* out, int cap, const char* devid, Flight* f)
     const char* val = comma + 1;
     if (!strcmp(key, "FE")) {
       if (!strncmp(val, "BOOTID=", 7)) s_sdBoot = strtoul(val + 7, 0, 10);
+      // PG-p14: v2O files before the BOOTID line have only "FE,BOOT <n> ID=<devid> ..." (telemetry.cpp)
+      else if (!s_sdBoot && !strncmp(val, "BOOT ", 5) && val[5] >= '1' && val[5] <= '9' && strstr(val, " ID="))
+        s_sdBoot = strtoul(val + 5, 0, 10);
       continue;
     }
     if (!strcmp(key, "0")) {
       uint32_t ts = strtoul(val, 0, 10);
-      if (cur >= 0 && !curHasData) recLen = cur;  // an empty record: leave it out
+      if (cur >= 0 && !curHasData) { recLen = cur; nrec--; }  // an empty record: leave it out
       else if (cur >= 0 && !curHasTime && s_sdBoot == s_boot && clockValid())
         recLen += timeFields(recBuf + recLen, sizeof(recBuf) - recLen, curTs);
       cur = -1;  // the previous record (if any) is complete
-      if (!s_sdBoot) continue;  // file without a boot id (old firmware): not replayable
+      if (!s_sdBoot) { s_replaySkip++; continue; }  // file without a boot id (old firmware): not replayable
       if (ts < s_sdTs) continue;
       if (sdStopKey(s_sdFile, ts)) { done = true; nextTs = ts; nextPos = linePos; break; }
       if (recLen >= TXQ_PACKET_MAX) { nextTs = ts; nextPos = linePos; break; }
       cur = recLen;
+      nrec++;
       curHasData = false;
       curHasTime = false;
       if (recLen) recBuf[recLen++] = ',';
@@ -721,7 +740,7 @@ static int buildSdPacket(char* out, int cap, const char* devid, Flight* f)
       memcpy(recBuf + recLen, val, vl); recLen += vl;
     }
   }
-  if (cur >= 0 && !curHasData) recLen = cur;
+  if (cur >= 0 && !curHasData) { recLen = cur; nrec--; }
   else if (cur >= 0 && !curHasTime && s_sdBoot == s_boot && clockValid())
     recLen += timeFields(recBuf + recLen, sizeof(recBuf) - recLen, curTs);
   (void)curPos;
@@ -732,6 +751,7 @@ static int buildSdPacket(char* out, int cap, const char* devid, Flight* f)
       ev("REPLAY end file=%u ts=%u done=%d eof=%d stop=%u", (unsigned)s_sdFile, (unsigned)s_sdTs, done, eof,
          (unsigned)nextTs);
       s_sdActive = false;
+      replayEnd(done ? "done" : "eof");
       return 0;
     }
     if (eof) {
@@ -742,6 +762,7 @@ static int buildSdPacket(char* out, int cap, const char* devid, Flight* f)
   }
   ev("REPLAY pkt=%u file=%u from=%u next=%u done=%d eof=%d", (unsigned)f->no, (unsigned)s_sdFile,
      (unsigned)s_sdTs, (unsigned)nextTs, done, eof);
+  s_replayRecs += nrec;
   f->sd = true;
   f->sdEof = eof;
   f->sdDone = done;
@@ -955,6 +976,8 @@ void txqResendFrom(uint32_t fileId)
   s_sdActive = fileId != 0;
   s_sdFile = fileId;
   s_sdBoot = 0;  // read from the file's BOOTID line
+  s_replayRecs = 0;
+  s_replaySkip = 0;
   s_sdTs = 0;
   s_sdPos = 0;
   for (auto& f : s_flight) if (f.used && f.sd) f.used = false;

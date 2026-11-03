@@ -921,6 +921,12 @@ void telemetryBegin(uint32_t bootId, bool sdOk)
     uint32_t id = s_log.begin(last);
     if (id) { nvs_set_u32(nvs, "DATA_ID", id); nvs_commit(nvs); }
     txqSetFile(id);
+    // PG-p14 (3.11.2026, as v1F telelogger.ino 2056-2061): the boot number in every file - the delivery
+    // queue's SD replay (RESEND) needs it to rebuild the records' identity; without it every record was
+    // skipped (Peugeot file 137 never refilled)
+    char bid[24];
+    snprintf(bid, sizeof(bid), "BOOTID=%lu", (unsigned long)bootId);
+    s_log.logEvent(bid);
     char ev[160], ri[100];
     snprintf(ev, sizeof(ev), "BOOT %lu ID=%s %s", (unsigned long)bootId, devid, bootResetInfo(ri, sizeof(ri)));
     s_log.logEvent(ev);
