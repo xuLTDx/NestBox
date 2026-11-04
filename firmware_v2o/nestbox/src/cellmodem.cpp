@@ -56,7 +56,7 @@ bool CellLink::waitFor(const char* a, const char* b, unsigned int timeoutMs)
 bool CellLink::at(const char* cmd, unsigned int timeoutMs, const char* expect)
 {
   lock();
-  while (linkAvail()) linkRead();       // stale bytes (URCs) are not this command's answer
+  linkFlush("at");                      // stale bytes (URCs) are not this command's answer
   m_len = 0;
   m_buf[0] = 0;
   portENTER_CRITICAL(&m_spin);
@@ -65,6 +65,7 @@ bool CellLink::at(const char* cmd, unsigned int timeoutMs, const char* expect)
   portEXIT_CRITICAL(&m_spin);
   if (cmd) linkWrite((const uint8_t*)cmd, strlen(cmd));
   bool ok = waitFor(expect ? expect : "\r\nOK", "\r\nERROR", timeoutMs);
+  ansCheck();
   unlock();
   return ok;
 }
@@ -286,7 +287,7 @@ bool CellLink::smsSend(const char* num, const char* text)
   lock();
   bool ok = at("AT+CMGF=1\r") && at("AT+CSCS=\"IRA\"\r");
   if (ok) {
-    while (linkAvail()) linkRead();
+    linkFlush("sms");
     m_len = 0;
     m_buf[0] = 0;
     portENTER_CRITICAL(&m_spin);
@@ -306,6 +307,7 @@ bool CellLink::smsSend(const char* num, const char* text)
       const uint8_t esc = 0x1B;                 // no prompt: cancel
       linkWrite(&esc, 1);
     }
+    ansCheck();
   }
   unlock();
   return ok;
@@ -434,7 +436,7 @@ bool CellLink::send(const char* data, unsigned int len)
 {
   if (!m_sockOpen) return false;
   lock();
-  while (linkAvail()) linkRead();
+  linkFlush("udp");
   m_len = 0;
   m_buf[0] = 0;
   portENTER_CRITICAL(&m_spin);
@@ -447,6 +449,7 @@ bool CellLink::send(const char* data, unsigned int len)
   bool prompt = waitFor("\r\n>", "\r\nERROR", 1000);   // the prompt, then the bytes
   linkWrite((const uint8_t*)data, len);
   bool ok = waitFor("+CIPSEND:", "\r\nERROR", 2000);
+  ansCheck();
   udpNote(ok ? "UDP SEND OK " : prompt ? "UDP SEND ERR " : "UDP SEND NOPROMPT ", ok);
   unlock();
   return ok;
@@ -629,6 +632,7 @@ bool CellLink::tlsOpen(const char* host, uint16_t port)
 {
   if (!m_netOpen) return false;
   lock();
+  m_tlsOn = false;
   at("AT+CCHCLOSE=0\r", 2000, "+CCHCLOSE:");   // a session left from before (harmless ERROR)
   at("AT+CCHSTOP\r", 3000, "+CCHSTOP:");      // wait for the stop itself, not only its OK (p43)
   // send result report, cache receive mode - before CCHSTART; an ERROR here left the modem pushing
@@ -657,8 +661,66 @@ bool CellLink::tlsOpen(const char* host, uint16_t port)
   bool ok = at(c, 30000, "+CCHOPEN: 0,0");
   if (!ok) Serial.printf("[CELL] CCHOPEN %s:%u failed: %s\n", host, (unsigned)port, m_buf);
   if (diag) { char t[64]; diagText(t, sizeof(t), ok ? "CCH OPEN OK " : "CCH OPEN ERR ", m_buf); diag(t); }
+  m_lostWhere = nullptr;                       // PG-p21: a new session, nothing lost yet
+  m_lostBytes = 0;
+  m_annBytes = m_gotBytes = 0;
+  m_rx2LostAt = m_rx2Lost;
+  m_pushDropAt = m_pushDrop;
+  m_flushTxtDone = false;
+  m_tlsOn = ok;
   unlock();
   return ok;
+}
+
+// PG-p21: the session lost bytes - the first spot is kept (the later ones follow from it)
+void CellLink::tlsLost(const char* where, int bytes)
+{
+  if (!m_tlsOn || m_lostWhere) return;
+  m_lostBytes = bytes;
+  m_lostWhere = where;
+}
+
+// PG-p21: throw away what waits on the data port (port 2, or the UART without CMUX) - as before,
+// but while a session is open a "+CCHRECV: DATA," among those bytes is a block of the HTTPS answer
+// that nobody asked for any more -> the session is lost. txt (optional) = the first bytes as text.
+int CellLink::linkFlush(const char* where, char* txt, int txtCap)
+{
+  static const char P[] = "+CCHRECV: DATA,";
+  int n = 0, st = 0;
+  bool hit = false;
+  while (linkAvail()) {
+    int b = linkRead();
+    if (b < 0) break;
+    if (txt && n < txtCap - 1) txt[n] = b ? (char)b : '.';
+    n++;
+    if (b == P[st]) { if (!P[++st]) { hit = true; st = 0; } }
+    else st = b == '+' ? 1 : 0;
+  }
+  if (txt && txtCap > 0) txt[n < txtCap - 1 ? n : txtCap - 1] = 0;
+  if (hit) tlsLost(where, n);
+  return n;
+}
+
+// PG-p21: an AT answer read while a session is open must not hold an HTTPS data block (the block
+// came late, after its own read had ended - then this answer swallowed it)
+void CellLink::ansCheck()
+{
+  if (m_tlsOn && !m_lostWhere && strstr(m_buf, "+CCHRECV: DATA,")) tlsLost("ans", 0);
+}
+
+// PG-p21: one read of the HTTPS answer; a read in which bytes were lost is dropped whole (-2), and
+// so is every later one of this session. The modem is held for the whole read (lock is recursive).
+int CellLink::tlsRead(uint8_t* buf, int cap, unsigned int timeoutMs)
+{
+  lock();
+  int n = -2;
+  if (!m_lostWhere) n = m_muxOn ? tlsReadMux(buf, cap, timeoutMs) : tlsReadUart(buf, cap, timeoutMs);
+  if (m_rx2Lost != m_rx2LostAt) tlsLost("rx2", (int)(m_rx2Lost - m_rx2LostAt));   // port-2 buffer full
+  if (m_pushDrop != m_pushDropAt) tlsLost("push", (int)(m_pushDrop - m_pushDropAt));   // m_push full
+  if (m_lostWhere) n = -2;
+  else if (n > 0) m_gotBytes += n;
+  unlock();
+  return n;
 }
 
 bool CellLink::tlsSend(const char* data, int len)
@@ -672,6 +734,7 @@ bool CellLink::tlsSend(const char* data, int len)
     m_len = 0;
     m_buf[0] = 0;
     ok = waitFor("\r\nOK", "\r\nERROR", 10000);
+    ansCheck();
   }
   if (diag) {
     char t[64], pre[24];
@@ -684,13 +747,13 @@ bool CellLink::tlsSend(const char* data, int len)
 }
 
 // one AT+CCHRECV: "+CCHRECV: DATA,0,<n>\r\n<n raw bytes>...OK"; no data = no DATA line
-int CellLink::tlsRead(uint8_t* buf, int cap, unsigned int timeoutMs)
+int CellLink::tlsReadUart(uint8_t* buf, int cap, unsigned int timeoutMs)
 {
   // as the FreematicsPlus SIM7600 branch (p44, 2026-10-26): in cache mode wait for the modem's
   // "+CCHRECV: 0,<n>" (data ready) or +CCH_PEER_CLOSED, only then AT+CCHRECV. The modem is held
   // (lock) for the whole wait - another task's at() would throw the notice away. Every modem line
   // goes into the diagnostics (first 16 per connection).
-  if (m_muxOn) return tlsReadMux(buf, cap, timeoutMs);
+  if (m_lostWhere) return -2;
   if (m_pushPos < m_pushLen) {
     int n = m_pushLen - m_pushPos < cap ? m_pushLen - m_pushPos : cap;
     memcpy(buf, m_push + m_pushPos, n);
@@ -716,6 +779,7 @@ int CellLink::tlsRead(uint8_t* buf, int cap, unsigned int timeoutMs)
     char* d = strstr(line, "+CCHRECV: DATA,0,");
     if (d) {                                   // pushed by the modem itself
       int n = atoi(d + 17), got = 0;
+      m_annBytes += n;
       uint32_t tb = millis();
       while (got < n && millis() - tb < 5000) {
         if (!s_uart.available()) { delay(1); continue; }
@@ -724,10 +788,12 @@ int CellLink::tlsRead(uint8_t* buf, int cap, unsigned int timeoutMs)
         got++;
         tb = millis();
       }
+      if (got < n) tlsLost("block", n - got);                     // PG-p21: the block did not come whole
+      if (got > (int)sizeof(m_push)) tlsLost("push", got - (int)sizeof(m_push));   // did not fit
       m_pushLen = got < (int)sizeof(m_push) ? got : (int)sizeof(m_push);
       m_pushPos = 0;
       unlock();
-      return tlsRead(buf, cap, timeoutMs);
+      return tlsReadUart(buf, cap, timeoutMs);
     }
     // the data-ready notice: "+CCHEVENT: 0,RECV EVENT" on this SIM7600G (car 26.10.2026), as the
     // FreematicsPlus inbound() pattern "RECV EVENT"; "+CCHRECV: 0,<n>" on other firmware (p45)
@@ -748,7 +814,7 @@ int CellLink::tlsRead(uint8_t* buf, int cap, unsigned int timeoutMs)
   char c[40];
   snprintf(c, sizeof(c), "AT+CCHRECV=0,%d\r", cap);
   s_uart.print(c);
-  int got = 0, blocks = 0, err = -1;
+  int got = 0, blocks = 0, err = -1, over = 0;
   bool failed = false;
   ll = 0;
   uint32_t t = millis();
@@ -766,14 +832,17 @@ int CellLink::tlsRead(uint8_t* buf, int cap, unsigned int timeoutMs)
     if (d) {                                   // "<id>,<len>" (the manual also shows "DATA, <id>")
       char* q = strchr(d + 15, ',');
       int n = q ? atoi(q + 1) : 0, r = 0;
+      m_annBytes += n;
       uint32_t tb = millis();
       while (r < n && millis() - tb < 5000) {
         if (!s_uart.available()) { delay(1); continue; }
         int b = s_uart.read();
         if (got < cap) buf[got++] = (uint8_t)b;
+        else over++;
         r++;
         tb = millis();
       }
+      if (r < n) tlsLost("block", n - r);      // PG-p21: the block did not come whole in 5 s
       blocks++;
       continue;
     }
@@ -786,16 +855,19 @@ int CellLink::tlsRead(uint8_t* buf, int cap, unsigned int timeoutMs)
              failed ? " ERROR" : "", closed ? " closed" : "");
     diag(tt);
   }
+  if (over) tlsLost("cap", over);              // PG-p21: more than asked for - did not fit
+  if (m_lostWhere) { unlock(); return -2; }
   if (got > 0) { m_moreData = got >= cap; unlock(); return got; }
   unlock();
   if (closed) return 0;
   if (millis() - t0 >= timeoutMs) return -1;
-  return tlsRead(buf, cap, timeoutMs - (millis() - t0));   // nothing yet: wait for the next notice
+  return tlsReadUart(buf, cap, timeoutMs - (millis() - t0));   // nothing yet: wait for the next notice
 }
 
 void CellLink::tlsClose()
 {
   lock();
+  m_tlsOn = false;                             // what comes after the caller stopped reading is not lost
   at("AT+CCHCLOSE=0\r", 3000, "+CCHCLOSE:");
   at("AT+CCHSTOP\r", 3000);
   unlock();
@@ -1003,6 +1075,7 @@ void CellLink::muxFrame()
     if (m_binLeft > 0) {                           // a pushed +CCHRECV: DATA block (raw bytes)
       portENTER_CRITICAL(&m_spin);
       if (m_pushLen < (int)sizeof(m_push)) m_push[m_pushLen++] = c;
+      else m_pushDrop++;                           // PG-p21: did not fit - counted, tlsRead reports it
       portEXIT_CRITICAL(&m_spin);
       m_binLeft--;
       continue;
@@ -1037,6 +1110,7 @@ void CellLink::portLine(int ch, char* line)
     int n = q ? atoi(q + 1) : 0;
     portENTER_CRITICAL(&m_spin);
     if (m_pushPos >= m_pushLen) m_pushPos = m_pushLen = 0;
+    if (n > 0) m_annBytes += n;                    // PG-p21: announced
     portEXIT_CRITICAL(&m_spin);
     m_binLeft = n;
   }
@@ -1139,18 +1213,27 @@ int CellLink::tlsReadMux(uint8_t* buf, int cap, unsigned int timeoutMs)
   bool closed = m_peerClosed;
   m_recvEvent = false;
   m_recvEnd = false;
-  int flushed = 0;                           // p75: bytes left on port 2 - lost data, reported
-  while (linkAvail()) { linkRead(); flushed++; }
+  // p75: bytes left on port 2 are thrown away; PG-p21: if they hold a data block the session is lost.
+  // Their text once per session - 4.11.2026 every read flushed 27 bytes of unknown content.
+  char ftxt[44];
+  int flushed = linkFlush("flush", ftxt, sizeof(ftxt));
   if (flushed && diag && m_diagFlush < 16) {
     m_diagFlush++;
     char tf[48];
     snprintf(tf, sizeof(tf), "CCH FLUSHED %d", flushed);
     diag(tf);
   }
+  if (flushed && diag && !m_flushTxtDone) {
+    m_flushTxtDone = true;
+    char tf[64];
+    diagText(tf, sizeof(tf), "CCH FLUSH TXT ", ftxt);
+    diag(tf);
+  }
+  if (m_lostWhere) { unlock(); return -2; }
   char c[40];
   snprintf(c, sizeof(c), "AT+CCHRECV=0,%d\r", cap);
   linkWrite((const uint8_t*)c, strlen(c));
-  int got = 0, blocks = 0, err = -1;
+  int got = 0, blocks = 0, err = -1, over = 0;
   bool failed = false;
   char line[96];
   int ll = 0;
@@ -1172,22 +1255,29 @@ int CellLink::tlsReadMux(uint8_t* buf, int cap, unsigned int timeoutMs)
     if (d) {
       char* q = strchr(d + 15, ',');
       int n = q ? atoi(q + 1) : 0, r = 0;
+      m_annBytes += n;
       uint32_t tb = millis();
       while (r < n && millis() - tb < 5000) {
         int b = linkRead();
         if (b < 0) { delay(1); continue; }
         if (got < cap) buf[got++] = (uint8_t)b;
+        else over++;
         r++;
         tb = millis();
       }
+      if (r < n) tlsLost("block", n - r);      // PG-p21: the block did not come whole in 5 s
       blocks++;
       continue;
     }
     if (!strncmp(line, "+CCHRECV: 0,", 12)) { err = atoi(line + 12); break; }
   }
+  if (over) tlsLost("cap", over);              // PG-p21: more than asked for - did not fit
   for (uint32_t tw = millis(); m_binLeft > 0 && millis() - tw < 2000;) delay(2);   // a block still arriving on port 3
+  if (m_binLeft > 0) tlsLost("push", m_binLeft);   // PG-p21: the port-3 block did not come whole in 2 s
   portENTER_CRITICAL(&m_spin);
   int pushed = m_pushLen - m_pushPos;
+  // PG-p21: data on port 2 AND port 3 in one read - their order cannot be checked
+  bool both = got > 0 && pushed > 0;
   if (got == 0 && pushed > 0) {
     int n = pushed < cap ? pushed : cap;
     memcpy(buf, m_push + m_pushPos, n);
@@ -1202,6 +1292,8 @@ int CellLink::tlsReadMux(uint8_t* buf, int cap, unsigned int timeoutMs)
              failed ? " ERROR" : "", closed ? " closed" : "");
     diag(tt);
   }
+  if (both) tlsLost("order", pushed);
+  if (m_lostWhere) { unlock(); return -2; }
   if (got > 0) { m_moreData = got >= cap; unlock(); return got; }
   unlock();
   if (closed) return 0;

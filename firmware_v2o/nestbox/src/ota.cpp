@@ -237,6 +237,18 @@ static String urlBuild()
   return s;
 }
 
+// PG-p21: the modem session lost bytes (CellLink::tlsLostWhere) - one status line, true = lost.
+// why: 4.11.2026 boot 157 a 1024-byte block vanished unnoticed (ERR=SHA256 after the resume)
+static bool cellLost(CellLink* cell, const char* what, size_t at)
+{
+  if (!cell || !cell->tlsLostWhere()) return false;
+  char m[64];
+  snprintf(m, sizeof(m), "OTA-PULL ERR=LOST %s %s %d @%u", what, cell->tlsLostWhere(), cell->tlsLostBytes(),
+           (unsigned)at);
+  otaLog(m);
+  return true;
+}
+
 // -------------------------------------------------------------- check ---
 static bool fileHasMark(const char* path)
 {
@@ -294,7 +306,9 @@ static void check()
     return;
   }
   String body = readAll(c);
+  bool metaLost = cellLost(cell, "meta", body.length());   // PG-p21: not a NO_UPDATE - the answer is cut
   c.stop();
+  if (metaLost) return;
   if (body.indexOf("\"available\": true") < 0 && body.indexOf("\"available\":true") < 0) {
     otaLog("OTA-PULL NO_UPDATE");
     s_retries = 0;
@@ -374,6 +388,14 @@ static void check()
       written += n;
       lastStep("OTA download %u/%u", (unsigned)written, (unsigned)size);
     }
+  }
+  // PG-p21: a read with lost bytes was not written (CellLink::tlsRead -2), so the file holds only good
+  // bytes and the resume below continues from them. The byte count shows a loss no spot reported.
+  cellLost(cell, "fw", written);
+  if (cell) {
+    snprintf(m, sizeof(m), "OTA-PULL BYTES ann=%u got=%u", (unsigned)cell->tlsAnnounced(),
+             (unsigned)cell->tlsDelivered());
+    otaLog(m);
   }
   c.stop();
   sdLock(); out.close(); sdUnlock();

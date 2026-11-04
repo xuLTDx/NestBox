@@ -88,8 +88,18 @@ public:
   // NOT TESTED on the module: the data link itself (NETOPEN) did not come up on USB power.
   bool tlsOpen(const char* host, uint16_t port);
   bool tlsSend(const char* data, int len);
-  int tlsRead(uint8_t* buf, int cap, unsigned int timeoutMs);   // >0 bytes, 0 closed, -1 timeout
+  int tlsRead(uint8_t* buf, int cap, unsigned int timeoutMs);   // >0 bytes, 0 closed, -1 timeout, -2 lost
   void tlsClose();
+  // PG-p21 (4.11.2026): no byte of the HTTPS answer is lost silently. why: Peugeot 4.11 boot 157 - the
+  // OTA server sent all 1166048 bytes (server log 06:08:36-06:16:01), the box got 1165024: one 1024-byte
+  // block vanished without any notice, the resume fetched only the last 1024 bytes -> ERR=SHA256 and the
+  // whole 8 min download again. Every spot that throws modem bytes away now marks the session lost:
+  // the read where it happened is dropped whole and tlsRead() returns -2 until the next tlsOpen(), so
+  // the caller's file holds only good bytes (the resume continues from there).
+  const char* tlsLostWhere() const { return m_lostWhere; }   // nullptr = nothing lost
+  int tlsLostBytes() const { return m_lostBytes; }           // 0 = count unknown
+  uint32_t tlsAnnounced() const { return m_annBytes; }       // bytes the modem announced (DATA,<n>)
+  uint32_t tlsDelivered() const { return m_gotBytes; }       // bytes tlsRead() handed over
   // HTTPS diagnostics (p42, 2026-10-26: OTA over cellular ended with META_HTTP0) - the modem's
   // AT+CCH* answers into the record (PID 0x399); set by ota.cpp, nullptr = none
   void (*diag)(const char*) = nullptr;
@@ -157,6 +167,17 @@ private:
   void nmeaLine(const char* line);
   void startGnss();
   int tlsReadMux(uint8_t* buf, int cap, unsigned int timeoutMs);
+  int tlsReadUart(uint8_t* buf, int cap, unsigned int timeoutMs);
+  // PG-p21 loss tracking (see tlsLostWhere above)
+  bool m_tlsOn = false;                        // a CCH session is open (tlsOpen OK .. tlsClose)
+  const char* volatile m_lostWhere = nullptr;
+  int m_lostBytes = 0;
+  uint32_t m_annBytes = 0, m_gotBytes = 0, m_rx2LostAt = 0, m_pushDropAt = 0;
+  volatile uint32_t m_pushDrop = 0;            // port-3 push bytes that did not fit into m_push
+  bool m_flushTxtDone = false;                 // "CCH FLUSH TXT" sent once per session
+  void tlsLost(const char* where, int bytes);
+  int linkFlush(const char* where, char* txt = nullptr, int txtCap = 0);
+  void ansCheck();
   int m_diagRecv = 0;
   int m_diagFlush = 0;                         // p75: "CCH FLUSHED n" lines sent
   bool m_moreData = false;   // the last AT+CCHRECV filled the buffer: read again without a new notice
