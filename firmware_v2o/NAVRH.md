@@ -173,3 +173,69 @@ Kód sa podľa tejto tabuľky NEMENÍ bez rozhodnutia.
 Poradie podľa dopadu: **K1+K2+K3 (p69)** → K13 (D5) → K11 (s p69) → K12.
 
 **Stav 27.10.2026 večer:** K1 (len CMUX, bez PPP – PPP nie je v Arduino-ESP32 2.0.14: `sdkconfig.h` bez `CONFIG_LWIP_PPP_SUPPORT`, `pppapi.c.obj` bez symbolov), K2, K3, K11 = p69 (b68095a); K12 + K13 (fw 17:01:25). Všetko zverejnené na OTA, v aute NEOVERENÉ.
+
+## 9. Dokončenie K1: dáta cez modem = CMUX + PPP, Arduino 3 (PG42, 2026-11-05 – NÁVRH na schválenie)
+
+**Prečo.** K1 (r. 157) od začiatku hovorí: OVMS = CMUX **+ PPP + lwIP**, kód CCH a AT sokety preč. 27.10. sa pri p69
+spravila len polovica (r. 175: PPP nie je v Arduino-ESP32 2.0.14) – dáta ostali cez AT príkazy na porte 2. Dôsledky
+(overené): 4.11. boot 157 aj boot 164 sa pri OTA cez modem stratil presne jeden 1024 B blok (`ERR=RECV …/…` o 1024
+menej → `ERR=SHA256` → celé sťahovanie znova); modem pri HTTPS cez CMUX mieša porty oproti vlastnému manuálu
+(`+CCHEVENT: 0,RECV EVENT` prišiel na port 2, manuál SSL 2.3.2 = URC → s `+CATR=6` port 3; manuály v
+`/home/claude/transfer/SIMCom`); OVMS3 CCH cez CMUX nikdy nepoužíva (žiadne `CCH*`/`CIP*` v `components/`).
+
+**Framework: Arduino 3.3.11 / ESP-IDF 5.5** (pioarduino `55.03.311`), nie ESP-IDF 4.4 s PPP:
+- ESP-IDF 4.4 je od júla 2024 bez opráv chýb aj bezpečnosti (poznámky k v4.4.8); 5.5 vyšlo 21.7.2025, podpora 30 mesiacov.
+- PPP z lwIP je v Arduine 3 predkompilované (`CONFIG_LWIP_PPP_SUPPORT=y`, `liblwip.a`: `pppapi_pppos_create`,
+  `pppos_input_tcpip`, `ppp_connect`) – bežný build, bez vlastného ESP-IDF.
+- Náš kód sa preložil (vetva `try/ppp-framework`, `/home/claude/Claude/nestbox_try`) – zmeny len: mená SHA-256 v mbedtls
+  (`ota.cpp`), zápis cache PSRAM `esp_psram_extram_writeback_cache` (`txqueue.cpp`).
+- Fronta v PSRAM cez reštart: Arduino 3 testuje PSRAM cez ten istý háčik `testSPIRAM()` (máme vlastný, horných 64 KB),
+  ESP-IDF 5.5 nuluje PSRAM len pri `SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY` (vypnuté) – zo zdrojákov; na boxe NEOVERENÉ.
+- Standby: ULP FSM zapnutý, staré ADC API (`adc1_ulp_enable`) ešte je (deprecated) – `standby.cpp` sa preložil bez zmeny.
+- OTA zo starého na nový: zavádzač z ESP-IDF 4.4 spustí aplikáciu z 5.x, ak nie je
+  `CONFIG_ESP_SYSTEM_ESP32_SRAM1_REGION_AS_IRAM` (Espressif „Bootloader“; v Arduine 3 vypnuté); oddiel 4 MB, firmvér ~1,28 MB;
+  rollback: obe jadrá potvrdia aplikáciu hneď pri štarte (`esp32-hal-misc.c`). Výrobca radí skúšať so zavádzačom, ktorý je
+  na boxe → **prvé nahranie na boxe s prístupom k USB**.
+- Build v2O dostane vlastný adresár PlatformIO (`[platformio] core_dir`) – dôvod: 5.11. pri skúške platforma Arduina 3 v
+  spoločnom `~/.platformio` prepísala balík 2.0.14, ktorý používa aj v1F (`firmware_v5`).
+- `esp_modem`/knižnica `PPP` z Arduina 3 sa **nepoužije**: `esp_modem` 2.0.2 má `MAX_TERMINALS_NUM = 2` (len príkazy +
+  dáta), poloha by nemala vlastný kanál. Ide sa cestou OVMS: vlastný CMUX (už máme) + `pppos` z lwIP.
+
+**Kanály CMUX** (ako OVMS `simcom_7600.h:47-51`):
+
+| kanál | dnes | po zmene | prečo |
+|---|---|---|---|
+| 1 | NMEA + príkazy GPS | bez zmeny | K2, PG-p19 |
+| 2 | všetky AT príkazy, UDP `CIP*`, HTTPS `CCH*` | **len PPP** (`AT+CGDCONT=1,"IP","<apn>";+CGDATA="PPP",1` → `CONNECT` → lwIP) | na dátovom kanáli nikdy AT text → nie je čo miešať (OVMS `ovms_cellular.cpp:1008-1016, 1136-1149`) |
+| 3 | hlásenia (URC) | hlásenia + stavové príkazy každých 10 s (`+CREG?;+CEREG?;+CSQ`) | OVMS `simcom_7600.cpp:127`; `+CSQ` už nie na dátovom kanáli |
+| 4 | `ATE0` | ostatné AT: SMS (`+CMGS`), GNSS cez AT keď NMEA nejde, APN, `AT=` z webu | OVMS kanál CMD |
+
+**Dáta.** IP robí ESP32 (lwIP) rovnako ako pri WiFi:
+- záznamy UDP: `CellLink` = to isté čo `WifiLink` (`NetworkUDP`), `up()` = PPP má IP; `netTask` bez zmeny (WiFi prvé);
+- OTA: jeden HTTPS kód (`NetworkClientSecure`) pre WiFi aj modem, `CellConn` a celé CCH preč; pokračovanie, SHA-256,
+  pravidlá flashu bez zmeny (K6). TCP stratený bajt pošle znova sám – strata bloku ako 4.11. nemôže prejsť potichu;
+- vzdialená diagnostika (neskôr): vlastné TCP/TLS spojenie na FleetNest cez tú istú IP (lwIP 16 socketov), modem sa nemení;
+- predvolená cesta: pri WiFi WiFi, inak PPP (prepínanie overiť na stole – NEOVERENÉ).
+
+**Obnova spojenia** (OVMS):
+- PPP spadne → nové pripojenie o 30 s (`gsmpppos.cpp:175-179`);
+- `+PPPD: DISCONNECTED` alebo strata registrácie → NetLoss: `AT+CGATT=0`, PPP stop, znova; 3 NetLoss po sebe → vypnúť a
+  zapnúť modem (`ovms_cellular.cpp:55, 721-751, 1041-1057`);
+- CMUX bez dobrého rámca 180 s → vypnúť a zapnúť modem (`:905-916`, máme od p69);
+- ostáva naše PG-p4: server neodpovedá 15 min → kontrola internetu → reštart modemu (kontrola cez socket).
+- CMUX sa nespustí → modem vypnúť a skúsiť znova (ako OVMS); stará cesta bez CMUX (`CELL_MUX=0`) **odpadne** – inak by
+  ostal kód CCH/CIP, teda znova polovica.
+
+**Čo odpadne:** CCH (`tlsOpen/tlsSend/tlsRead*`, PG-p21 sledovanie strát), AT sokety `CIP*` (`open/send/receive`,
+`netReopen`), čítanie AT textu z dátového kanála, cesta bez CMUX. **Ostane:** rámce CMUX, NMEA, SMS (kanál 4), štart a
+napájanie modemu (K11), APN logika (`nbApnPick`, skúšobné APN), fronta s ACK, SD, OTA logika.
+
+**Poradie a overenie (každý krok pred ďalším):**
+1. Arduino 3 bez zmeny funkcie (len prechod): na stole – štart, fronta v PSRAM cez reštart (`TEST_TXQ`), standby/ULP
+   prebudenie, WiFi, OTA cez WiFi, 11 varovaní `snprintf` opraviť (nie vypnúť). Prvé nahranie na boxe s USB:
+   **nový box OVMS (podľa používateľa 5.11. na colnici, príde o 4–5 dní), na stole s laboratórnym 12 V zdrojom** –
+   modem tak pôjde aj na stole (r. 95: na USB napájaní nemusí naštartovať). VXQH2SY2 v aute ostáva na 2.0.14
+   (`Nov  4 2026 16:25:01`), Arduino 3 naň cez OTA až po krokoch 1 a 2 na novom boxe.
+2. PPP: na stole – PPP hore, záznamy UDP, OTA cez modem 3× celé so SHA OK, výpadok siete (anténa) → obnova, prepínanie
+   WiFi ↔ modem, SMS tam aj späť, poloha NMEA.
+3. Auto: jazda s OTA cez modem; medzery v zázname > 2 s žiadne; SD = DB ok.
