@@ -2,8 +2,9 @@
 #include "standby.h"
 #include <WiFi.h>
 #include <esp_sleep.h>
-#include <driver/adc.h>
 #include <esp32/ulp.h>
+#include <ulp_adc.h>
+#include "esp32-hal-periman.h"
 #include <soc/rtc.h>
 #include <soc/sens_reg.h>
 #include "canbus1.h"
@@ -109,9 +110,20 @@ static bool ulpStart(uint16_t thrX4)
   RTC_SLOW_MEM[ULP_LAST] = 0;
   RTC_SLOW_MEM[ULP_RUNS] = 0; RTC_SLOW_MEM[ULP_MIN] = 0xFFFF; RTC_SLOW_MEM[ULP_MAX] = 0;
   RTC_SLOW_MEM[ULP_OVER] = 0; RTC_SLOW_MEM[ULP_NRDY] = 0; RTC_SLOW_MEM[ULP_WAKES] = 0;
-  adc1_config_width(ADC_WIDTH_BIT_12);
-  adc1_config_channel_atten(ADC1_CHANNEL_0, ADC_ATTEN_DB_11);   // as analogRead (Arduino default 11 dB)
-  adc1_ulp_enable();
+  // Arduino 3 / ESP-IDF 5.5 (NAVRH 9, 2026-11-05): the old adc1_config_* / adc1_ulp_enable (driver/adc.h) is the
+  // legacy ADC driver - linked together with the new one of analogRead() ESP-IDF stops the chip at boot
+  // ("CONFLICT! driver_ng is not allowed to be used with the legacy driver", adc_legacy.c:906-921). ulp_adc_init()
+  // gives ADC1 to the ULP through the new driver; ADC1 must be free first: analogRead(36) holds it until the pin is
+  // released (perimanClearPinBus -> adcDetachBus deletes the unit, esp32-hal-adc.c:82-101). Same input and scale as
+  // before: ADC1 channel 0 (GPIO 36), 12 bit, 11 dB (= ADC_ATTEN_DB_12 in ESP-IDF 5, the same setting renamed).
+  perimanClearPinBus(36);
+  ulp_adc_cfg_t acfg = {};
+  acfg.adc_n = ADC_UNIT_1;
+  acfg.channel = ADC_CHANNEL_0;
+  acfg.atten = ADC_ATTEN_DB_12;
+  acfg.width = ADC_BITWIDTH_12;
+  acfg.ulp_mode = ADC_ULP_MODE_FSM;
+  if (ulp_adc_init(&acfg) != ESP_OK) return false;
   if (ulp_process_macros_and_load(ULP_PROG, prog, &n) != ESP_OK) return false;
   ulp_set_wakeup_period(0, STANDBY_ULP_PERIOD_US);
   if (ulp_run(ULP_PROG) != ESP_OK) return false;
@@ -325,8 +337,9 @@ static bool ulpMeasure(unsigned* sum, uint32_t* raw)   // false = the ULP did no
   delay(250);                          // a run in progress ends
   *sum = RTC_SLOW_MEM[ULP_LAST] & 0xFFFF;
   esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ULP);
+  ulp_adc_deinit();                    // ADC1 back to analogRead (it takes the unit again at the next call)
   *raw = 0;
-  for (int i = 0; i < 4; i++) *raw += analogRead(36);  // adc1_get_raw: the ADC back from the ULP
+  for (int i = 0; i < 4; i++) *raw += analogRead(36);
   return true;
 }
 

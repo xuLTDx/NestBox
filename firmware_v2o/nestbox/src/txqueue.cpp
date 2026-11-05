@@ -12,8 +12,12 @@
 #include <stdarg.h>
 #include "sddigest.h"
 #include "txqueue.h"
-#include "esp32/spiram.h"   // esp_spiram_writeback_cache()
+// esp_spiram_writeback_cache() of ESP-IDF 4.4 is esp_psram_extram_writeback_cache() in ESP-IDF 5
+// (esp_psram/include/esp_private/esp_psram_extram.h - declared here: that header clashes with the Arduino
+// core's C++ declaration of esp_psram_extram_test)
+extern "C" void esp_psram_extram_writeback_cache(void);
 #include "esp_system.h"     // esp_register_shutdown_handler()
+#include "soc/soc.h"        // SOC_EXTRAM_DATA_LOW
 
 extern nvs_handle_t nvs;
 void sdLock();    // telestore.cpp - the SD card is shared with the logger
@@ -25,10 +29,12 @@ void sdUnlock();
 // measured 2026-09-26: 12 % of the reserve destroyed by each restart, 0 %
 // with the test skipped. Test the top 64 KB instead: the queue reserve is the
 // first PSRAM allocation, at the bottom. A failing chip is still caught here
-// and by esp_spiram_init() itself (the core then runs without PSRAM).
+// and by esp_psram_init() itself (the core then runs without PSRAM).
+// Arduino 3 / ESP-IDF 5.5 (2026-11-05, read in the sources): psramInit() still calls this weak hook
+// (esp32-hal-psram.c:46, 83); ESP-IDF clears PSRAM only with SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY (off).
 extern "C" bool testSPIRAM(void)
 {
-  volatile uint32_t* p = (volatile uint32_t*)(0x3F800000 + 0x400000 - 0x10000);
+  volatile uint32_t* p = (volatile uint32_t*)(SOC_EXTRAM_DATA_LOW + 0x400000 - 0x10000);   // soc.h: 0x3F800000
   const int n = 0x10000 / 4;
   for (int i = 0; i < n; i++) p[i] = (uint32_t)i * 2654435761u;
   for (int i = 0; i < n; i++) {
@@ -141,7 +147,7 @@ static void unlock() { if (s_mux) xSemaphoreGiveRecursive(s_mux); }
 // every change of the reserve, and by a shutdown handler for any esp_restart().
 static void persist()
 {
-  if (s_psram) esp_spiram_writeback_cache();
+  if (s_psram) esp_psram_extram_writeback_cache();
 }
 
 static uint32_t crc32b(uint32_t crc, const uint8_t* p, int n)

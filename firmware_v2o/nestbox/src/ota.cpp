@@ -354,12 +354,12 @@ static void check()
   if (!out) { otaLog("OTA-PULL ERR=SD_OPEN"); return; }
   mbedtls_sha256_context ctx;
   mbedtls_sha256_init(&ctx);
-  mbedtls_sha256_starts_ret(&ctx, 0);
+  mbedtls_sha256_starts(&ctx, 0);
   if (from) {                                 // the bytes already on SD
     sdLock();
     File rf = SD.open(OTA_PENDING_PATH, FILE_READ);
     int n;
-    while (rf && (n = rf.read(s_buf, OTA_CHUNK)) > 0) mbedtls_sha256_update_ret(&ctx, s_buf, n);
+    while (rf && (n = rf.read(s_buf, OTA_CHUNK)) > 0) mbedtls_sha256_update(&ctx, s_buf, n);
     if (rf) rf.close();
     sdUnlock();
     snprintf(m, sizeof(m), "OTA-PULL RESUME from %u", (unsigned)from);
@@ -372,7 +372,7 @@ static void check()
   uint32_t t0 = millis();
   if (code == 200 && from) {                  // no Range support: start over
     sdLock(); out.close(); out = SD.open(OTA_PENDING_PATH, FILE_WRITE); sdUnlock();
-    mbedtls_sha256_free(&ctx); mbedtls_sha256_init(&ctx); mbedtls_sha256_starts_ret(&ctx, 0);
+    mbedtls_sha256_free(&ctx); mbedtls_sha256_init(&ctx); mbedtls_sha256_starts(&ctx, 0);
     written = 0;
   }
   if (code == 200 || code == 206) {
@@ -384,7 +384,7 @@ static void check()
       bool ok = out.write(s_buf, n) == (size_t)n;
       sdUnlock();
       if (!ok) break;
-      mbedtls_sha256_update_ret(&ctx, s_buf, n);
+      mbedtls_sha256_update(&ctx, s_buf, n);
       written += n;
       lastStep("OTA download %u/%u", (unsigned)written, (unsigned)size);
     }
@@ -409,7 +409,7 @@ static void check()
     return;
   }
   uint8_t dig[32];
-  mbedtls_sha256_finish_ret(&ctx, dig);
+  mbedtls_sha256_finish(&ctx, dig);
   mbedtls_sha256_free(&ctx);
   char hex[65];
   for (int i = 0; i < 32; i++) sprintf(hex + 2 * i, "%02x", dig[i]);
