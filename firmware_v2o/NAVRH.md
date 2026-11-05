@@ -207,8 +207,8 @@ menej → `ERR=SHA256` → celé sťahovanie znova); modem pri HTTPS cez CMUX mi
 |---|---|---|---|
 | 1 | NMEA + príkazy GPS | bez zmeny | K2, PG-p19 |
 | 2 | všetky AT príkazy, UDP `CIP*`, HTTPS `CCH*` | **len PPP** (`AT+CGDCONT=1,"IP","<apn>";+CGDATA="PPP",1` → `CONNECT` → lwIP) | na dátovom kanáli nikdy AT text → nie je čo miešať (OVMS `ovms_cellular.cpp:1008-1016, 1136-1149`) |
-| 3 | hlásenia (URC) | hlásenia + stavové príkazy každých 10 s (`+CREG?;+CEREG?;+CSQ`) | OVMS `simcom_7600.cpp:127`; `+CSQ` už nie na dátovom kanáli |
-| 4 | `ATE0` | ostatné AT: SMS (`+CMGS`), GNSS cez AT keď NMEA nejde, APN, `AT=` z webu | OVMS kanál CMD |
+| 3 | hlásenia (URC) | len hlásenia (`+CATR=6`), z nich `+PPPD: DISCONNECTED` | OVMS `ovms_cellular.cpp:1146-1149` |
+| 4 | `ATE0` | všetky ostatné AT: registrácia `+CREG?/+CEREG?` každých 30 s, `+CSQ` každých 10 s (PG-p19), SMS, GNSS cez AT keď NMEA nejde, `AT=` z webu | OVMS kanál CMD; pri kódovaní 5.11. **zmena oproti PG42**: stavové príkazy nie na 3, ale na 4 – jeden kanál pre všetky odpovede AT (na 3 sú len hlásenia), interval registrácie 30 s ako OVMS (`m_state1_ticker % 30`) |
 
 **Dáta.** IP robí ESP32 (lwIP) rovnako ako pri WiFi:
 - záznamy UDP: `CellLink` = to isté čo `WifiLink` (`NetworkUDP`), `up()` = PPP má IP; `netTask` bez zmeny (WiFi prvé);
@@ -223,6 +223,8 @@ menej → `ERR=SHA256` → celé sťahovanie znova); modem pri HTTPS cez CMUX mi
   zapnúť modem (`ovms_cellular.cpp:55, 721-751, 1041-1057`);
 - CMUX bez dobrého rámca 180 s → vypnúť a zapnúť modem (`:905-916`, máme od p69);
 - ostáva naše PG-p4: server neodpovedá 15 min → kontrola internetu → reštart modemu (kontrola cez socket).
+- strata PPP sa zistí z hlásení modemu (`+PPPD: DISCONNECTED`, `NO CARRIER` na porte 2) a zo straty registrácie –
+  LCP echo v lwIP Arduina 3 nie je (`CONFIG_LWIP_ENABLE_LCP_ECHO` vypnuté); zvyšok chytí PG-p4 (15 min bez servera);
 - CMUX sa nespustí → modem vypnúť a skúsiť znova (ako OVMS); stará cesta bez CMUX (`CELL_MUX=0`) **odpadne** – inak by
   ostal kód CCH/CIP, teda znova polovica.
 
@@ -232,10 +234,14 @@ napájanie modemu (K11), APN logika (`nbApnPick`, skúšobné APN), fronta s ACK
 
 **Poradie a overenie (každý krok pred ďalším):**
 1. Arduino 3 bez zmeny funkcie (len prechod): na stole – štart, fronta v PSRAM cez reštart (`TEST_TXQ`), standby/ULP
-   prebudenie, WiFi, OTA cez WiFi, 11 varovaní `snprintf` opraviť (nie vypnúť). Prvé nahranie na boxe s USB:
+   prebudenie, WiFi, OTA cez WiFi. Varovania `snprintf` (11, len pri builde ESP-IDF): zámerné skrátenie stavových
+   riadkov na 56 znakov, len buffre čísel `telemetry.cpp` (REFUEL) boli malé – zväčšené. Prvé nahranie na boxe s USB:
    **nový box OVMS (podľa používateľa 5.11. na colnici, príde o 4–5 dní), na stole s laboratórnym 12 V zdrojom** –
    modem tak pôjde aj na stole (r. 95: na USB napájaní nemusí naštartovať). VXQH2SY2 v aute ostáva na 2.0.14
    (`Nov  4 2026 16:25:01`), Arduino 3 naň cez OTA až po krokoch 1 a 2 na novom boxe.
 2. PPP: na stole – PPP hore, záznamy UDP, OTA cez modem 3× celé so SHA OK, výpadok siete (anténa) → obnova, prepínanie
    WiFi ↔ modem, SMS tam aj späť, poloha NMEA.
+   Cesta prechodu ako v aute: nový box najprv cez USB build **2.0.14** (zavádzač ESP-IDF 4.4 ako VXQH2SY2), potom cez
+   **OTA** na Arduino 3 – overí štart aplikácie 5.5 so starým zavádzačom (Espressif: skúšať so zavádzačom z výroby).
+   Kód krokov 1 + 2: vetva `v2o-arduino3` (`/home/claude/Claude/nestbox_a3`), zbuildovaný 5.11., na boxe NEOVERENÝ.
 3. Auto: jazda s OTA cez modem; medzery v zázname > 2 s žiadne; SD = DB ok.

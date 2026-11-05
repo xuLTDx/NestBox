@@ -1,12 +1,24 @@
-// SIM7600G - see cellmodem.h (sources, untested state)
+// SIM7600G - see cellmodem.h (sources, NAVRH 9 PPP)
 #include "cellmodem.h"
 #include "max7317.h"
 #include "hw.h"
 #include <sys/time.h>
 #include <time.h>
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <lwip/netif.h>
+#include <lwip/dns.h>
+#include <lwip/ip_addr.h>
+#include <netif/ppp/pppapi.h>
+#include <netif/ppp/pppos.h>
 
 static HardwareSerial s_uart(1);
 static void muxReaderTask(void* p) { ((CellLink*)p)->muxLoop(); }
+static struct netif s_pppNetif;              // the PPP interface in lwIP (one, reused for every dial)
+static WiFiUDP s_udp;                        // NetworkUDP: lwIP socket, not tied to WiFi (Arduino 3 WiFiUdp.h:3)
+static IPAddress s_srvIp;
+static uint16_t s_srvPort;
+static bool s_udpBegun;
 
 void CellLink::lock() { if (m_mux) xSemaphoreTakeRecursive(m_mux, portMAX_DELAY); }
 void CellLink::unlock() { if (m_mux) xSemaphoreGiveRecursive(m_mux); }
@@ -16,9 +28,12 @@ void CellLink::begin()
   if (m_mux) return;
   m_mux = xSemaphoreCreateRecursiveMutex();
   m_txLock = xSemaphoreCreateMutex();
-  m_rx2 = xStreamBufferCreate(8192, 1);
+  m_rx4 = xStreamBufferCreate(4096, 1);
   xTaskCreatePinnedToCore(muxReaderTask, "cmux", 4096, this, 6, &m_rdTask, 1);
-  s_uart.setRxBufferSize(4096);
+  s_uart.setRxBufferSize(8192);
+  // NAVRH 9: lwIP writes the PPP frames from its tcpip task (pppOutput) - with a TX buffer the UART write
+  // returns at once instead of blocking that task for the whole frame (1500 B at 115200 = ~130 ms)
+  s_uart.setTxBufferSize(4096);
   s_uart.begin(115200, SERIAL_8N1, HW_MODEM_RX, HW_MODEM_TX);
   mx7317Out(MX_MODEM_PWR, 0);          // key released (OVMS PwrKeyHigh = 0)
 }
@@ -28,18 +43,21 @@ void CellLink::setApn(const char* apn)
   strncpy(m_apn, apn ? apn : "", sizeof(m_apn) - 1);
 }
 
-// read until a or b appears (or timeout); m_buf holds what came
+// read until a or b appears (or timeout); m_buf holds what came. The answer of a command on port 4;
+// some answers come as URCs on port 3 (+CPIN, +CMTI ...) - those are in m_urc
 bool CellLink::waitFor(const char* a, const char* b, unsigned int timeoutMs)
 {
   uint32_t t = millis();
   do {
     while (linkAvail() && m_len < (int)sizeof(m_buf) - 1) {
-      m_buf[m_len++] = (char)linkRead();
+      int c = linkRead();
+      if (c < 0) break;
+      m_buf[m_len++] = (char)c;
       m_buf[m_len] = 0;
     }
     if (a && strstr(m_buf, a)) return true;
     if (b && strstr(m_buf, b)) return false;
-    if (m_muxOn && a) {                // CMUX: the answer can come as a URC on port 3 (+NETOPEN:, +CCHOPEN:)
+    if (m_muxOn && a) {
       bool hitA, hitB;
       portENTER_CRITICAL(&m_spin);
       hitA = strstr(m_urc, a) != nullptr;
@@ -56,7 +74,7 @@ bool CellLink::waitFor(const char* a, const char* b, unsigned int timeoutMs)
 bool CellLink::at(const char* cmd, unsigned int timeoutMs, const char* expect)
 {
   lock();
-  linkFlush("at");                      // stale bytes (URCs) are not this command's answer
+  linkFlush();                          // stale bytes are not this command's answer (port 4: no data ever)
   m_len = 0;
   m_buf[0] = 0;
   portENTER_CRITICAL(&m_spin);
@@ -65,7 +83,6 @@ bool CellLink::at(const char* cmd, unsigned int timeoutMs, const char* expect)
   portEXIT_CRITICAL(&m_spin);
   if (cmd) linkWrite((const uint8_t*)cmd, strlen(cmd));
   bool ok = waitFor(expect ? expect : "\r\nOK", "\r\nERROR", timeoutMs);
-  ansCheck();
   unlock();
   return ok;
 }
@@ -86,13 +103,14 @@ void CellLink::pressKey(int ms)
 bool CellLink::start()
 {
   begin();
-  m_netOpen = false;
-  m_sockOpen = false;
-  m_netLost = false;
-  m_netLostErr = 0;
+  m_pppUp = false;
+  m_pppLost = false;
+  m_pppErr = 0;
+  m_ipStr[0] = 0;
   snprintf(m_status, sizeof(m_status), "power");
   m_startStep = 0;
   m_startMs = 0;
+  if (m_muxOn) muxStop();              // a restart: the old CMUX session is gone with the power cycle
   if (!alive()) {
     // p79 (28.10.2026), times from SIM7600G Hardware Design V1.00 tables 8/9: PWRKEY >= 2.5 s powers a
     // running modem off - fully off (STATUS low) only after 25-26 s; 100-500 ms powers an off modem on,
@@ -117,19 +135,15 @@ bool CellLink::start()
     if (!alive()) { snprintf(m_status, sizeof(m_status), "no answer after power key"); return false; }
   }
   at("ATE0\r");
-  if (m_muxWanted && !m_muxOn) {
-    if (!muxStart()) {                 // the modem may be half in CMUX: off, then the old way
-      Serial.println("[CELL] CMUX failed - power off, start without CMUX");
-      muxStop();
-      pressKey(3000);
-      delay(5000);
-      m_muxWanted = false;
-      bool r = start();
-      m_muxWanted = true;              // next start tries CMUX again
-      return r;
-    }
+  // NAVRH 9: CMUX or nothing - the old single-UART path (AT sockets, CCH) is gone. A modem that does
+  // not take CMUX is switched off; cellTask starts it again (as OVMS: power cycle and retry).
+  if (!muxStart()) {
+    Serial.println("[CELL] CMUX failed - power off");
+    muxStop();
+    pressKey(3000);
+    snprintf(m_status, sizeof(m_status), "CMUX failed");
+    return false;
   }
-  if (!m_muxOn) at("AT+CATR=0\r");      // URCs on every port again (a +CATR=6 from a CMUX start may stay)
   startGnss();
   m_alive = true;
   at("ATI\r", 1000);
@@ -139,12 +153,7 @@ bool CellLink::start()
   if (!sim) { snprintf(m_status, sizeof(m_status), "SIM not ready"); return false; }
   snprintf(m_status, sizeof(m_status), "registering");
   bool reg = false;
-  for (uint32_t t = millis(); !reg && millis() - t < 90000; delay(1000)) {
-    if (at("AT+CREG?\r", 1000, "+CREG: 0,")) {
-      char* p = strstr(m_buf, "+CREG: 0,");
-      reg = p && (p[9] == '1' || p[9] == '5' || p[9] == '6');
-    }
-  }
+  for (uint32_t t = millis(); !reg && millis() - t < 90000; delay(1000)) reg = registered();
   if (!reg) { snprintf(m_status, sizeof(m_status), "not registered"); return false; }
   // what the modem itself has stored as APN (its own profile) - logged, not changed
   if (at("AT+CGDCONT?\r", 1000)) {
@@ -153,31 +162,18 @@ bool CellLink::start()
     if (p && e) { *e = 0; snprintf(m_cgdcont, sizeof(m_cgdcont), "%s", p + 9); }
     Serial.printf("[CELL] stored APN profile: %s\n", m_cgdcont);
   }
-  if (m_apn[0]) {
-    char c[80];
-    snprintf(c, sizeof(c), "AT+CGSOCKCONT=1,\"IP\",\"%s\"\r", m_apn);
-    at(c);
-  }
-  at("AT+CSOCKSETPN=1\r");
-  at("AT+CIPMODE=0\r");
-  // NETOPEN answers OK first, then "+NETOPEN: 0" (or "already opened")
-  at("AT+NETOPEN\r", 15000, "+NETOPEN:");
-  if (!strstr(m_buf, "+NETOPEN: 0") && !at("AT+NETOPEN?\r", 2000, "+NETOPEN: 1")) {
-    snprintf(m_status, sizeof(m_status), "NETOPEN failed");
-    return false;
-  }
-  at("AT+CIPRXGET=1\r");               // buffer mode before any socket (v1F, SIMCom manual 6.3.2)
-  m_netOpen = true;
-  snprintf(m_status, sizeof(m_status), "online");
-  Serial.println("[CELL] online");
+  // "PPP failed" = registered, but no data session: telemetry.cpp counts it for a trial APN (nbapn.h),
+  // as "NETOPEN failed" before NAVRH 9
+  if (!pppDial(30000)) { snprintf(m_status, sizeof(m_status), "PPP failed err=%d", m_pppErr); return false; }
+  snprintf(m_status, sizeof(m_status), "online ip=%s", m_ipStr);
+  Serial.printf("[CELL] online, PPP ip %s\n", m_ipStr);
   return true;
 }
 
 void CellLink::stop()
 {
+  pppClose();
   close();
-  m_netOpen = false;
-  if (!m_muxOn) at("AT+CGPS=0\r", 1000);
   if (m_muxOn) muxTxStr(1, "AT+CGPS=0\r");
   bool off = at("AT+CPOF\r", 3000);
   muxStop();
@@ -194,92 +190,179 @@ void CellLink::powerOff()
   unlock();
 }
 
-static void diagText(char* out, int cap, const char* prefix, const char* in);
+// ------------------------------------------------------------------ PPP (NAVRH 9) ---
+// As OVMS3 gsmpppos.cpp / ovms_cellular.cpp: the dial on the data port, then lwIP's PPPoS client.
 
-// p71: one UDP line - the answer on the data port (m_buf) and on port 3 (m_urc); after each
-// open the first 3 good and 12 bad results, so a working link does not flood
-void CellLink::udpNote(const char* what, bool ok)
+static u32_t pppOutCb(ppp_pcb*, const void* data, u32_t len, void* ctx)
 {
-  if (!udpDiag || (ok ? m_udpOk++ >= 3 : m_udpErr++ >= 12)) return;
-  char both[200], t[120];
-  portENTER_CRITICAL(&m_spin);
-  snprintf(both, sizeof(both), "%.*s U:%.*s", 100, m_buf, 80, m_urc);
-  portEXIT_CRITICAL(&m_spin);
-  diagText(t, sizeof(t), what, both);
-  udpDiag(t);
+  return ((CellLink*)ctx)->pppOutput((const uint8_t*)data, len);
 }
+
+static void pppStatusCb(ppp_pcb*, int err, void* ctx)
+{
+  ((CellLink*)ctx)->pppStatus(err);
+}
+
+// lwIP tcpip task: the PPP frame to the modem (OVMS GsmPPPOS_OutputCallback: mux->tx on the data channel)
+uint32_t CellLink::pppOutput(const uint8_t* data, uint32_t len)
+{
+  if (!m_muxOn || !m_pppMode) return 0;
+  muxTx(2, data, len);
+  return len;
+}
+
+// lwIP tcpip task: PPPERR_NONE = we have an IP (OVMS GsmPPPOS_StatusCallback); only flags here - the status
+// lines and the recovery run in cellTask (no SD / log calls from the tcpip task)
+void CellLink::pppStatus(int err)
+{
+  m_pppErr = err;
+  if (err == PPPERR_NONE) {
+    if (ip_addr_isany(&s_pppNetif.ip_addr) || ip_addr_isany(&s_pppNetif.gw)) return;   // OVMS: ignored
+    snprintf(m_ipStr, sizeof(m_ipStr), "%s", ipaddr_ntoa(&s_pppNetif.ip_addr));
+    for (int i = 0; i < 2; i++) {      // usepeerdns: lwIP set the peer's DNS servers - kept for makeDefault()
+      const ip_addr_t* d = dns_getserver(i);
+      m_dns[i] = (d && IP_IS_V4(d)) ? ip_2_ip4(d)->addr : 0;
+    }
+    m_pppLost = false;
+    m_pppUp = true;
+  } else {
+    bool was = m_pppUp;
+    m_pppUp = false;
+    if (was && err != PPPERR_USER) m_pppLost = true;   // not our own close
+  }
+  m_pppStatusSeen++;
+}
+
+bool CellLink::pppDial(uint32_t timeoutMs)
+{
+  lock();
+  m_pppMode = false;
+  m_dial = 0;
+  m_lineLen[2] = 0;
+  // OVMS NetStart (ovms_cellular.cpp:1008-1012): APN and the dial in one line on the data channel. Without our
+  // APN (CELL_APN empty) the modem's stored profile 1 is used.
+  char c[120];
+  if (m_apn[0]) snprintf(c, sizeof(c), "AT+CGDCONT=1,\"IP\",\"%s\";+CGDATA=\"PPP\",1\r", m_apn);
+  else snprintf(c, sizeof(c), "AT+CGDATA=\"PPP\",1\r");
+  muxTxStr(2, c);
+  uint32_t t = millis();
+  while (m_dial == 0 && millis() - t < timeoutMs) delay(20);
+  if (m_dial != 1) {
+    unlock();
+    Serial.printf("[CELL] PPP dial: %s\n", m_dial < 0 ? "refused" : "no CONNECT");
+    return false;
+  }
+  m_pppMode = true;                    // from here every port 2 byte goes to lwIP
+  ppp_pcb* p = (ppp_pcb*)m_ppp;
+  if (!p) {
+    p = pppapi_pppos_create(&s_pppNetif, pppOutCb, pppStatusCb, this);
+    m_ppp = p;
+  }
+  if (!p) { m_pppMode = false; unlock(); Serial.println("[CELL] pppos_create failed"); return false; }
+  ppp_set_auth(p, PPPAUTHTYPE_PAP, "", "");   // OVMS: PAP with the configured user/password (empty here)
+  ppp_set_usepeerdns(p, 1);                   // up to 2 DNS servers from the network (OVMS gsmpppos.cpp:244)
+  int seen = m_pppStatusSeen;
+  m_pppErr = 0;
+  pppapi_connect(p, 0);
+  t = millis();
+  while (!m_pppUp && m_pppStatusSeen == seen && millis() - t < timeoutMs) delay(20);
+  bool ok = m_pppUp;
+  unlock();
+  if (!ok) pppClose();
+  return ok;
+}
+
+// lwIP closes the PPP session (LCP terminate), the modem leaves the data mode (NO CARRIER on port 2)
+void CellLink::pppClose()
+{
+  ppp_pcb* p = (ppp_pcb*)m_ppp;
+  if (p && m_pppMode) {
+    int seen = m_pppStatusSeen;
+    pppapi_close(p, 0);
+    for (uint32_t t = millis(); m_pppStatusSeen == seen && millis() - t < 5000;) delay(20);
+    if (m_pppStatusSeen == seen) {     // no answer from the peer: close without the carrier
+      seen = m_pppStatusSeen;
+      pppapi_close(p, 1);
+      for (uint32_t t = millis(); m_pppStatusSeen == seen && millis() - t < 2000;) delay(20);
+    }
+  }
+  m_pppMode = false;
+  m_pppUp = false;
+}
+
+// OVMS NetLoss (ovms_cellular.cpp:721-751) -> NetWait (registration) -> NetStart (dial)
+bool CellLink::netRecover()
+{
+  bool had = m_pppMode;
+  pppClose();
+  lock();
+  m_pppLost = false;
+  if (had) at("AT+CGATT=0\r", 10000);  // OVMS: detach the PDP only when PPP had been connected
+  bool reg = false;
+  for (uint32_t t = millis(); !reg && millis() - t < 30000; delay(1000)) reg = registered();
+  bool ok = reg && pppDial(30000);
+  if (ok) snprintf(m_status, sizeof(m_status), "online ip=%s", m_ipStr);
+  else snprintf(m_status, sizeof(m_status), reg ? "PPP failed err=%d" : "not registered", m_pppErr);
+  unlock();
+  return ok;
+}
+
+// netTask chose the modem: lwIP's default route and DNS back to PPP (WiFi's DHCP may have changed both)
+void CellLink::makeDefault()
+{
+  ppp_pcb* p = (ppp_pcb*)m_ppp;
+  if (!p || !m_pppUp) return;
+  pppapi_set_default(p);
+  for (int i = 0; i < 2; i++) {
+    if (!m_dns[i]) continue;
+    ip_addr_t a;
+    IP_ADDR4(&a, 0, 0, 0, 0);
+    ip_2_ip4(&a)->addr = m_dns[i];
+    dns_setserver(i, &a);
+  }
+}
+
+// ---------------------------------------------------------- UDP over PPP (NetLink) ---
+// The same as WifiLink (netlink.cpp) - lwIP sends through the default route, which netTask sets to PPP
+// (makeDefault) when it uses the modem
 
 bool CellLink::open(const char* host, uint16_t port)
 {
-  if (!m_netOpen) return false;
-  lock();
-  m_udpOk = m_udpErr = 0;
-  char c[120];
-  snprintf(c, sizeof(c), "AT+CDNSGIP=\"%s\"\r", host);
-  if (at(c, 10000)) {                  // +CDNSGIP: 1,"host","1.2.3.4"
-    char* p = strstr(m_buf, host);
-    p = p ? strstr(p, ",\"") : nullptr;
-    if (p) {
-      p += 2;
-      char* q = strchr(p, '"');
-      if (q && q - p < (int)sizeof(m_ip)) { memcpy(m_ip, p, q - p); m_ip[q - p] = 0; }
-    }
-  }
-  if (!m_ip[0]) { udpNote("UDP DNS ERR ", false); unlock(); return false; }
-  m_port = port;
-  if (m_sockOpen) at("AT+CIPCLOSE=0\r", 2000);
-  at("AT+CIPRXGET=1\r");
-  snprintf(c, sizeof(c), "AT+CIPOPEN=0,\"UDP\",\"%s\",%u,8000\r", m_ip, port);
-  m_sockOpen = at(c, 3000);
-  if (!m_sockOpen) {                   // PG-p1: the error code (+CIPOPEN: 0,<err>) comes as a URC on port 3
-    waitFor("+CIPOPEN: 0,", nullptr, 500);
-    int err = -1;
-    portENTER_CRITICAL(&m_spin);
-    const char* p = strstr(m_urc, "+CIPOPEN: 0,");
-    if (p) err = atoi(p + 12);
-    portEXIT_CRITICAL(&m_spin);
-    if (err < 0) { const char* q = strstr(m_buf, "+CIPOPEN: 0,"); if (q) err = atoi(q + 12); }
-    if (err == 1 || err == 2) { m_netLostErr = err; m_netLost = true; }   // network failure / not opened
-  }
-  udpNote(m_sockOpen ? "UDP OPEN OK " : "UDP OPEN ERR ", m_sockOpen);
-  unlock();
-  return m_sockOpen;
+  if (!up()) return false;
+  IPAddress ip;
+  if (!WiFi.hostByName(host, ip)) return false;   // Arduino 3: NetworkManager::hostByName -> lwip_getaddrinfo
+  s_srvIp = ip;
+  s_srvPort = port;
+  if (!s_udpBegun) s_udpBegun = s_udp.begin(0);
+  return s_udpBegun;
 }
 
-// "+CPING: 3,<sent>,<recvd>,..." (the manual's example has no space after the colon) - recvd or -1
-static int pingSummary(const char* s)
+bool CellLink::send(const char* data, unsigned int len)
 {
-  for (const char* p = s ? strstr(s, "+CPING:") : nullptr; p; p = strstr(p + 7, "+CPING:")) {
-    const char* q = p + 7;
-    while (*q == ' ') q++;
-    if (q[0] != '3' || q[1] != ',') continue;
-    const char* r = strchr(q + 2, ',');
-    if (r) return atoi(r + 1);
-  }
-  return -1;
+  if (!up() || !s_udpBegun || !s_srvPort) return false;
+  if (!s_udp.beginPacket(s_srvIp, s_srvPort)) return false;
+  return s_udp.write((const uint8_t*)data, len) == len && s_udp.endPacket();
 }
 
-int CellLink::ping(const char* addr, int n)
+int CellLink::receive(char* buf, int cap, unsigned int timeoutMs)
 {
-  if (!m_netOpen || m_netLost) return -1;
-  char c[80];
-  snprintf(c, sizeof(c), "AT+CPING=\"%s\",1,%d,32,1000,10000,255\r", addr, n);
-  lock();
-  int got = -1;
-  if (at(c, 2000)) {                   // OK first, then one line per reply and the summary (type 3)
-    uint32_t t = millis();
-    while (got < 0 && millis() - t < 10000UL + n * 1000UL + 2000UL) {
-      waitFor("+CPING:", nullptr, 200);
-      portENTER_CRITICAL(&m_spin);
-      int u = pingSummary(m_urc);
-      portEXIT_CRITICAL(&m_spin);
-      got = u >= 0 ? u : pingSummary(m_buf);
-      if (got < 0) delay(50);
-    }
-  }
-  unlock();
-  return got;
+  if (!s_udpBegun) return 0;
+  uint32_t t = millis();
+  do {
+    int n = s_udp.parsePacket();
+    if (n > 0) return s_udp.read(buf, cap);
+    delay(1);
+  } while (millis() - t < timeoutMs);
+  return 0;
 }
+
+void CellLink::close()
+{
+  if (s_udpBegun) s_udp.stop();
+  s_udpBegun = false;
+}
+
+// ---------------------------------------------------------------- AT on port 4 ---
 
 bool CellLink::smsSend(const char* num, const char* text)
 {
@@ -287,7 +370,7 @@ bool CellLink::smsSend(const char* num, const char* text)
   lock();
   bool ok = at("AT+CMGF=1\r") && at("AT+CSCS=\"IRA\"\r");
   if (ok) {
-    linkFlush("sms");
+    linkFlush();
     m_len = 0;
     m_buf[0] = 0;
     portENTER_CRITICAL(&m_spin);
@@ -307,7 +390,6 @@ bool CellLink::smsSend(const char* num, const char* text)
       const uint8_t esc = 0x1B;                 // no prompt: cancel
       linkWrite(&esc, 1);
     }
-    ansCheck();
   }
   unlock();
   return ok;
@@ -391,104 +473,23 @@ void CellLink::netInfo(char* out, int cap)
   snprintf(out, cap, "%s %s", op, st == 1 ? "home" : st == 5 ? "roam" : st >= 0 ? (st == 2 ? "search" : "noreg") : "?");
 }
 
-bool CellLink::dnsOk(const char* host)
-{
-  if (!m_netOpen || m_netLost) return false;
-  char c[96];
-  snprintf(c, sizeof(c), "AT+CDNSGIP=\"%s\"\r", host);
-  return at(c, 10000, "+CDNSGIP: 1,");   // error: "+CDNSGIP: 0,<err>" + ERROR
-}
-
+// registered home (1) or roaming (5) - AT+CREG? as before, AT+CEREG? (LTE) as OVMS polls both
+// (simcom_7600.cpp:127); 6 = SMS only (home) kept from before
 bool CellLink::registered()
 {
-  if (!at("AT+CREG?\r", 1000, "+CREG: 0,")) return false;
-  char* p = strstr(m_buf, "+CREG: 0,");
-  return p && (p[9] == '1' || p[9] == '5' || p[9] == '6');
-}
-
-// PG-p1 (a): manual V3.00 11.4 - after NETWORK CLOSED UNEXPECTEDLY close the sockets, AT+NETCLOSE, then
-// AT+NETOPEN again; only when the modem is registered (no signal = no 15 s NETOPEN blocking the UART)
-bool CellLink::netReopen()
-{
   lock();
-  bool ok = false;
-  if (registered()) {
-    if (m_sockOpen) at("AT+CIPCLOSE=0\r", 2000);
-    m_sockOpen = false;
-    at("AT+NETCLOSE\r", 10000, "+NETCLOSE:");
-    at("AT+NETOPEN\r", 15000, "+NETOPEN:");
-    portENTER_CRITICAL(&m_spin);
-    ok = strstr(m_urc, "+NETOPEN: 0") != nullptr;
-    portEXIT_CRITICAL(&m_spin);
-    ok = ok || strstr(m_buf, "+NETOPEN: 0") || at("AT+NETOPEN?\r", 2000, "+NETOPEN: 1");
-    if (ok) {
-      at("AT+CIPRXGET=1\r");
-      m_netOpen = true;
-      m_netLostErr = 0;
-      m_netLost = false;
-    }
+  bool r = false;
+  if (at("AT+CREG?\r", 1000, "+CREG: 0,")) {
+    char* p = strstr(m_buf, "+CREG: 0,");
+    r = p && (p[9] == '1' || p[9] == '5' || p[9] == '6');
+  }
+  if (!r && at("AT+CEREG?\r", 1000, "+CEREG: ")) {
+    char* p = strstr(m_buf, "+CEREG: ");
+    char* q = p ? strchr(p, ',') : nullptr;
+    r = q && (q[1] == '1' || q[1] == '5');
   }
   unlock();
-  return ok;
-}
-
-bool CellLink::send(const char* data, unsigned int len)
-{
-  if (!m_sockOpen) return false;
-  lock();
-  linkFlush("udp");
-  m_len = 0;
-  m_buf[0] = 0;
-  portENTER_CRITICAL(&m_spin);
-  m_urcLen = 0;
-  m_urc[0] = 0;
-  portEXIT_CRITICAL(&m_spin);
-  char c[80];
-  int n = snprintf(c, sizeof(c), "AT+CIPSEND=0,%u,\"%s\",%u\r", len, m_ip, m_port);
-  linkWrite((const uint8_t*)c, n);
-  bool prompt = waitFor("\r\n>", "\r\nERROR", 1000);   // the prompt, then the bytes
-  linkWrite((const uint8_t*)data, len);
-  bool ok = waitFor("+CIPSEND:", "\r\nERROR", 2000);
-  ansCheck();
-  udpNote(ok ? "UDP SEND OK " : prompt ? "UDP SEND ERR " : "UDP SEND NOPROMPT ", ok);
-  unlock();
-  return ok;
-}
-
-int CellLink::receive(char* buf, int cap, unsigned int timeoutMs)
-{
-  if (!m_sockOpen) return 0;
-  uint32_t t = millis();
-  do {
-    lock();
-    bool got = at("AT+CIPRXGET=2,0,1500\r", 1000);
-    // +CIPRXGET: 2,<link>,<read_len>,<rest_len>\r\n<data>\r\nOK
-    char* p = got ? strstr(m_buf, "+CIPRXGET: 2,") : nullptr;
-    int n = 0;
-    if (p) {
-      char* q = strchr(p, ',');
-      if (q) q = strchr(q + 1, ',');
-      int len = q ? atoi(q + 1) : 0;
-      char* nl = q ? strchr(q, '\n') : nullptr;
-      if (nl && len > 0) {
-        n = len < cap ? len : cap;
-        memcpy(buf, nl + 1, n);
-      }
-    }
-    if (n > 0) { char w[24]; snprintf(w, sizeof(w), "UDP RX %d ", n); udpNote(w, true); }
-    else if (millis() - t >= timeoutMs && timeoutMs >= 1000) udpNote("UDP RX NONE ", false);   // not the 10 ms inbound polls
-    unlock();
-    if (n > 0) return n;
-    if (millis() - t >= timeoutMs) break;
-    delay(100);
-  } while (true);
-  return 0;
-}
-
-void CellLink::close()
-{
-  if (m_sockOpen) at("AT+CIPCLOSE=0\r", 2000);
-  m_sockOpen = false;
+  return r;
 }
 
 int CellLink::rssi()
@@ -552,7 +553,7 @@ int CellLink::gnssPushed(GnssFix* f)
     return 1;
   }
   if (m_gpsAt && now - m_gpsAt < 20000) return 0;   // NMEA not started yet
-  return -1;                           // no NMEA on port 1 for 10 s: only the AT query (port 2) can read it
+  return -1;                           // no NMEA on port 1 for 10 s: only the AT query (port 4) can read it
 }
 
 bool CellLink::gnss(GnssFix* f)
@@ -613,267 +614,6 @@ int CellLink::raw(const char* cmd, unsigned int timeoutMs, char* out, int cap)
   return n;
 }
 
-
-// ------------------------------------------------------------- HTTPS (CCH) ---
-
-// a modem answer as diagnostic text: \r\n -> '|', non-printable -> '.', at most `cap` chars
-static void diagText(char* out, int cap, const char* prefix, const char* in)
-{
-  int n = snprintf(out, cap, "%s", prefix);
-  for (const char* p = in; *p && n < cap - 1; p++) {
-    char ch = *p;
-    if (ch == '\r') continue;
-    out[n++] = ch == '\n' ? '|' : (ch >= 32 && ch < 127 ? ch : '.');
-  }
-  out[n < cap ? n : cap - 1] = 0;
-}
-
-bool CellLink::tlsOpen(const char* host, uint16_t port)
-{
-  if (!m_netOpen) return false;
-  lock();
-  m_tlsOn = false;
-  at("AT+CCHCLOSE=0\r", 2000, "+CCHCLOSE:");   // a session left from before (harmless ERROR)
-  at("AT+CCHSTOP\r", 3000, "+CCHSTOP:");      // wait for the stop itself, not only its OK (p43)
-  // send result report, cache receive mode - before CCHSTART; an ERROR here left the modem pushing
-  // the answer by itself (p43, 26.10.2026: CCHRECV only ERROR, the answer never read)
-  bool set = at("AT+CCHSET=1,1\r");
-  if (!set) { delay(500); set = at("AT+CCHSET=1,1\r"); }
-  if (diag) { char t[64]; diagText(t, sizeof(t), set ? "CCH SET OK " : "CCH SET ERR ", m_buf); diag(t); }
-  m_pushLen = m_pushPos = 0;
-  m_moreData = false;
-  bool started = at("AT+CCHSTART\r", 5000);
-  if (!started) started = at("AT+CCHSTART\r", 5000);
-  if (!started) {
-    if (diag) { char t[64]; diagText(t, sizeof(t), "CCH START ERR ", m_buf); diag(t); }
-    unlock(); snprintf(m_status, sizeof(m_status), "online, CCHSTART failed"); return false;
-  }
-  m_diagRecv = 0;
-  m_diagFlush = 0;
-  if (diag && at("AT+CCHSET?\r", 2000)) { char t[64]; diagText(t, sizeof(t), "CCH SET? ", m_buf); diag(t); }
-  at("AT+CSSLCFG=\"sslversion\",0,4\r");       // all versions
-  at("AT+CSSLCFG=\"authmode\",0,0\r");         // no server certificate check (as v1F, self-signed server)
-  at("AT+CSSLCFG=\"ignorelocaltime\",0,1\r");
-  at("AT+CSSLCFG=\"enableSNI\",0,1\r");
-  at("AT+CCHSSLCFG=0,0\r");
-  char c[160];
-  snprintf(c, sizeof(c), "AT+CCHOPEN=0,\"%s\",%u,2\r", host, (unsigned)port);
-  bool ok = at(c, 30000, "+CCHOPEN: 0,0");
-  if (!ok) Serial.printf("[CELL] CCHOPEN %s:%u failed: %s\n", host, (unsigned)port, m_buf);
-  if (diag) { char t[64]; diagText(t, sizeof(t), ok ? "CCH OPEN OK " : "CCH OPEN ERR ", m_buf); diag(t); }
-  m_lostWhere = nullptr;                       // PG-p21: a new session, nothing lost yet
-  m_lostBytes = 0;
-  m_annBytes = m_gotBytes = 0;
-  m_rx2LostAt = m_rx2Lost;
-  m_pushDropAt = m_pushDrop;
-  m_flushTxtDone = false;
-  m_tlsOn = ok;
-  unlock();
-  return ok;
-}
-
-// PG-p21: the session lost bytes - the first spot is kept (the later ones follow from it)
-void CellLink::tlsLost(const char* where, int bytes)
-{
-  if (!m_tlsOn || m_lostWhere) return;
-  m_lostBytes = bytes;
-  m_lostWhere = where;
-}
-
-// PG-p21: throw away what waits on the data port (port 2, or the UART without CMUX) - as before,
-// but while a session is open a "+CCHRECV: DATA," among those bytes is a block of the HTTPS answer
-// that nobody asked for any more -> the session is lost. txt (optional) = the first bytes as text.
-int CellLink::linkFlush(const char* where, char* txt, int txtCap)
-{
-  static const char P[] = "+CCHRECV: DATA,";
-  int n = 0, st = 0;
-  bool hit = false;
-  while (linkAvail()) {
-    int b = linkRead();
-    if (b < 0) break;
-    if (txt && n < txtCap - 1) txt[n] = b ? (char)b : '.';
-    n++;
-    if (b == P[st]) { if (!P[++st]) { hit = true; st = 0; } }
-    else st = b == '+' ? 1 : 0;
-  }
-  if (txt && txtCap > 0) txt[n < txtCap - 1 ? n : txtCap - 1] = 0;
-  if (hit) tlsLost(where, n);
-  return n;
-}
-
-// PG-p21: an AT answer read while a session is open must not hold an HTTPS data block (the block
-// came late, after its own read had ended - then this answer swallowed it)
-void CellLink::ansCheck()
-{
-  if (m_tlsOn && !m_lostWhere && strstr(m_buf, "+CCHRECV: DATA,")) tlsLost("ans", 0);
-}
-
-// PG-p21: one read of the HTTPS answer; a read in which bytes were lost is dropped whole (-2), and
-// so is every later one of this session. The modem is held for the whole read (lock is recursive).
-int CellLink::tlsRead(uint8_t* buf, int cap, unsigned int timeoutMs)
-{
-  lock();
-  int n = -2;
-  if (!m_lostWhere) n = m_muxOn ? tlsReadMux(buf, cap, timeoutMs) : tlsReadUart(buf, cap, timeoutMs);
-  if (m_rx2Lost != m_rx2LostAt) tlsLost("rx2", (int)(m_rx2Lost - m_rx2LostAt));   // port-2 buffer full
-  if (m_pushDrop != m_pushDropAt) tlsLost("push", (int)(m_pushDrop - m_pushDropAt));   // m_push full
-  if (m_lostWhere) n = -2;
-  else if (n > 0) m_gotBytes += n;
-  unlock();
-  return n;
-}
-
-bool CellLink::tlsSend(const char* data, int len)
-{
-  lock();
-  char c[40];
-  snprintf(c, sizeof(c), "AT+CCHSEND=0,%d\r", len);
-  bool ok = at(c, 5000, ">");
-  if (ok) {
-    linkWrite((const uint8_t*)data, len);
-    m_len = 0;
-    m_buf[0] = 0;
-    ok = waitFor("\r\nOK", "\r\nERROR", 10000);
-    ansCheck();
-  }
-  if (diag) {
-    char t[64], pre[24];
-    snprintf(pre, sizeof(pre), "CCH SEND %d %s ", len, ok ? "OK" : "ERR");
-    diagText(t, sizeof(t), pre, m_buf);
-    diag(t);
-  }
-  unlock();
-  return ok;
-}
-
-// one AT+CCHRECV: "+CCHRECV: DATA,0,<n>\r\n<n raw bytes>...OK"; no data = no DATA line
-int CellLink::tlsReadUart(uint8_t* buf, int cap, unsigned int timeoutMs)
-{
-  // as the FreematicsPlus SIM7600 branch (p44, 2026-10-26): in cache mode wait for the modem's
-  // "+CCHRECV: 0,<n>" (data ready) or +CCH_PEER_CLOSED, only then AT+CCHRECV. The modem is held
-  // (lock) for the whole wait - another task's at() would throw the notice away. Every modem line
-  // goes into the diagnostics (first 16 per connection).
-  if (m_lostWhere) return -2;
-  if (m_pushPos < m_pushLen) {
-    int n = m_pushLen - m_pushPos < cap ? m_pushLen - m_pushPos : cap;
-    memcpy(buf, m_push + m_pushPos, n);
-    m_pushPos += n;
-    return n;
-  }
-  uint32_t t0 = millis(), lastProbe = millis();
-  lock();
-  // RECV EVENT comes only for NEW data: after a full read the rest is still cached (p46)
-  bool ready = m_moreData, closed = false;
-  m_moreData = false;
-  char line[96];
-  int ll = 0;
-  while (!ready && !closed && millis() - t0 < timeoutMs) {
-    if (millis() - lastProbe > 5000) { ready = true; break; }   // no notice in 5 s: try a read anyway
-    if (!s_uart.available()) { delay(2); continue; }
-    char ch = (char)s_uart.read();
-    if (ch != '\n') { if (ch != '\r' && ll < (int)sizeof(line) - 1) { line[ll++] = ch; line[ll] = 0; } continue; }
-    line[ll] = 0;
-    if (!ll) continue;
-    ll = 0;
-    if (diag && m_diagRecv < 16) { m_diagRecv++; char t[64]; diagText(t, sizeof(t), "CCH URC ", line); diag(t); }
-    char* d = strstr(line, "+CCHRECV: DATA,0,");
-    if (d) {                                   // pushed by the modem itself
-      int n = atoi(d + 17), got = 0;
-      m_annBytes += n;
-      uint32_t tb = millis();
-      while (got < n && millis() - tb < 5000) {
-        if (!s_uart.available()) { delay(1); continue; }
-        int b = s_uart.read();
-        if (got < (int)sizeof(m_push)) m_push[got] = (uint8_t)b;
-        got++;
-        tb = millis();
-      }
-      if (got < n) tlsLost("block", n - got);                     // PG-p21: the block did not come whole
-      if (got > (int)sizeof(m_push)) tlsLost("push", got - (int)sizeof(m_push));   // did not fit
-      m_pushLen = got < (int)sizeof(m_push) ? got : (int)sizeof(m_push);
-      m_pushPos = 0;
-      unlock();
-      return tlsReadUart(buf, cap, timeoutMs);
-    }
-    // the data-ready notice: "+CCHEVENT: 0,RECV EVENT" on this SIM7600G (car 26.10.2026), as the
-    // FreematicsPlus inbound() pattern "RECV EVENT"; "+CCHRECV: 0,<n>" on other firmware (p45)
-    if (strstr(line, "RECV EVENT") || strstr(line, "+CCHRECV: 0,") || strstr(line, "+CCHRECV:0,")) ready = true;
-    if (strstr(line, "PEER_CLOSED") || strstr(line, "+CCHCLOSE")) closed = true;
-  }
-  if (!ready && !closed) { unlock(); return -1; }
-  // read what the modem keeps. SIM7500/SIM7600/SIM7800 SSL AT Command Manual V1.00, 2.2.10 - the
-  // answer is "OK" FIRST, then "+CCHRECV: DATA,<id>,<len>\r\n<len bytes>" (one or more), then
-  // "+CCHRECV: <id>,<err>"; ERROR when nothing is cached ("not allowed"). Stopping at the OK threw
-  // the data away (p46, car 26.10.2026: "+CCH_PEER_CLOSED: 0 | OK", then only ERROR).
-  if (diag && m_diagRecv < 16 && at("AT+CCHRECV?\r", 1000)) {
-    m_diagRecv++;
-    char t[64];
-    diagText(t, sizeof(t), "CCH LEN ", m_buf);
-    diag(t);
-  }
-  char c[40];
-  snprintf(c, sizeof(c), "AT+CCHRECV=0,%d\r", cap);
-  s_uart.print(c);
-  int got = 0, blocks = 0, err = -1, over = 0;
-  bool failed = false;
-  ll = 0;
-  uint32_t t = millis();
-  while (millis() - t < 5000) {
-    if (!s_uart.available()) { delay(1); continue; }
-    char ch = (char)s_uart.read();
-    t = millis();
-    if (ch != '\n') { if (ch != '\r' && ll < (int)sizeof(line) - 1) { line[ll++] = ch; line[ll] = 0; } continue; }
-    line[ll] = 0;
-    if (!ll) continue;
-    ll = 0;
-    if (strstr(line, "PEER_CLOSED") || strstr(line, "+CCHCLOSE")) { closed = true; continue; }
-    if (!strcmp(line, "ERROR")) { failed = true; break; }
-    char* d = strstr(line, "+CCHRECV: DATA,");
-    if (d) {                                   // "<id>,<len>" (the manual also shows "DATA, <id>")
-      char* q = strchr(d + 15, ',');
-      int n = q ? atoi(q + 1) : 0, r = 0;
-      m_annBytes += n;
-      uint32_t tb = millis();
-      while (r < n && millis() - tb < 5000) {
-        if (!s_uart.available()) { delay(1); continue; }
-        int b = s_uart.read();
-        if (got < cap) buf[got++] = (uint8_t)b;
-        else over++;
-        r++;
-        tb = millis();
-      }
-      if (r < n) tlsLost("block", n - r);      // PG-p21: the block did not come whole in 5 s
-      blocks++;
-      continue;
-    }
-    if (!strncmp(line, "+CCHRECV: 0,", 12)) { err = atoi(line + 12); break; }   // end of the answer
-  }
-  if (diag && m_diagRecv < 16) {
-    m_diagRecv++;
-    char tt[64];
-    snprintf(tt, sizeof(tt), "CCH RECV got=%d blocks=%d err=%d%s%s", got, blocks, err,
-             failed ? " ERROR" : "", closed ? " closed" : "");
-    diag(tt);
-  }
-  if (over) tlsLost("cap", over);              // PG-p21: more than asked for - did not fit
-  if (m_lostWhere) { unlock(); return -2; }
-  if (got > 0) { m_moreData = got >= cap; unlock(); return got; }
-  unlock();
-  if (closed) return 0;
-  if (millis() - t0 >= timeoutMs) return -1;
-  return tlsReadUart(buf, cap, timeoutMs - (millis() - t0));   // nothing yet: wait for the next notice
-}
-
-void CellLink::tlsClose()
-{
-  lock();
-  m_tlsOn = false;                             // what comes after the caller stopped reading is not lost
-  at("AT+CCHCLOSE=0\r", 3000, "+CCHCLOSE:");
-  at("AT+CCHSTOP\r", 3000);
-  unlock();
-}
-
-
 // =============================================================== p69 CMUX ===
 // 3GPP TS 27.010 basic option, as OVMS3 components/ovms_cellular/src/gsmmux.cpp (frame layout,
 // FCS table, SABM / UA / UIH, channel opening one after the other).
@@ -911,9 +651,10 @@ static uint8_t fcsOf(const uint8_t* d, size_t n)
   return 0xFF - f;
 }
 
+// the AT link: port 4 with CMUX, the UART before it (power on, AT+CMUX)
 int CellLink::linkAvail()
 {
-  if (m_muxOn) return (int)xStreamBufferBytesAvailable(m_rx2);
+  if (m_muxOn) return (int)xStreamBufferBytesAvailable(m_rx4);
   return s_uart.available();
 }
 
@@ -921,17 +662,22 @@ int CellLink::linkRead()
 {
   if (m_muxOn) {
     uint8_t b;
-    return xStreamBufferReceive(m_rx2, &b, 1, 0) == 1 ? b : -1;
+    return xStreamBufferReceive(m_rx4, &b, 1, 0) == 1 ? b : -1;
   }
   return s_uart.read();
 }
 
 void CellLink::linkWrite(const uint8_t* d, size_t n)
 {
-  if (m_muxOn) { muxTx(2, d, n); return; }
+  if (m_muxOn) { muxTx(4, d, n); return; }
   xSemaphoreTake(m_txLock, portMAX_DELAY);
   s_uart.write(d, n);
   xSemaphoreGive(m_txLock);
+}
+
+void CellLink::linkFlush()
+{
+  while (linkAvail()) if (linkRead() < 0) break;
 }
 
 // UIH frames of at most 127 bytes (one length byte; the modem's N1 is not assumed)
@@ -966,9 +712,9 @@ bool CellLink::muxStart()
   while (s_uart.available()) s_uart.read();
   m_fpos = m_flen = m_fipos = 0;
   m_fmore = false;
-  m_binLeft = 0;
+  m_pppMode = false;
   for (int c = 0; c < 5; c++) { m_chOpen[c] = 0; m_lineLen[c] = 0; }
-  xStreamBufferReset(m_rx2);
+  xStreamBufferReset(m_rx4);
   m_lastFrame = millis();
   m_muxOn = true;                                // the reader task takes the UART from here
   bool ok = true;
@@ -984,8 +730,8 @@ bool CellLink::muxStart()
     ok = m_chOpen[c];
   }
   if (!ok) { unlock(); Serial.println("[CELL] CMUX channel did not open"); return false; }
-  at("ATE0\r", 1000);                           // port 2: our AT link
-  muxTxStr(4, "ATE0\r");
+  at("ATE0\r", 1000);                           // port 4: our AT link
+  muxTxStr(2, "ATE0\r");                        // port 2: no echo of the dial line
   unlock();
   Serial.println("[CELL] CMUX up");
   return true;
@@ -994,23 +740,20 @@ bool CellLink::muxStart()
 void CellLink::muxStop()
 {
   if (!m_muxOn) return;
+  m_pppMode = false;
+  m_pppUp = false;
   m_muxOn = false;
   delay(30);
   while (s_uart.available()) s_uart.read();
-  xStreamBufferReset(m_rx2);
+  xStreamBufferReset(m_rx4);
   for (int c = 0; c < 5; c++) m_chOpen[c] = 0;
 }
 
 // GNSS on port 1 (OVMS simcom_7600.cpp:86-95: CGPS=0 first, the SIM7600 may already run it), RMC + GNS
-// every second; p66 start mode (N / H / C) kept. Without CMUX the old single command.
+// every second; p66 start mode (N / H / C) kept.
 void CellLink::startGnss()
 {
   const char* go = m_gpsMode == 'H' ? "AT+CGPSHOT\r" : m_gpsMode == 'C' ? "AT+CGPSCOLD\r" : "AT+CGPS=1,1\r";
-  if (!m_muxOn) {
-    m_gpsOk = at(go, 2000);            // an error = already on
-    m_gpsAt = millis();
-    return;
-  }
   m_nmeaAt = m_rmcAt = m_gnsAt = 0;
   muxTxStr(1, "AT+CGPS=0\r");
   delay(2000);
@@ -1066,20 +809,22 @@ void CellLink::muxFrame()
   if (ctl != GSM_UIH) return;
   const uint8_t* d = m_frame + m_fipos;
   int n = m_flen - m_fipos - 2;
-  if (ch == 2) {
-    if (xStreamBufferSend(m_rx2, d, n, 0) != (size_t)n) m_rx2Lost += n;
+  if (ch == 4) {                                   // AT answers
+    if (xStreamBufferSend(m_rx4, d, n, 0) != (size_t)n) m_rx4Lost += n;
     return;
   }
-  for (int i = 0; i < n; i++) {
-    uint8_t c = d[i];
-    if (m_binLeft > 0) {                           // a pushed +CCHRECV: DATA block (raw bytes)
-      portENTER_CRITICAL(&m_spin);
-      if (m_pushLen < (int)sizeof(m_push)) m_push[m_pushLen++] = c;
-      else m_pushDrop++;                           // PG-p21: did not fit - counted, tlsRead reports it
-      portEXIT_CRITICAL(&m_spin);
-      m_binLeft--;
-      continue;
+  if (ch == 2 && m_pppMode) {
+    // PPP: the bytes to lwIP (OVMS ovms_cellular.cpp:1876-1884 -> pppos_input_tcpip). A text frame
+    // (not HDLC: no 0x7E) with NO CARRIER = the modem left the data mode
+    if (n > 0 && d[0] != 0x7E && memmem(d, n, "NO CARRIER", 10)) {
+      if (m_pppUp) m_pppLost = true;
+      return;
     }
+    if (m_ppp) pppos_input_tcpip((ppp_pcb*)m_ppp, d, n);
+    return;
+  }
+  for (int i = 0; i < n; i++) {                    // ports 1, 3 and port 2 before CONNECT: text lines
+    uint8_t c = d[i];
     if (c == '\n') {
       m_lines[ch][m_lineLen[ch]] = 0;
       if (m_lineLen[ch]) portLine(ch, m_lines[ch]);
@@ -1090,7 +835,7 @@ void CellLink::muxFrame()
   }
 }
 
-// one text line from port 1, 3 or 4 (port 3 = every URC, +CATR=6)
+// one text line from port 1, 2 (the dial answer) or 3 (every URC, +CATR=6)
 void CellLink::portLine(int ch, char* line)
 {
   if (line[0] == '$') { nmeaLine(line); return; }
@@ -1099,22 +844,14 @@ void CellLink::portLine(int ch, char* line)
     else if (strstr(line, "ERROR")) m_gpsCmdResult = 0;
     return;
   }
-  if (ch != 3) return;
-  if (strstr(line, "RECV EVENT")) m_recvEvent = true;
-  if (!strncmp(line, "+CCHRECV: 0,", 12) || !strncmp(line, "+CCHRECV:0,", 11)) { m_recvEvent = true; m_recvEnd = true; }
-  if (strstr(line, "PEER_CLOSED") || !strncmp(line, "+CCHCLOSE", 9)) m_peerClosed = true;
-  if (strstr(line, "+CIPEVENT:") && strstr(line, "NETWORK CLOSED")) { m_netLostErr = 0; m_netLost = true; }   // PG-p1
-  const char* d = strstr(line, "+CCHRECV: DATA,");
-  if (d) {                                         // "<id>,<len>" then <len> raw bytes on this port
-    const char* q = strchr(d + 15, ',');
-    int n = q ? atoi(q + 1) : 0;
-    portENTER_CRITICAL(&m_spin);
-    if (m_pushPos >= m_pushLen) m_pushPos = m_pushLen = 0;
-    if (n > 0) m_annBytes += n;                    // PG-p21: announced
-    portEXIT_CRITICAL(&m_spin);
-    m_binLeft = n;
+  if (ch == 2) {                                   // OVMS ovms_cellular.cpp:1136-1149
+    if (!strncmp(line, "CONNECT", 7)) m_dial = 1;
+    else if (strstr(line, "ERROR") || strstr(line, "NO CARRIER")) m_dial = -1;
+    return;
   }
-  if (!strcmp(line, "OK") || !strcmp(line, "ERROR")) return;   // never an answer of the data port
+  if (ch != 3) return;
+  if (!strncmp(line, "+PPPD: DISCONNECTED", 19) && m_pppUp) m_pppLost = true;   // OVMS :1146-1149
+  if (!strcmp(line, "OK") || !strcmp(line, "ERROR")) return;
   portENTER_CRITICAL(&m_spin);
   int k = strlen(line);
   if (m_urcLen + k + 4 >= (int)sizeof(m_urc)) m_urcLen = 0;
@@ -1185,118 +922,3 @@ void CellLink::nmeaLine(const char* line)
   }
 }
 
-// HTTPS read over CMUX: the notices come on port 3 (m_recvEvent / m_peerClosed), the answer of
-// AT+CCHRECV on port 2 - its DATA blocks may also come as URCs on port 3 (then m_push); the end is
-// "+CCHRECV: 0,<err>" on either port (manual SSL 2.2.10)
-int CellLink::tlsReadMux(uint8_t* buf, int cap, unsigned int timeoutMs)
-{
-  portENTER_CRITICAL(&m_spin);
-  int have = m_pushLen - m_pushPos;
-  portEXIT_CRITICAL(&m_spin);
-  if (have > 0 && m_binLeft == 0) {
-    int n = have < cap ? have : cap;
-    portENTER_CRITICAL(&m_spin);
-    memcpy(buf, m_push + m_pushPos, n);
-    m_pushPos += n;
-    portEXIT_CRITICAL(&m_spin);
-    return n;
-  }
-  uint32_t t0 = millis();
-  lock();
-  bool ready = m_moreData;
-  m_moreData = false;
-  while (!ready && !m_recvEvent && !m_peerClosed && millis() - t0 < timeoutMs) {
-    if (millis() - t0 > 5000) { ready = true; break; }   // no notice in 5 s: try a read anyway
-    delay(5);
-  }
-  if (!ready && !m_recvEvent && !m_peerClosed) { unlock(); return -1; }
-  bool closed = m_peerClosed;
-  m_recvEvent = false;
-  m_recvEnd = false;
-  // p75: bytes left on port 2 are thrown away; PG-p21: if they hold a data block the session is lost.
-  // Their text once per session - 4.11.2026 every read flushed 27 bytes of unknown content.
-  char ftxt[44];
-  int flushed = linkFlush("flush", ftxt, sizeof(ftxt));
-  if (flushed && diag && m_diagFlush < 16) {
-    m_diagFlush++;
-    char tf[48];
-    snprintf(tf, sizeof(tf), "CCH FLUSHED %d", flushed);
-    diag(tf);
-  }
-  if (flushed && diag && !m_flushTxtDone) {
-    m_flushTxtDone = true;
-    char tf[64];
-    diagText(tf, sizeof(tf), "CCH FLUSH TXT ", ftxt);
-    diag(tf);
-  }
-  if (m_lostWhere) { unlock(); return -2; }
-  char c[40];
-  snprintf(c, sizeof(c), "AT+CCHRECV=0,%d\r", cap);
-  linkWrite((const uint8_t*)c, strlen(c));
-  int got = 0, blocks = 0, err = -1, over = 0;
-  bool failed = false;
-  char line[96];
-  int ll = 0;
-  uint32_t t = millis();
-  // p75: the end "+CCHRECV: 0,<err>" comes on port 3, the data on port 2 - stop only when port 2
-  // is empty too (27.10.2026: the rest was thrown away by the next read's flush -> ERR=SHA256)
-  while (millis() - t < 5000) {
-    if (m_recvEnd && !linkAvail()) { delay(20); if (!linkAvail()) break; }
-    int ch = linkRead();
-    if (ch < 0) { delay(1); continue; }
-    t = millis();
-    if (ch != '\n') { if (ch != '\r' && ll < (int)sizeof(line) - 1) { line[ll++] = (char)ch; line[ll] = 0; } continue; }
-    line[ll] = 0;
-    if (!ll) continue;
-    ll = 0;
-    if (strstr(line, "PEER_CLOSED") || strstr(line, "+CCHCLOSE")) { closed = true; continue; }
-    if (!strcmp(line, "ERROR")) { failed = true; break; }
-    char* d = strstr(line, "+CCHRECV: DATA,");
-    if (d) {
-      char* q = strchr(d + 15, ',');
-      int n = q ? atoi(q + 1) : 0, r = 0;
-      m_annBytes += n;
-      uint32_t tb = millis();
-      while (r < n && millis() - tb < 5000) {
-        int b = linkRead();
-        if (b < 0) { delay(1); continue; }
-        if (got < cap) buf[got++] = (uint8_t)b;
-        else over++;
-        r++;
-        tb = millis();
-      }
-      if (r < n) tlsLost("block", n - r);      // PG-p21: the block did not come whole in 5 s
-      blocks++;
-      continue;
-    }
-    if (!strncmp(line, "+CCHRECV: 0,", 12)) { err = atoi(line + 12); break; }
-  }
-  if (over) tlsLost("cap", over);              // PG-p21: more than asked for - did not fit
-  for (uint32_t tw = millis(); m_binLeft > 0 && millis() - tw < 2000;) delay(2);   // a block still arriving on port 3
-  if (m_binLeft > 0) tlsLost("push", m_binLeft);   // PG-p21: the port-3 block did not come whole in 2 s
-  portENTER_CRITICAL(&m_spin);
-  int pushed = m_pushLen - m_pushPos;
-  // PG-p21: data on port 2 AND port 3 in one read - their order cannot be checked
-  bool both = got > 0 && pushed > 0;
-  if (got == 0 && pushed > 0) {
-    int n = pushed < cap ? pushed : cap;
-    memcpy(buf, m_push + m_pushPos, n);
-    m_pushPos += n;
-    got = n;
-  }
-  portEXIT_CRITICAL(&m_spin);
-  if (diag && m_diagRecv < 16) {
-    m_diagRecv++;
-    char tt[64];
-    snprintf(tt, sizeof(tt), "CCH RECV mux got=%d blocks=%d err=%d fl=%d%s%s", got, blocks, err, flushed,
-             failed ? " ERROR" : "", closed ? " closed" : "");
-    diag(tt);
-  }
-  if (both) tlsLost("order", pushed);
-  if (m_lostWhere) { unlock(); return -2; }
-  if (got > 0) { m_moreData = got >= cap; unlock(); return got; }
-  unlock();
-  if (closed) return 0;
-  if (millis() - t0 >= timeoutMs) return -1;
-  return tlsReadMux(buf, cap, timeoutMs - (millis() - t0));
-}

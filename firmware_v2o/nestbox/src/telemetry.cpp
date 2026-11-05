@@ -85,7 +85,7 @@ static volatile bool s_cellUp;
 static GnssFix s_fix;                        // last valid reading - read and written only through fixGet / fixSet
 // PG-p19 (3.11.2026): the record task never waits for the modem. why: makeRecord() asked the modem itself
 // (AT+CSQ every record, the AT GNSS query when no NMEA) and waited for its lock without a limit; a pull-OTA
-// over the modem holds that lock up to 5 s per read (CellLink::tlsReadMux) - Peugeot 3.11 boot 149/151/152:
+// over the modem held that lock up to 5 s per read (the AT+CCH read, gone since NAVRH 9) - Peugeot 3.11 boot 149/151/152:
 // 4-5 s without records exactly during OTA-PULL (not on SD either). As v1F (telelogger.ino 3413: the RSSI
 // read in the network task, 2548: the record only takes the variable). The record now takes the NMEA fix
 // (memory, CellLink::gnssPushed) or the last values cellTask read from the modem (s_fix, s_csq).
@@ -124,7 +124,7 @@ static void loadApn()
   else snprintf(s_apn, sizeof(s_apn), "internet");
 }
 void telemetryApnCommand(const char* arg) { nbApnCommand(nvs, arg, "internet"); }
-void telemetrySetMux(bool on) { nvs_set_u8(nvs, "CELL_MUX", on ? 1 : 0); nvs_commit(nvs); s_cell.setMuxWanted(on); }
+// NAVRH 9: CMUX always (PPP needs it) - CELL_MUX=0 is not possible any more, the stored value is ignored
 bool telemetryMuxOn() { return s_cell.muxOn(); }
 void telemetrySetCell(bool on) { s_cellOn = on; nvs_set_u8(nvs, "CELL", on ? 1 : 0); nvs_commit(nvs); }
 bool telemetryCell() { return s_cellOn; }
@@ -193,7 +193,7 @@ void telemetryCellOff()
   s_standby = true;
   if (s_cellOn) { s_cellUp = false; s_cell.powerOff(); logNetEvent("CELL OFF standby"); }
 }
-CellLink* telemetryCellLink() { return s_cellUp ? &s_cell : nullptr; }   // pull-OTA over cellular
+CellLink* telemetryCellLink() { return s_cellUp && s_cell.up() ? &s_cell : nullptr; }   // pull-OTA: PPP has an IP
 
 // ---- automatic diagnostic reads (Peugeot K0, agreed 21.10.2026 "k") ------------------------
 // At every engine START and then every 10 min while the engine runs, one UDS 22 read after
@@ -444,7 +444,7 @@ static void refuelTick(const CarValues& cv)
   if (!cv.refuelAt) return;
   if (!armed) { armed = true; lastCnt = cv.refuelCnt; return; }
   if (cv.refuelCnt == lastCnt) return;
-  char b612[8], bc3[8], bc4[8], n612[8];
+  char b612[12], bc3[12], bc4[12], n612[12];   // 11 = "-2147483648" + 0 (ESP-IDF -Wformat-truncation, 5.11.2026)
   if (stop612 >= 0) snprintf(b612, sizeof(b612), "%d", stop612); else strcpy(b612, "-");
   if (stopC3 >= 0) snprintf(bc3, sizeof(bc3), "%d", stopC3); else strcpy(bc3, "-");
   if (stopC4 >= 0) snprintf(bc4, sizeof(bc4), "%d", stopC4); else strcpy(bc4, "-");
@@ -514,29 +514,43 @@ static void recordTask(void*)
   }
 }
 
-// PG-p1 (2.11.2026): (b) data session not back within 15 min -> modem restart; (c, PG-p4) on the modem
+// PG-p1 (2.11.2026): (b) data session not back within 15 min -> modem restart; NAVRH 9: also 3 failed PPP
+// recoveries in a row (OVMS s_netloss_retry_limit = 3, ovms_cellular.cpp:55, 721-751); (c, PG-p4) on the modem
 // and no server answer (ACK / reply / ping) for 15 min -> network check (asked by netTask, done here):
 // internet works = the server's side, no restart; internet down = restart, again at the earliest in 60 min
 #define CELL_NET_RESTART_MS 900000UL
 #define CELL_ACK_RESTART_MS 900000UL
 #define CELL_ACK_RESTART_GAP_MS 3600000UL
+#define CELL_PPP_RETRY_MS 30000UL      // OVMS gsmpppos.cpp:175-179: PPP reconnect after 30 s
+#define CELL_PPP_RETRIES 3
 static volatile bool s_cellRestartReq, s_netCheckReq;
 static char s_cellRestartWhy[40];
 
-// PG-p4: one line - pings 8.8.8.8 / 1.1.1.1, DNS google.com, our server (DNS + ping, information only)
+// PG-p4: one line - where does the link break? NAVRH 9: the modem's own AT+CPING / AT+CDNSGIP are gone with
+// the AT data path; the same questions through lwIP over PPP: DNS of google.com and of our server, a TCP
+// connection to 8.8.8.8:53 and 1.1.1.1:53 (TCP instead of ICMP ping: lwIP has no ping in our code)
+static bool tcpOk(const char* ip, uint16_t port)
+{
+  NetworkClient c;
+  bool ok = c.connect(ip, port, 5000);
+  c.stop();
+  return ok;
+}
+
 static bool netCheck()
 {
-  int p8 = s_cell.ping("8.8.8.8", 2);
-  int p1 = s_cell.ping("1.1.1.1", 2);
-  bool dns = s_cell.dnsOk("google.com");
-  bool sdns = s_cell.dnsOk(SERVER_HOST);
-  int ps = sdns ? s_cell.ping(SERVER_HOST, 2) : -1;
+  s_cell.makeDefault();                          // the check goes over PPP
+  bool t8 = tcpOk("8.8.8.8", 53);
+  bool t1 = tcpOk("1.1.1.1", 53);
+  IPAddress a;
+  bool dns = WiFi.hostByName("google.com", a);
+  bool sdns = WiFi.hostByName(SERVER_HOST, a);
   char m[57];
-  snprintf(m, sizeof(m), "NETCHK p8=%d/2 p1=%d/2 dns=%s srv_dns=%s srv=%d/2", p8, p1, dns ? "ok" : "err",
-           sdns ? "ok" : "err", ps);
+  snprintf(m, sizeof(m), "NETCHK tcp8=%d tcp1=%d dns=%s srv_dns=%s ppp=%d", t8 ? 1 : 0, t1 ? 1 : 0,
+           dns ? "ok" : "err", sdns ? "ok" : "err", s_cell.up() ? 1 : 0);
   statusLine(m);
   if (s_cell.udpDiag) s_cell.udpDiag(m);           // also over HTTPS (OTA server log) when that works
-  return p8 > 0 || p1 > 0 || dns;
+  return t8 || t1 || dns;
 }
 
 // ---- PG-p8 (2.11.2026): SMS channel - works with the registration only, no data session needed ----------
@@ -725,7 +739,8 @@ static void smsHandle(const char* from, const char* text)
 static void smsTick()
 {
   static uint32_t lastPoll;
-  if (!s_cellOn || s_standby || !s_cell.alive_() || otaBusy()) return;
+  // NAVRH 9: no otaBusy() any more - the OTA download goes over PPP (port 2), SMS over port 4
+  if (!s_cellOn || s_standby || !s_cell.alive_()) return;
   if (s_smsReq) {
     smsSendLogged(s_smsReqNum, s_smsReqText);
     s_fwdUntil = millis() + SMS_FWD_MS;
@@ -768,8 +783,8 @@ static void cellTask(void*)
       logNetEvent("CELL START");
       s_cell.setApn(nbApnPick(nvs, s_apn));   // a server APN= is tried first (nbapn.h)
       s_cellUp = s_cell.start();
-      // the data connection failed after registration (NETOPEN) = the APN's fault: counts for a trial
-      if (!s_cellUp && !strcmp(s_cell.status(), "NETOPEN failed")) { nbApnAfterLogin(nvs, false); loadApn(); }
+      // NAVRH 9: "PPP failed" (registered, no data session) = the APN's fault, as "NETOPEN failed" before
+      if (!s_cellUp && !strncmp(s_cell.status(), "PPP failed", 10)) { nbApnAfterLogin(nvs, false); loadApn(); }
       char m[120];
       snprintf(m, sizeof(m), "CELL %s apn_profile=%s", s_cell.status(), s_cell.storedApn());
       logNetEvent(m);
@@ -786,27 +801,42 @@ static void cellTask(void*)
       s_cell.stop();
       lastTry = 0;
     }
-    // PG-p1 (a): the modem closed the data session - open it again every 30 s (when registered)
-    if (s_cellUp && s_cell.netLost()) {
+    // NAVRH 9 (as OVMS NetMode -> NetLoss): PPP lost its IP (lwIP status, +PPPD: DISCONNECTED, NO CARRIER) or
+    // the registration is gone -> close PPP, AT+CGATT=0, registered? -> dial again; every 30 s, 3 failures in a
+    // row -> modem power cycle; and as PG-p1 (b): no data session for 15 min -> restart as well
+    static uint32_t regAt;
+    if (s_cellUp && !s_cell.pppLost() && s_cell.up() && millis() - regAt >= 30000UL) {   // OVMS polls every 30 s
+      regAt = millis();
+      if (!s_cell.registered() && !lostAt) {
+        statusLine("CELL REG LOST");
+        lostAt = millis();
+        lastReopen = 0;
+        tries = 0;
+      }
+    }
+    if (s_cellUp && (s_cell.pppLost() || lostAt)) {
       char m[57];
       if (!lostAt) {
         lostAt = millis();
         lastReopen = 0;
         tries = 0;
-        snprintf(m, sizeof(m), "CELL NET LOST err=%d", s_cell.netLostErr());
+        snprintf(m, sizeof(m), "CELL PPP LOST err=%d", s_cell.pppErr());
         statusLine(m);
       }
-      if (!otaBusy() && (!lastReopen || millis() - lastReopen >= 30000UL)) {   // never inside a CCH download
+      if (!lastReopen || millis() - lastReopen >= CELL_PPP_RETRY_MS) {
         lastReopen = millis();
         tries++;
-        if (s_cell.netReopen()) {
-          snprintf(m, sizeof(m), "CELL NETOPEN OK after %lus tries=%lu", (unsigned long)((millis() - lostAt) / 1000),
-                   (unsigned long)tries);
+        if (s_cell.netRecover()) {
+          snprintf(m, sizeof(m), "CELL PPP OK after %lus tries=%lu ip=%s", (unsigned long)((millis() - lostAt) / 1000),
+                   (unsigned long)tries, s_cell.ip());
           statusLine(m);
           lostAt = 0;
+        } else if (tries >= CELL_PPP_RETRIES) {
+          snprintf(s_cellRestartWhy, sizeof(s_cellRestartWhy), "PPP %lu tries", (unsigned long)tries);
+          s_cellRestartReq = true;
         }
       }
-      if (lostAt && millis() - lostAt > CELL_NET_RESTART_MS) {   // (b)
+      if (lostAt && millis() - lostAt > CELL_NET_RESTART_MS) {   // PG-p1 (b)
         strcpy(s_cellRestartWhy, "no data session 15 min");
         s_cellRestartReq = true;
       }
@@ -815,7 +845,7 @@ static void cellTask(void*)
     if (ackRestartAt && (int32_t)(s_client.lastSyncTime - ackRestartAt) > 0) ackRestartAt = 0;   // answers again
     if (s_netCheckReq) {
       s_netCheckReq = false;
-      if (s_cellUp && !s_cell.netLost() && !otaBusy()) {
+      if (s_cellUp && s_cell.up()) {
         if (netCheck()) {
           statusLine("SERVER NO ANSWER internet ok");
         } else if (!ackRestartAt || millis() - ackRestartAt >= CELL_ACK_RESTART_GAP_MS) {
@@ -866,11 +896,12 @@ static void netTask(void*)
   uint32_t linkSince = 0;
   for (;;) {
     // WiFi first, the modem when WiFi is not there (v1F: cellular fallback)
-    NetLink* want = s_wifi.up() ? (NetLink*)&s_wifi : (s_cellUp ? (NetLink*)&s_cell : nullptr);
+    NetLink* want = s_wifi.up() ? (NetLink*)&s_wifi : (s_cellUp && s_cell.up() ? (NetLink*)&s_cell : nullptr);
     if (want != cur) {
       if (cur) cur->close();
       s_client.login = false;
       cur = want;
+      if (cur == &s_cell) s_cell.makeDefault();   // NAVRH 9: lwIP route + DNS to PPP (WiFi's DHCP had them)
       linkSince = millis();
       s_client.setLink(cur);
       char m[40];
@@ -884,7 +915,7 @@ static void netTask(void*)
       continue;
     }
     // PG-p1 (c): on the modem, session not reported lost, but no server answer for 15 min -> modem restart
-    if (cur == &s_cell && !s_cell.netLost()) {
+    if (cur == &s_cell && s_cell.up()) {
       uint32_t ref = s_client.lastSyncTime;
       if ((int32_t)(linkSince - ref) > 0) ref = linkSince;   // the last answer on WiFi does not count
       if (millis() - ref > CELL_ACK_RESTART_MS) {
@@ -936,9 +967,6 @@ void telemetryBegin(uint32_t bootId, bool sdOk)
   loadApn();
   smsLoad();                                     // PG-p8
   s_cell.setApn(s_apn);
-  uint8_t mux = 1;                               // p69: CMUX on unless CELL_MUX=0 (local web)
-  nvs_get_u8(nvs, "CELL_MUX", &mux);
-  s_cell.setMuxWanted(mux != 0);
   s_cell.begin();
   genDeviceID(devid);
   Serial.printf("[TEL] device ID %s\n", devid);

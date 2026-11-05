@@ -1,34 +1,33 @@
-// SIM7600G modem of OVMS v3.3 - NestBox_v2O step 2b. NOT TESTED on the module
-// yet: the v3.3 modem may not start on USB power (OVMS installation.rst), it
-// needs the car's 12 V.
+// SIM7600G modem of OVMS v3.3 - NestBox_v2O.
 //
 // Sources (read 2026-10-18):
 //  - power key: OVMS3 components/simcom/src/simcom_powering.h - PWRKEY through
 //    MAX7317 port 0, inverted by a transistor (port 1 = key pressed); SIM7600:
 //    on = press >= 100 ms (OVMS uses 200), off = press >= 2500 ms; UART 115200
 //    on GPIO 13 (RX) / 4 (TX), modem ready ~12 s after power-on (simcom_7600.cpp);
-//  - AT sequence: NestBox_v1F libraries/FreematicsPlus/FreematicsNetwork.cpp,
-//    the CELL_SIM7600 / shared SIMCom branches: CPSI? / CREG? registration,
-//    CGSOCKCONT + CSOCKSETPN (APN), CIPMODE=0, NETOPEN, UDP with CIPRXGET=1
-//    (buffer mode - the server's commands are not lost between polls, v1F
-//    2026-09-23), CIPOPEN=0,"UDP",..., CIPSEND=0,<len>,"<ip>",<port>, CIPRXGET=2;
-//  - GNSS: AT+CGPS=1,1 (v1F setGPS), position polled with AT+CGNSSINFO, and
-//    AT+CGPSINFO when that is empty (SIM7600G V2.0.2, Peugeot 21.10.2026) (v1F
-//    used the CGPSINFO URC, which has no satellite count; FleetNest hides
-//    points with < 4 satellites). The field list of CGNSSINFO differs between
-//    firmware versions (an extra GALILEO count) - the parser finds the fields
-//    by the N/S and E/W letters, not by position.
-// One mutex around every AT exchange: the net task (UDP) and the record task
-// (GNSS) share the UART.
+//  - GNSS: AT+CGPS=1,1 (v1F setGPS); without NMEA the position is polled with AT+CGNSSINFO, and
+//    AT+CGPSINFO when that is empty (SIM7600G V2.0.2, Peugeot 21.10.2026). The field list of CGNSSINFO
+//    differs between firmware versions (an extra GALILEO count) - the parser finds the fields by the
+//    N/S and E/W letters, not by position.
 //
 // p69 (27.10.2026, NAVRH 8 K1-K3/K11, as OVMS3 components/ovms_cellular gsmmux.cpp + simcom_7600.cpp):
 // after the power-on the modem is switched to CMUX (AT+CMUX=0;+CATR=6, 3GPP 27.010 basic mode, the
-// frame code of OVMS gsmmux.cpp) - four virtual ports on the one UART: 1 = GNSS (NMEA pushed by the
-// modem, AT+CGPSNMEA=258 + AT+CGPSINFOCFG=1,258 = RMC + GNS every second, manual V3.00 17.2.16),
-// 2 = our AT data link (CIP UDP, CCH HTTPS, everything at() does), 3 = all URCs (+CATR=6, manual
-// 3.2.11), 4 = spare. GNSS no longer costs an AT exchange on the data port; system time from RMC when
-// there is no NTP. A CMUX that does not come up -> the modem is switched off and started the old way
-// (one UART, GNSS polled) - never worse than before. No good frame for 180 s -> link down (OVMS).
+// frame code of OVMS gsmmux.cpp) - four virtual ports on the one UART. System time from RMC when there
+// is no NTP. No good frame for 180 s -> modem restart (OVMS).
+//
+// NAVRH 9 (PG42/PG43, 2026-11-05): the data = PPP on port 2, IP in the ESP32 (lwIP) as OVMS3
+// (gsmpppos.cpp, ovms_cellular.cpp NetStart/NetMode/NetLoss). Why: until now UDP (AT+CIP*) and HTTPS
+// (AT+CCH*) ran as AT commands on port 2 - 4.11.2026 boot 157 and boot 164 one 1024-byte block of the
+// OTA download was lost each time (ERR=RECV 1024 short -> ERR=SHA256), the modem mixes the ports
+// against its own manual (+CCHEVENT RECV EVENT came on port 2; SSL manual 2.3.2: an URC -> port 3 with
+// +CATR=6), OVMS3 never uses CCH over CMUX. With PPP port 2 carries no AT text at all; TCP sends lost
+// bytes again itself; UDP records keep the ACK queue. Ports (OVMS simcom_7600.h:47-51):
+//   1 = GNSS: NMEA pushed by the modem (AT+CGPSNMEA=258, AT+CGPSINFOCFG=1,258) + the GNSS commands
+//   2 = PPP only (AT+CGDCONT + AT+CGDATA="PPP",1 -> CONNECT -> lwIP pppos)
+//   3 = URCs (+CATR=6, manual 4.11)
+//   4 = every other AT command (registration, CSQ, SMS, AT= from the web)
+// The modem never starts without CMUX any more (the old CIP/CCH path is gone - NAVRH 9: keeping it =
+// a half solution again); a CMUX that does not come up = modem off, the next start() tries again.
 #pragma once
 #include <Arduino.h>
 #include <freertos/stream_buffer.h>
@@ -47,21 +46,22 @@ struct GnssFix {
 
 class CellLink : public NetLink {
 public:
+  // NetLink: UDP through lwIP over PPP - the same code as WifiLink (netlink.cpp), only the interface differs
   const char* name() override { return "CELL"; }
-  bool up() override { return m_netOpen && !m_netLost; }
+  bool up() override { return m_pppUp; }
   bool open(const char* host, uint16_t port) override;
   bool send(const char* data, unsigned int len) override;
   int receive(char* buf, int cap, unsigned int timeoutMs) override;
   void close() override;
 
-  void begin();                // UART + mutex; the modem task does the rest
-  bool start();                // power on, SIM, registration, data - true = up (blocking, up to ~2 min)
-  void stop();                 // network closed, modem powered off
+  void begin();                // UART, mutexes, the CMUX reader task; the modem task does the rest
+  bool start();                // power on, CMUX, SIM, registration, PPP - true = IP (blocking, up to ~3 min)
+  void stop();                 // PPP closed, modem powered off
   void powerOff();             // stop() under the lock (standby, from another task)
-  bool gnss(GnssFix* out);     // one AT+CGNSSINFO reading, CGPSINFO when empty (modem on, network not needed)
+  bool gnss(GnssFix* out);     // NMEA fix, or one AT+CGNSSINFO / CGPSINFO reading (port 4) when NMEA is not there
   // PG-p19 (3.11.2026): the fix the modem pushes as NMEA (CMUX port 1) - memory only, never waits for the
   // modem. 1 = fix, 0 = NMEA running, no fix now, -1 = no NMEA (only the AT query of gnss() can read it).
-  // why: the record task must never wait for the modem (OTA holds it up to 5 s per read - see telemetry.cpp)
+  // why: the record task must never wait for the modem
   int gnssPushed(GnssFix* out);
   bool alive_() { return m_alive; }
   // p66: how the next start() switches GNSS on - 'N' AT+CGPS=1,1 (as before), 'H' AT+CGPSHOT, 'C' AT+CGPSCOLD
@@ -70,54 +70,35 @@ public:
   char gpsMode() const { return m_gpsMode; }
   uint32_t gpsStartedAt() const { return m_gpsAt; }   // millis() of the GNSS start command, 0 = not yet
   bool gpsStartOk() const { return m_gpsOk; }
-  int rssi();                  // dBm, 0 = unknown
+  int rssi();                  // dBm, 0 = unknown (AT+CSQ on port 4)
   const char* status() { return m_status; }
   const char* storedApn() { return m_cgdcont; }
-  // p69 CMUX
-  void setMuxWanted(bool on) { m_muxWanted = on; }
   bool muxOn() const { return m_muxOn; }
   bool muxDead() const { return m_muxOn && millis() - m_lastFrame > 180000UL; }   // OVMS: 3 min
   uint32_t muxFrames() const { return m_rxFrames; }
   uint32_t muxErrors() const { return m_frameErr; }
   void muxLoop();              // the reader task (internal)
   void setApn(const char* apn);
-  // diagnostics (local web API only): one AT command, the modem's raw answer into out
+  // diagnostics (local web API only): one AT command on port 4, the modem's raw answer into out
   int raw(const char* cmd, unsigned int timeoutMs, char* out, int cap);
-  // HTTPS inside the modem (AT+CCH*, session 0, cache receive mode) - pull-OTA over cellular
-  // (2026-10-20, from v1F CellHTTP; SIM7600 command set per the SIMCom SSL application note).
-  // NOT TESTED on the module: the data link itself (NETOPEN) did not come up on USB power.
-  bool tlsOpen(const char* host, uint16_t port);
-  bool tlsSend(const char* data, int len);
-  int tlsRead(uint8_t* buf, int cap, unsigned int timeoutMs);   // >0 bytes, 0 closed, -1 timeout, -2 lost
-  void tlsClose();
-  // PG-p21 (4.11.2026): no byte of the HTTPS answer is lost silently. why: Peugeot 4.11 boot 157 - the
-  // OTA server sent all 1166048 bytes (server log 06:08:36-06:16:01), the box got 1165024: one 1024-byte
-  // block vanished without any notice, the resume fetched only the last 1024 bytes -> ERR=SHA256 and the
-  // whole 8 min download again. Every spot that throws modem bytes away now marks the session lost:
-  // the read where it happened is dropped whole and tlsRead() returns -2 until the next tlsOpen(), so
-  // the caller's file holds only good bytes (the resume continues from there).
-  const char* tlsLostWhere() const { return m_lostWhere; }   // nullptr = nothing lost
-  int tlsLostBytes() const { return m_lostBytes; }           // 0 = count unknown
-  uint32_t tlsAnnounced() const { return m_annBytes; }       // bytes the modem announced (DATA,<n>)
-  uint32_t tlsDelivered() const { return m_gotBytes; }       // bytes tlsRead() handed over
-  // HTTPS diagnostics (p42, 2026-10-26: OTA over cellular ended with META_HTTP0) - the modem's
-  // AT+CCH* answers into the record (PID 0x399); set by ota.cpp, nullptr = none
-  void (*diag)(const char*) = nullptr;
-  // p71 (27.10.2026: no UDP records over cellular with CMUX, HTTPS fine) - the modem's AT+CIP*
-  // answers (data port + port 3 URCs); set by ota.cpp, which sends them over HTTPS; nullptr = none
+  // p71 diagnostics sink (ota.cpp sends the lines over HTTPS to the OTA server log when UDP does not get through)
   void (*udpDiag)(const char*) = nullptr;
   // p79: how the last start() got an answer - 0 already on, 1 after 3000 ms, 2 after 3000 + 500 ms
   int startStep() const { return m_startStep; }
   uint32_t startMs() const { return m_startMs; }
-  // PG-p1 (2.11.2026, Peugeot 10:49-11:38: CIPOPEN "network not opened" for 50 min, only the socket was
-  // retried): the modem closed the data session itself - +CIPEVENT: NETWORK CLOSED UNEXPECTEDLY or
-  // CIPOPEN err 1/2 (manual V3.00 11.4 / 11.6); cellTask then calls netReopen() (11.4: NETCLOSE, NETOPEN)
-  bool netLost() const { return m_netLost; }
-  int netLostErr() const { return m_netLostErr; }   // 1/2 = CIPOPEN error, 0 = +CIPEVENT
-  bool netReopen();            // registered -> CIPCLOSE, NETCLOSE, NETOPEN; true = the session is open again
-  // PG-p4: where the link breaks - AT+CPING (manual V3.00 11.3.4) and AT+CDNSGIP
-  int ping(const char* addr, int n);   // replies received (0..n), -1 = no ping summary from the modem
-  bool dnsOk(const char* host);
+
+  // NAVRH 9 - PPP state and recovery (OVMS ovms_cellular.cpp NetMode / NetLoss):
+  //  - pppLost(): PPP had an IP and lost it (lwIP status != OK, +PPPD: DISCONNECTED or NO CARRIER on port 2)
+  //    or the registration is gone; cellTask then calls netRecover()
+  //  - netRecover(): as OVMS NetLoss -> NetWait -> NetStart: PPP closed, AT+CGATT=0 (port 4), registered?
+  //    then the dial again; true = IP again. cellTask counts the failures: 3 in a row -> modem power cycle
+  //    (OVMS s_netloss_retry_limit = 3, ovms_cellular.cpp:55, 721-751)
+  bool pppLost() const { return m_pppLost; }
+  int pppErr() const { return m_pppErr; }      // the last lwIP PPP status (PPPERR_*, 0 = none)
+  bool netRecover();
+  void makeDefault();          // PPP = lwIP's default route + its DNS servers (netTask: switch WiFi -> modem)
+  const char* ip() const { return m_ipStr; }
+  bool registered();           // AT+CREG? / AT+CEREG? home or roaming (port 4)
   // PG-p7 (2.11.2026, 4ka: roaming data on/off by SMS to 900): SMS in text mode (manual V3.00 4.2.x
   // AT+CMGF / AT+CMGS / AT+CMGL / AT+CMGD) - needs only the registration, not the data session
   bool smsSend(const char* num, const char* text);
@@ -125,38 +106,45 @@ public:
   bool smsTake(char* from, int fcap, char* text, int tcap);
   // "<operator> home|roam|reg=<n>" from AT+COPS? and AT+CREG? (PG-p8 STAV answer)
   void netInfo(char* out, int cap);
+
+  // lwIP callbacks (internal, called from the tcpip task)
+  uint32_t pppOutput(const uint8_t* data, uint32_t len);
+  void pppStatus(int err);
 private:
-  volatile bool m_netLost = false;
-  volatile int m_netLostErr = 0;
-  bool registered();           // AT+CREG? home / roaming
   int m_startStep = 0;
   uint32_t m_startMs = 0;
-  int m_udpOk = 0, m_udpErr = 0;
-  void udpNote(const char* what, bool ok);
-  // p69 CMUX state
+  // CMUX state
   volatile bool m_muxOn = false;
-  bool m_muxWanted = true;
-  StreamBufferHandle_t m_rx2 = nullptr;        // port 2 (AT data link) bytes
+  StreamBufferHandle_t m_rx4 = nullptr;        // port 4 (AT commands) bytes
   SemaphoreHandle_t m_txLock = nullptr;
   TaskHandle_t m_rdTask = nullptr;
   volatile uint8_t m_chOpen[5] = {0, 0, 0, 0, 0};
-  volatile uint32_t m_lastFrame = 0, m_rxFrames = 0, m_frameErr = 0, m_rx2Lost = 0;
+  volatile uint32_t m_lastFrame = 0, m_rxFrames = 0, m_frameErr = 0, m_rx4Lost = 0;
   uint8_t m_frame[2100];
   int m_fpos = 0, m_flen = 0, m_fipos = 0;
   bool m_fmore = false;
   char m_lines[5][256];
   int m_lineLen[5] = {0, 0, 0, 0, 0};
-  int m_binLeft = 0;                           // raw bytes of a pushed +CCHRECV: DATA still to take
   char m_urc[1024];                            // port 3 lines (URCs) for waitFor
   int m_urcLen = 0;
   portMUX_TYPE m_spin = portMUX_INITIALIZER_UNLOCKED;
-  volatile bool m_recvEvent = false, m_peerClosed = false, m_recvEnd = false;
   volatile int8_t m_gpsCmdResult = -1;         // port 1: 1 OK, 0 ERROR
   GnssFix m_nfix = {};
   volatile uint32_t m_rmcAt = 0, m_gnsAt = 0, m_nmeaAt = 0, m_timeSetAt = 0;
+  // PPP (NAVRH 9)
+  void* m_ppp = nullptr;                       // ppp_pcb* (lwIP), created once, reused for every dial
+  volatile bool m_pppMode = false;             // port 2 bytes go to lwIP (after CONNECT) - else text lines
+  volatile int8_t m_dial = 0;                  // port 2 answer to the dial: 0 waiting, 1 CONNECT, -1 refused
+  volatile bool m_pppUp = false, m_pppLost = false;
+  volatile int m_pppErr = 0, m_pppStatusSeen = 0;
+  uint32_t m_dns[2] = {0, 0};                  // the PPP peer's DNS servers (ip4 addr, network order)
+  char m_ipStr[20] = "";
+  bool pppDial(uint32_t timeoutMs);            // port 2: dial, CONNECT, lwIP connect, wait for the IP
+  void pppClose();
   int linkAvail();
   int linkRead();
   void linkWrite(const uint8_t* d, size_t n);
+  void linkFlush();
   void muxTx(int ch, const uint8_t* d, size_t n);
   void muxTxStr(int ch, const char* s) { muxTx(ch, (const uint8_t*)s, strlen(s)); }
   bool muxStart();
@@ -166,24 +154,6 @@ private:
   void portLine(int ch, char* line);
   void nmeaLine(const char* line);
   void startGnss();
-  int tlsReadMux(uint8_t* buf, int cap, unsigned int timeoutMs);
-  int tlsReadUart(uint8_t* buf, int cap, unsigned int timeoutMs);
-  // PG-p21 loss tracking (see tlsLostWhere above)
-  bool m_tlsOn = false;                        // a CCH session is open (tlsOpen OK .. tlsClose)
-  const char* volatile m_lostWhere = nullptr;
-  int m_lostBytes = 0;
-  uint32_t m_annBytes = 0, m_gotBytes = 0, m_rx2LostAt = 0, m_pushDropAt = 0;
-  volatile uint32_t m_pushDrop = 0;            // port-3 push bytes that did not fit into m_push
-  bool m_flushTxtDone = false;                 // "CCH FLUSH TXT" sent once per session
-  void tlsLost(const char* where, int bytes);
-  int linkFlush(const char* where, char* txt = nullptr, int txtCap = 0);
-  void ansCheck();
-  int m_diagRecv = 0;
-  int m_diagFlush = 0;                         // p75: "CCH FLUSHED n" lines sent
-  bool m_moreData = false;   // the last AT+CCHRECV filled the buffer: read again without a new notice
-  // data the modem pushed by itself (+CCHRECV: DATA,0,<n> without AT+CCHRECV - p43), not yet read
-  uint8_t m_push[2048];
-  int m_pushLen = 0, m_pushPos = 0;
   bool at(const char* cmd, unsigned int timeoutMs = 1000, const char* expect = nullptr);
   bool gnssLine(const char* cmd, const char* tag, char* line, int cap);
   bool waitFor(const char* a, const char* b, unsigned int timeoutMs);
@@ -193,14 +163,10 @@ private:
   void unlock();
   char m_buf[1600];
   int m_len = 0;
-  volatile bool m_netOpen = false;
   volatile bool m_alive = false;     // answers AT (GNSS can be read)
   char m_gpsMode = 'N';
   uint32_t m_gpsAt = 0;
   bool m_gpsOk = false;
-  bool m_sockOpen = false;
-  char m_ip[40] = "";
-  uint16_t m_port = 0;
   char m_apn[40] = "";
   char m_status[96] = "off";
   char m_cgdcont[80] = "";       // the modem's stored PDP profile (AT+CGDCONT?), for the log

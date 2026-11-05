@@ -54,7 +54,7 @@ static volatile bool s_staged;               // a verified image waits on SD for
 static uint8_t s_buf[OTA_CHUNK];
 
 // -------------------------------------------------------------- status ---
-#define OTA_STATUS_Q 24      // p42: CCH diagnostics - several lines in a row
+#define OTA_STATUS_Q 24      // p42: several OTA lines in a row (was for the CCH diagnostics)
 static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 static char s_q[OTA_STATUS_Q][64];
 static uint8_t s_head, s_count;
@@ -137,8 +137,9 @@ static void udpDiagNote(const char* text)
 }
 
 // ---------------------------------------------------------------- HTTP ---
-// One HTTPS connection: WiFi (WiFiClientSecure) or the modem's own TLS (AT+CCH*, 2026-10-20 -
-// over cellular when there is no WiFi; NOT TESTED: the data link did not come up on USB power).
+// One HTTPS connection (NetworkClientSecure = mbedTLS in the ESP32) over WiFi or over the modem's PPP -
+// lwIP takes the default route (NAVRH 9, 2026-11-05). Before: the modem's own TLS (AT+CCH*) - 4.11.2026
+// boot 157 / 164 a 1024-byte block of the download was lost on it (ERR=SHA256), now TCP resends itself.
 struct OtaConn {
   virtual bool connect(const char* host, uint16_t port) = 0;
   virtual void write(const char* s) = 0;
@@ -180,22 +181,10 @@ struct WifiConn : OtaConn {
   void stop() override { c.stop(); }
 };
 
-struct CellConn : OtaConn {
-  CellLink* m;
-  explicit CellConn(CellLink* l) : m(l) {}
-  bool connect(const char* host, uint16_t port) override { return m->tlsOpen(host, port); }
-  void write(const char* s) override { m->tlsSend(s, strlen(s)); }
-  int read(uint8_t* buf, int cap, unsigned int timeoutMs) override {
-    return m->tlsRead(buf, cap > 1024 ? 1024 : cap, timeoutMs);
-  }
-  void stop() override { m->tlsClose(); }
-};
-
-// Both connections live outside the ota task's stack, as v1F's global otaWifiClient
+// The connection lives outside the ota task's stack, as v1F's global otaWifiClient
 // (telelogger.ino): on the stack (2 x 1 KB line buffer + the TLS client) the second TLS
 // handshake overflowed the 8 KB stack - "Stack canary watchpoint triggered (ota)", serial 21.10.2026.
-static WifiConn s_wc;
-static CellConn s_cc(nullptr);
+static WifiConn s_wc;                        // WiFi or PPP: the same TLS client
 
 // one GET; returns the status code (-1 = no connection), *len = Content-Length (-1 unknown).
 // The body is then read with c.body().
@@ -235,18 +224,6 @@ static String urlBuild()
   String s;
   for (const char* p = FW_BUILD_STR; *p; p++) s += *p == ' ' ? String("%20") : String(*p);
   return s;
-}
-
-// PG-p21: the modem session lost bytes (CellLink::tlsLostWhere) - one status line, true = lost.
-// why: 4.11.2026 boot 157 a 1024-byte block vanished unnoticed (ERR=SHA256 after the resume)
-static bool cellLost(CellLink* cell, const char* what, size_t at)
-{
-  if (!cell || !cell->tlsLostWhere()) return false;
-  char m[64];
-  snprintf(m, sizeof(m), "OTA-PULL ERR=LOST %s %s %d @%u", what, cell->tlsLostWhere(), cell->tlsLostBytes(),
-           (unsigned)at);
-  otaLog(m);
-  return true;
 }
 
 // -------------------------------------------------------------- check ---
@@ -289,9 +266,8 @@ static void check()
   char path[300];
   snprintf(path, sizeof(path), "/api/nestbox/ota/%s/meta.json?build=%s&variant=%s", s_token,
            urlBuild().c_str(), OTA_VARIANT);
-  s_cc.m = cell;
-  if (cell) cell->diag = otaLog;              // p42: the modem's answers into the record
-  OtaConn& c = cell ? (OtaConn&)s_cc : (OtaConn&)s_wc;
+  if (cell) cell->makeDefault();              // NAVRH 9: the download goes over PPP
+  OtaConn& c = s_wc;
   otaLog(cell ? "OTA-PULL CHECK cell" : "OTA-PULL CHECK wifi");
   long len = 0;
   int code = httpGet(c, path, 0, &len);
@@ -306,9 +282,7 @@ static void check()
     return;
   }
   String body = readAll(c);
-  bool metaLost = cellLost(cell, "meta", body.length());   // PG-p21: not a NO_UPDATE - the answer is cut
   c.stop();
-  if (metaLost) return;
   if (body.indexOf("\"available\": true") < 0 && body.indexOf("\"available\":true") < 0) {
     otaLog("OTA-PULL NO_UPDATE");
     s_retries = 0;
@@ -388,14 +362,6 @@ static void check()
       written += n;
       lastStep("OTA download %u/%u", (unsigned)written, (unsigned)size);
     }
-  }
-  // PG-p21: a read with lost bytes was not written (CellLink::tlsRead -2), so the file holds only good
-  // bytes and the resume below continues from them. The byte count shows a loss no spot reported.
-  cellLost(cell, "fw", written);
-  if (cell) {
-    snprintf(m, sizeof(m), "OTA-PULL BYTES ann=%u got=%u", (unsigned)cell->tlsAnnounced(),
-             (unsigned)cell->tlsDelivered());
-    otaLog(m);
   }
   c.stop();
   sdLock(); out.close(); sdUnlock();
@@ -507,10 +473,10 @@ static void udpDiagUpload(CellLink* cell)
     sent++;
   }
   if (!sent) return;
-  s_cc.m = cell;
+  if (cell) cell->makeDefault();
   long len = 0;
-  int code = httpGet(s_cc, path, 0, &len);
-  s_cc.stop();
+  int code = httpGet(s_wc, path, 0, &len);
+  s_wc.stop();
   if (code < 0) return;                        // no connection: the lines wait for the next try
   portENTER_CRITICAL(&s_mux);
   s_dHead = (s_dHead + sent) % UDP_DIAG_Q;
