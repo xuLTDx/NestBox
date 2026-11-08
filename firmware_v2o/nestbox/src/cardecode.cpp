@@ -63,6 +63,16 @@ void carDecode(uint32_t id, bool ext, uint8_t dlc, const uint8_t* d)
       s_v.speedKmh = raw * 0.01f; s_v.speedAt = now;
       portEXIT_CRITICAL(&s_mux);
     }
+  } else if (id == 0x572 && dlc >= 5) {      // PG55: belt candidate (cardecode.h), raw, every change counted
+    portENTER_CRITICAL(&s_mux);
+    if (!s_v.c572At || d[0] != s_v.c572b0 || d[4] != s_v.c572b4) { s_v.c572b0 = d[0]; s_v.c572b4 = d[4]; s_v.c572Chg++; }
+    s_v.c572At = now;
+    portEXIT_CRITICAL(&s_mux);
+  } else if (id == 0x4F2 && dlc >= 4) {      // PG57: passenger seated candidate (cardecode.h), raw, every change counted
+    portENTER_CRITICAL(&s_mux);
+    if (!s_v.c4f2At || d[3] != s_v.c4f2b3) { s_v.c4f2b3 = d[3]; s_v.c572Chg++; }
+    s_v.c4f2At = now;
+    portEXIT_CRITICAL(&s_mux);
   } else if (id == 0x432 && dlc >= 6) {      // PG-p12 added fuel volume + refuel counter
     portENTER_CRITICAL(&s_mux);
     s_v.refuelVol = d[3]; s_v.refuelCnt = d[5] & 0x07; s_v.refuelAt = now;
