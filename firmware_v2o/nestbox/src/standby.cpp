@@ -25,6 +25,16 @@ void prepareRestart(const char* why);  // main.cpp
 #define ADC_12V_FACTOR_SB 195.7f      // = telemetry.cpp ADC_12V_FACTOR (raw / factor = volts)
 #define FALSE_WAKES_RAISE 3           // after this many unconfirmed ULP wakes in a row: threshold up
 #define FALSE_WAKE_RAISE_V 0.3f
+// PG50 (2026-11-08, NAVRH 9 rule "the ULP runs only during the sleep"). Why: Peugeot 6.11 (boot 178 -> 179) and
+// 7.11 (boot 184 -> 185, 34 km driven, not recorded) the sleep had "ULP n=0" - the ULP program never ran, an
+// engine start could not wake the box. Both sleeps came after a REPORT (timer) wake; after a timer wake the ULP
+// kept running while the chip was awake, analogRead() took ADC1 from it meanwhile (ESP-IDF 4.4 adc1_get_raw sets
+// the RTC controller and resets its FSM, adc_common.c:405-415) and ulpStart() then loaded the new program over
+// it - ulp_run() on the ESP32 only restarts the timer, it does not reset a stuck ULP (ulp.c:45-63). Not proven
+// (NEOVERENE which of the two stops it); the data fit (after VOLTAGE wakes the ULP had ended with I_END itself).
+#define ULP_CHECK_MS    600           // > 2 ULP periods: the run counter must move before the sleep
+#define ULP_TRIES       3
+#define ULP_FALLBACK_S  600           // no ULP: wake every 10 min and measure 12 V (emergency only)
 
 // RTC slow memory, start reserved for the ULP (CONFIG_ULP_COPROC_RESERVE_MEM 512 B = 128 words)
 // p62 (27.10.2026): counters of one sleep, read at the wake - where does the ULP wake fail?
@@ -36,6 +46,9 @@ RTC_DATA_ATTR static uint8_t s_falseWakes;    // ULP wakes not confirmed by the 
 RTC_DATA_ATTR static uint16_t s_thrRaise;     // raw x4 added to the ULP threshold after false wakes
 RTC_DATA_ATTR static uint8_t s_ulpTest;       // SLEEP_ULP test: a wake always boots (no sleep again)
 RTC_DATA_ATTR static uint8_t s_ulpArmed;      // p62: the ULP watched this sleep (its counters are valid)
+// PG50 (2026-11-08): the ULP did not run before the sleep -> 10 min sleeps (12 V checked at each wake)
+// until it runs again; counted, reported at the next full boot
+RTC_DATA_ATTR static uint16_t s_ulpFallbacks;
 
 static char s_wake[48] = "-";
 static char s_ulpStats[56];                   // p62: the last sleep's ULP counters ("" = no ULP sleep)
@@ -130,6 +143,28 @@ static bool ulpStart(uint16_t thrX4)
   return esp_sleep_enable_ulp_wakeup() == ESP_OK;
 }
 
+// PG50: the ULP stopped and ADC1 back to analogRead (a run in progress ends within 250 ms)
+static void ulpStop()
+{
+  ulp_timer_stop();
+  delay(250);
+  ulp_adc_deinit();
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ULP);
+}
+
+// PG50: start the ULP and see it run (its run counter moves) while still awake - up to ULP_TRIES times
+static bool ulpStartChecked(uint16_t thrX4)
+{
+  for (int i = 0; i < ULP_TRIES; i++) {
+    if (ulpStart(thrX4)) {
+      for (uint32_t t = millis(); millis() - t < ULP_CHECK_MS; delay(20))
+        if ((RTC_SLOW_MEM[ULP_RUNS] & 0xFFFF) > 0) return true;
+    }
+    ulpStop();
+  }
+  return false;
+}
+
 // deep sleep until the 12 V rises (ULP) or the parked report is due (timer); no return
 static void sleepNow(bool ulp, uint32_t forceSeconds = 0)
 {
@@ -141,8 +176,13 @@ static void sleepNow(bool ulp, uint32_t forceSeconds = 0)
   }
   esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
   s_ulpArmed = 0;
-  if (ulp && !ulpStart(rawX4(ENGINE_OFF_VOLTAGE) + s_thrRaise)) Serial.println("[STANDBY] ULP start failed - timer only");
-  else if (ulp) s_ulpArmed = 1;
+  if (ulp && ulpStartChecked(rawX4(ENGINE_OFF_VOLTAGE) + s_thrRaise)) {
+    s_ulpArmed = 1;
+  } else if (ulp) {                    // PG50: no ULP -> the 12 V is checked by the timer every 10 min
+    Serial.println("[STANDBY] ULP not running - timer 10 min");
+    if (s_ulpFallbacks < 0xFFFF) s_ulpFallbacks++;
+    if (!forceSeconds && secs > ULP_FALLBACK_S) secs = ULP_FALLBACK_S;
+  }
   esp_sleep_enable_timer_wakeup((uint64_t)secs * 1000000ULL);
   lastStep("deep sleep %lus", (unsigned long)secs);
   Serial.printf("[STANDBY] deep sleep %lu s%s\n", (unsigned long)secs, ulp ? " + ULP 12 V" : "");
@@ -151,9 +191,22 @@ static void sleepNow(bool ulp, uint32_t forceSeconds = 0)
   esp_deep_sleep_start();
 }
 
+static void standbyEarlyWake();
+
+// every return from here is a full boot (a sleep again does not return): the fallback count was reported
 void standbyEarly()
 {
   if (esp_reset_reason() != ESP_RST_DEEPSLEEP) return;
+  standbyEarlyWake();
+  s_ulpFallbacks = 0;
+}
+
+static void standbyEarlyWake()
+{
+  // PG50: the ULP never runs while the chip is awake - stopped before the first analogRead of this boot
+  // (after a VOLTAGE wake it has stopped itself with I_END, after a timer wake it was still running)
+  ulp_timer_stop();
+  delay(250);
   esp_sleep_wakeup_cause_t c = esp_sleep_get_wakeup_cause();
   unsigned ulpSum = RTC_SLOW_MEM[ULP_LAST] & 0xFFFF;   // the ULP's last 4-sample sum
   if (s_ulpArmed)                     // runs, min/max sum, sums >= threshold, not ready, WAKE issued
@@ -162,6 +215,8 @@ void standbyEarly()
              (unsigned)(RTC_SLOW_MEM[ULP_MAX] & 0xFFFF), (unsigned)(RTC_SLOW_MEM[ULP_OVER] & 0xFFFF),
              (unsigned)(RTC_SLOW_MEM[ULP_NRDY] & 0xFFFF), (unsigned)(RTC_SLOW_MEM[ULP_WAKES] & 0xFFFF));
   s_ulpArmed = 0;
+  if (s_ulpFallbacks && !s_ulpStats[0])
+    snprintf(s_ulpStats, sizeof(s_ulpStats), "ULP NOT RUNNING before sleep fallbacks=%u", (unsigned)s_ulpFallbacks);
   if (s_ulpTest) {                    // SLEEP_ULP: report and boot, whatever woke it
     s_ulpTest = 0;
     snprintf(s_wake, sizeof(s_wake), "ULP_TEST %s ulp=%u v=%.2f", c == ESP_SLEEP_WAKEUP_ULP ? "ULP" :
@@ -182,6 +237,13 @@ void standbyEarly()
     s_thrRaise = 0;
     snprintf(s_wake, sizeof(s_wake), "VOLTAGE ulp=%u", ulpSum);
   } else if (c == ESP_SLEEP_WAKEUP_TIMER) {
+    // PG50: a 10 min fallback wake (no ULP): 12 V above the engine-off level -> a normal boot (the engine may
+    // run), else sleep again at once (the ULP is tried again) until the report is due
+    if (s_ulpFallbacks && (long)(s_nextReport - time(nullptr)) > 10) {
+      if (read12V() < ENGINE_OFF_VOLTAGE) sleepNow(true);
+      snprintf(s_wake, sizeof(s_wake), "VOLTAGE_POLL v=%.2f", read12V());
+      return;
+    }
     if ((long)(s_nextReport - time(nullptr)) > 10) {   // a SLEEP_TEST wake, not the report
       snprintf(s_wake, sizeof(s_wake), "TEST");
       return;
