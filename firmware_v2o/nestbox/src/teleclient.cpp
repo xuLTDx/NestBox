@@ -238,6 +238,14 @@ void TeleClientUDP::onMessage(char* msg, UdpRx* rx)
       telemetrySmsSetting(cmdp + 4, m, sizeof(m));
       statusLine(m);
     }
+    if (cmdp && !strncmp(cmdp + 4, "LOG=", 4)) {      // PG49: LOG=<file>[,<from byte>] -> HTTPS upload (ota.cpp)
+      char* e = nullptr;
+      uint32_t f = (uint32_t)strtoul(cmdp + 8, &e, 10);
+      uint32_t from = (e && *e == ',') ? (uint32_t)strtoul(e + 1, nullptr, 10) : 0;
+      char m[48];
+      snprintf(m, sizeof(m), "CMD LOG=%u %s", (unsigned)f, otaLogRequest(f, from) ? "start" : "running");
+      statusLine(m);
+    }
     if (cmdp && !strncmp(cmdp + 4, "RESEND=", 7)) {
       uint32_t f = (uint32_t)strtoul(cmdp + 11, 0, 10);
       bool started = txqResendRequest(f);

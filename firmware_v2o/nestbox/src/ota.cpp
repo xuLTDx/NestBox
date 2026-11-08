@@ -143,6 +143,7 @@ static void udpDiagNote(const char* text)
 struct OtaConn {
   virtual bool connect(const char* host, uint16_t port) = 0;
   virtual void write(const char* s) = 0;
+  virtual void writeRaw(const uint8_t* d, int n) = 0;   // PG49: a POST body
   virtual int read(uint8_t* buf, int cap, unsigned int timeoutMs) = 0;   // >0, 0 closed, -1 timeout
   virtual void stop() = 0;
   virtual ~OtaConn() {}
@@ -172,6 +173,7 @@ struct WifiConn : OtaConn {
     return c.connect(host, port);
   }
   void write(const char* s) override { c.print(s); }
+  void writeRaw(const uint8_t* d, int n) override { c.write(d, n); }
   int read(uint8_t* buf, int cap, unsigned int timeoutMs) override {
     uint32_t t = millis();
     while (!c.available() && c.connected() && millis() - t < timeoutMs) delay(2);
@@ -484,6 +486,117 @@ static void udpDiagUpload(CellLink* cell)
   portEXIT_CRITICAL(&s_mux);
 }
 
+// ---- PG49 (2026-11-08): one SD data file to the OTA server over HTTPS (WiFi or the modem's PPP) ----------
+// Why: Peugeot 7.11.2026, 34 km without records, the box ~1500 km away - its SD files could only be read on the
+// local web (/api/log/<n>). FleetNest command LOG=<file>[,<from byte>] (0 = the file written now); the box POSTs
+// the file in pieces to .../log?file=<n>&off=<byte>&size=<bytes>, the server appends and answers "next=<byte>"
+// (what it has) - after a break the box goes on from there, as the OTA download (p74). The size is taken at the
+// start: the file being written is sent up to that point. Status lines: "LOG <n> start size=<b> from=<b>",
+// "LOG <n> done <b>", "LOG <n> ERR ...".
+#define LOG_CHUNK    8192            // one POST
+#define LOG_GAP_MS   2000UL          // between two POSTs - the upload never holds the line long (records first)
+#define LOG_RETRY_MS 60000UL         // after an error (no answer, HTTP error), as the OTA retry
+#define LOG_TRIES    10
+uint32_t telemetryFileId();          // telemetry.cpp: the file written now
+static volatile bool s_logReq;
+static uint32_t s_logFile, s_logOff, s_logSize, s_logAt, s_logWait;
+static uint8_t s_logTries;
+static uint8_t* s_logBuf;            // LOG_CHUNK in PSRAM, taken at the first LOG
+
+bool otaLogRequest(uint32_t file, uint32_t from)
+{
+  if (s_logReq) return false;
+  s_logFile = file ? file : telemetryFileId();
+  s_logOff = from;
+  s_logSize = 0;
+  s_logTries = 0;
+  s_logAt = 0;
+  s_logWait = 0;
+  s_logReq = true;
+  return true;
+}
+
+static int httpPost(OtaConn& c, const char* path, const uint8_t* body, int n, String* answer)
+{
+  c.rn = c.rp = 0;
+  if (!c.connect(s_host, s_port)) return -1;
+  char req[400];
+  snprintf(req, sizeof(req), "POST %s HTTP/1.1\r\nHost: %s\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n"
+           "Connection: close\r\n\r\n", path, s_host, n);
+  c.write(req);
+  c.writeRaw(body, n);
+  String status = c.line(OTA_TIMEOUT_MS);
+  int code = status.length() > 12 ? status.substring(9, 12).toInt() : 0;
+  for (;;) {
+    String h = c.line(OTA_TIMEOUT_MS);
+    if (h.length() <= 1) break;
+  }
+  if (answer) *answer = readAll(c);
+  return code;
+}
+
+static void logEnd(const char* m) { otaLog(m); s_logReq = false; }
+
+static void logTick()
+{
+  if (!s_logReq || (s_logAt && millis() - s_logAt < s_logWait)) return;
+  CellLink* cell = WiFi.status() == WL_CONNECTED ? nullptr : telemetryCellLink();
+  if (WiFi.status() != WL_CONNECTED && !cell) return;   // no network: wait (no try counted)
+  char m[64];
+  if (!s_logBuf) s_logBuf = (uint8_t*)ps_malloc(LOG_CHUNK);
+  if (!s_logBuf) { snprintf(m, sizeof(m), "LOG %u ERR no memory", (unsigned)s_logFile); logEnd(m); return; }
+  char path[200];
+  snprintf(path, sizeof(path), "/DATA/%u.CSV", (unsigned)s_logFile);
+  sdLock();
+  File f = SD.open(path, FILE_READ);
+  bool opened = (bool)f;               // a File is false again after close()
+  int n = -1;
+  if (opened) {
+    if (!s_logSize) s_logSize = f.size();
+    if (s_logOff < s_logSize && f.seek(s_logOff)) {
+      uint32_t want = s_logSize - s_logOff < LOG_CHUNK ? s_logSize - s_logOff : LOG_CHUNK;
+      n = f.read(s_logBuf, want);
+    } else {
+      n = 0;
+    }
+    f.close();
+  }
+  sdUnlock();
+  if (!opened) { snprintf(m, sizeof(m), "LOG %u ERR no file", (unsigned)s_logFile); logEnd(m); return; }
+  if (!s_logAt) {
+    snprintf(m, sizeof(m), "LOG %u start size=%u from=%u", (unsigned)s_logFile, (unsigned)s_logSize, (unsigned)s_logOff);
+    otaLog(m);
+  }
+  s_logAt = millis();
+  if (s_logOff >= s_logSize) {
+    snprintf(m, sizeof(m), "LOG %u done %u", (unsigned)s_logFile, (unsigned)s_logSize);
+    logEnd(m);
+    return;
+  }
+  if (n <= 0) { snprintf(m, sizeof(m), "LOG %u ERR SD read @%u", (unsigned)s_logFile, (unsigned)s_logOff); logEnd(m); return; }
+  if (cell) cell->makeDefault();
+  snprintf(path, sizeof(path), "/api/nestbox/ota/%s/log?file=%u&off=%u&size=%u", s_token, (unsigned)s_logFile,
+           (unsigned)s_logOff, (unsigned)s_logSize);
+  String answer;
+  s_busy = true;
+  int code = httpPost(s_wc, path, s_logBuf, n, &answer);
+  s_wc.stop();
+  s_busy = false;
+  int k = answer.indexOf("next=");
+  if (code == 200 && k >= 0) {
+    uint32_t next = (uint32_t)answer.substring(k + 5).toInt();   // what the server has (normally off + n)
+    s_logOff = next;
+    s_logTries = 0;
+    s_logWait = LOG_GAP_MS;
+    return;
+  }
+  s_logTries++;
+  s_logWait = LOG_RETRY_MS;
+  snprintf(m, sizeof(m), "LOG %u ERR http=%d @%u try %u/%u", (unsigned)s_logFile, code, (unsigned)s_logOff,
+           (unsigned)s_logTries, (unsigned)LOG_TRIES);
+  if (s_logTries >= LOG_TRIES) logEnd(m); else otaLog(m);
+}
+
 static void otaTask(void*)
 {
   uint32_t last = 0;
@@ -508,6 +621,7 @@ static void otaTask(void*)
         s_busy = false;
       }
     }
+    if (!s_staged || !flashAllowed()) logTick();   // PG49
     CellLink* cell = telemetryCellLink();     // p71
     if (cell && !cell->udpDiag) cell->udpDiag = udpDiagNote;
     if (cell && s_dCount && s_token[0] && WiFi.status() != WL_CONNECTED && millis() - s_dAt > 20000) {

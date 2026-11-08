@@ -24,3 +24,5 @@ int otaTakeStatus(uint8_t* out, int cap);   // the oldest pending step line (rec
 void statusLine(const char* text);   // p58: a text line to FleetNest the same way (BOOT, WIFI)
 int otaStatus(char* buf, int size);  // web
 bool otaSet(const char* key, const char* value);   // OTA_TOKEN / OTA_HOST / OTA_PORT
+// PG49: SD data file <file> (0 = the current one) from byte <from> to the OTA server; false = one runs already
+bool otaLogRequest(uint32_t file, uint32_t from);
