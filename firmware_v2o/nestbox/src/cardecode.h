@@ -46,6 +46,11 @@ struct CarValues {
   uint8_t crew;     uint32_t crewAt;                        // p83 READ BSI D997/D998/D99F: bit0 driver belt,
                                                             // bit1 passenger belt, bit2 passenger seated (verified 28.10)
   uint8_t speedDisp; uint32_t speedDispAt;                  // p83 READ BSI D8F9 speed as on the cluster, km/h (verified 50/70)
+  // PG55/PG53 (8.11.2026): 0x572 byte 0 / byte 4 - candidate belt bits on CAN1 (S31 28.10: byte 0 bit 5 = passenger
+  // belt in the one read with the belt on; NEOVERENE); PG57: + 0x4F2 byte 3 (S31: bit 7 inverted = passenger seated
+  // in all 12 reads, 4 seated; NEOVERENE until more drives). c572Chg counts changes of any of the three bytes, the
+  // record sends each change once. Why raw: the bits are candidates, FleetNest compares them with READ D997/D998/D99F
+  uint8_t c572b0, c572b4, c4f2b3; uint32_t c572At, c4f2At, c572Chg;
 };
 
 void carSetProfile(const char* p);    // "K0" or "" (none)

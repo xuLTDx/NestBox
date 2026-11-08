@@ -61,6 +61,7 @@ const char* bootResetInfo(char* buf, int cap);   // main.cpp
 #define PID_REFUEL_CNT 0x3AA     // PG-p12: K0 0x432 byte 6 bits 2-0 refuel counter
 #define PID_CREW       0x3A4     // p83: bit0 driver belt, bit1 passenger belt, bit2 passenger seated
 #define PID_SPEED_DISP 0x3A5     // p83: speed as on the cluster (BSI D8F9), km/h
+#define PID_CREW_CAN   0x3AB     // PG55/PG57: K0 0x572 byte 0, byte 4, 0x4F2 byte 3 raw (belt / seat candidates), in the record after each change
 #define PID_ENGINE_EVENT      0x380   // v1F: 1 = START, 2 = STOP
 #define PID_ENGINE_EVENT_TIME 0x381   // v1F: unix time of the event
 #define CAR_FRESH_MS   5000
@@ -395,8 +396,16 @@ static void makeRecord(int event = 0, time_t when = 0)
     r.u32(PID_REFUEL_VOL, cv.refuelVol);
     r.u32(PID_REFUEL_CNT, cv.refuelCnt);
   }
-  if (cv.crewAt && ms - cv.crewAt < 90000UL) r.u32(PID_CREW, cv.crew);
-  if (cv.speedDispAt && ms - cv.speedDispAt < 90000UL) r.u32(PID_SPEED_DISP, cv.speedDisp);
+  // PG47 (8.11.2026, FleetNest FN62): once per read - before, the value was repeated in every record up to 90 s
+  // (boot 177: "99 km/h" on the cluster speed for ~37 s while the car braked from 100 to 49)
+  static uint32_t crewSent, dispSent, c572Sent;
+  if (cv.crewAt && cv.crewAt != crewSent) { crewSent = cv.crewAt; r.u32(PID_CREW, cv.crew); }
+  if (cv.speedDispAt && cv.speedDispAt != dispSent) { dispSent = cv.speedDispAt; r.u32(PID_SPEED_DISP, cv.speedDisp); }
+  if (cv.c572Chg != c572Sent) {                  // PG55: each change of the 0x572 belt candidate once
+    c572Sent = cv.c572Chg;
+    uint32_t v[3] = {cv.c572b0, cv.c572b4, cv.c4f2b3};
+    r.u32n(PID_CREW_CAN, v, 3);
+  }
   if (cv.ureaAt && ms - cv.ureaAt < CAR_FRESH_MS) {
     r.u32(PID_UREA_KM, cv.ureaKm);
     uint8_t* u = cv.urea;
