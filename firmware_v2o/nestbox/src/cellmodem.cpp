@@ -87,6 +87,43 @@ bool CellLink::at(const char* cmd, unsigned int timeoutMs, const char* expect)
   return ok;
 }
 
+// PG68 a (9.11.2026): which SIM sits in which box, and its phone number for the SMS commands (PG-p8).
+// Why: the number was nowhere - neither read by the box nor stored in FleetNest; the SMS commands
+// (STAV, OTA, ...) need it. ICCID: AT+CICCID -> "+ICCID: <ICCID>" (SIM7600 AT manual V1.10, line 1909),
+// always there. Number: AT+CNUM -> "+CNUM: <alpha>,"<number>",<type>" (line 7245) - only if the SIM has
+// it written (often not, NEOVERENÉ for our SIMs) -> "NUM=-". Only reported, the modem start goes on
+// whatever the answers are. One status line per modem start (FleetNest PID 0x399).
+void statusLine(const char* text);     // ota.cpp
+void CellLink::simInfoLine()
+{
+  char iccid[24] = "-", num[24] = "-";
+  if (at("AT+CICCID\r", 1000)) {
+    const char* p = strstr(m_buf, "+ICCID:");
+    if (p) {
+      p += 7;
+      while (*p == ' ') p++;
+      int n = 0;
+      while (n < (int)sizeof(iccid) - 1 && isalnum((unsigned char)p[n])) { iccid[n] = p[n]; n++; }
+      iccid[n ? n : 1] = 0;
+      if (!n) iccid[0] = '-';
+    }
+  }
+  if (at("AT+CNUM\r", 1000)) {
+    const char* p = strstr(m_buf, "+CNUM:");
+    p = p ? strstr(p, ",\"") : nullptr;   // the second field
+    if (p) {
+      p += 2;
+      int n = 0;
+      while (n < (int)sizeof(num) - 1 && p[n] && p[n] != '"') { num[n] = p[n]; n++; }
+      if (n) num[n] = 0;
+    }
+  }
+  char m[57];
+  snprintf(m, sizeof(m), "SIM ICCID=%s NUM=%s", iccid, num);
+  Serial.printf("[CELL] %s\n", m);
+  statusLine(m);
+}
+
 bool CellLink::alive()
 {
   for (int i = 0; i < 3; i++) if (at("AT\r", 300)) return true;
@@ -151,6 +188,7 @@ bool CellLink::start()
   bool sim = false;
   for (int i = 0; i < 20 && !(sim = at("AT+CPIN?\r", 500, ": READY")); i++) delay(500);
   if (!sim) { snprintf(m_status, sizeof(m_status), "SIM not ready"); return false; }
+  simInfoLine();
   snprintf(m_status, sizeof(m_status), "registering");
   bool reg = false;
   for (uint32_t t = millis(); !reg && millis() - t < 90000; delay(1000)) reg = registered();

@@ -158,6 +158,7 @@ private:
   bool gnssLine(const char* cmd, const char* tag, char* line, int cap);
   bool waitFor(const char* a, const char* b, unsigned int timeoutMs);
   bool alive();
+  void simInfoLine();                // PG68 a: status line "SIM ICCID=<n> NUM=<number>|-" (cellmodem.cpp)
   void pressKey(int ms);
   void lock();
   void unlock();
