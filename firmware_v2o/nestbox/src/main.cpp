@@ -65,6 +65,14 @@ void prepareRestart(const char* why)
   telemetryBeforeRestart();
 }
 
+// PG105 (9.11.2026): SD bus 16 MHz instead of 20 (SDMMC_FREQ_DEFAULT) - TEST. Why: U9K4M3G6 the SD fails a few
+// minutes after power-on with 'sdmmc_send_cmd returned 0x109' (CRC) / 0x107, on this branch (72-101 s) AND on master
+// 2.0.14 (boot 16, 288 s), two different cards; the same master in the Peugeot box works at 20 MHz. OVMS3 defaults
+// to 16000 kHz (sdcard.cpp, 2018 - CP2102 batch gave timeouts + CRC errors at 20 MHz, ovmsdev 17.5.2018) and allows
+// 20 MHz only on boards rev 3.2+ (can_logging.rst). ESP-IDF 5.5 really sets 16 MHz (sdmmc_sd.c:490). Kept only if
+// the errors go away; otherwise back to 20 MHz.
+#define SD_FREQ_KHZ 16000
+
 static bool sdMount()
 {
   // CMD and D0 need pull-ups; the board has them, the internal ones help (OVMS ovms_peripherals.cpp)
@@ -72,7 +80,7 @@ static bool sdMount()
   gpio_set_pull_mode((gpio_num_t)HW_SD_D0, GPIO_PULLUP_ONLY);
   // 1-bit, NEVER format: a card that does not mount stays as it is (OVMS formats it - not here)
   for (int i = 0; i < 3; i++) {
-    if (SD_MMC.begin(SDW_MOUNT, true, false, SDMMC_FREQ_DEFAULT, 5)) return true;
+    if (SD_MMC.begin(SDW_MOUNT, true, false, SD_FREQ_KHZ, 5)) return true;
     nbout.println("[SD] mount failed, retry");
     SD_MMC.end();
     delay(300);
@@ -208,6 +216,7 @@ void setup()
 
   s_sdOk = sdMount();
   sdPinsLine(s_sdOk ? "after-mount" : "mount-failed");   // PG102 (sdwriter.cpp)
+  nbout.printf("[SD] bus %d kHz (PG105 test)\n", SD_FREQ_KHZ);
   if (s_sdOk) {
     nbout.printf("[SD] %llu MB, %llu MB used\n", SD_MMC.totalBytes() >> 20, SD_MMC.usedBytes() >> 20);
     sdwStart();
