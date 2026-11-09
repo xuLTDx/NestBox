@@ -99,8 +99,42 @@ static void apOff()
   statusLine("WIFI AP off");
 }
 
+// PG65 (9.11.2026): WIFI=0 / WIFI=1 from FleetNest. Why: on the bench the box sits in range of NTLIRIS, the
+// telemetry takes WiFi whenever it is up (telemetry.cpp "want = s_wifi.up() ? ..."), so the modem path (PPP,
+// OTA over cell) can only be tested by switching the network off - the user does not want that. Kept in RAM
+// only: every restart / deep-sleep wake starts with WiFi on, so a box can never stay cut off from WiFi OTA.
+// Refused while the modem is off (CELL=0): WiFi off + cell off = no way to send WIFI=1 until a restart.
+// The command arrives in the UDP task (teleclient.cpp), applied here in loop() where the WiFi calls live.
+static volatile int8_t s_wifiReq = -1;         // -1 nothing, 0 off, 1 on
+static bool s_wifiOff;
+bool telemetryCell();                          // telemetry.cpp
+bool wifiRequest(bool on)
+{
+  if (!on && !telemetryCell()) return false;
+  s_wifiReq = on ? 1 : 0;
+  return true;
+}
+
 static void wifiTick()
 {
+  int8_t req = s_wifiReq;
+  if (req >= 0) {
+    s_wifiReq = -1;
+    if (req == 0 && !s_wifiOff) {
+      WiFi.disconnect(true);
+      WiFi.mode(WIFI_OFF);
+      s_apOn = false;
+      s_wifiOff = true;
+      statusLine("WIFI off (WIFI=0, until WIFI=1 or restart)");
+    } else if (req == 1 && s_wifiOff) {
+      s_wifiOff = false;
+      WiFi.mode(WIFI_STA);
+      s_wifiTry = 0;                           // scan right now, not after WIFI_RETRY_MS
+      s_knownAt = millis();
+      statusLine("WIFI on (WIFI=1)");
+    }
+  }
+  if (s_wifiOff) return;
   if (WiFi.status() == WL_CONNECTED) { s_knownAt = millis(); apOff(); return; }
   if (s_apOn && !webApAllowed()) apOff();
   if (!s_apOn && webApAllowed() && millis() - s_knownAt > WIFI_AP_AFTER_MS && strlen(webPassword()) >= 8) {

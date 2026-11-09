@@ -13,6 +13,7 @@
 void telemetrySetVehicle(const char* p);   // telemetry.cpp
 bool webSetPassword(const char* pw);       // web.cpp (K13)
 void webSetApAllowed(bool on);            // web.cpp (K12 switch)
+bool wifiRequest(bool on);                // main.cpp (PG65)
 
 extern const char FW_BUILD_STR[];
 #define FIRMWARE_VARIANT "NestBox_v2O"
@@ -220,6 +221,11 @@ void TeleClientUDP::onMessage(char* msg, UdpRx* rx)
     if (cmdp && (!strcmp(cmdp + 4, "AP=1") || !strcmp(cmdp + 4, "AP=0"))) {   // K12 switch
       webSetApAllowed(cmdp[7] == '1');
       statusLine(cmdp[7] == '1' ? "CMD AP=1 OK" : "CMD AP=0 OK");
+    }
+    if (cmdp && (!strcmp(cmdp + 4, "WIFI=1") || !strcmp(cmdp + 4, "WIFI=0"))) {   // PG65 (main.cpp wifiRequest)
+      bool on = cmdp[9] == '1';
+      statusLine(wifiRequest(on) ? (on ? "CMD WIFI=1 OK" : "CMD WIFI=0 OK")
+                                 : "CMD WIFI=0 ERR cell off (CELL=0) - WiFi stays on");
     }
     if (cmdp && !strncmp(cmdp + 4, "SNIFF_VEH=", 10)) {
       char m[64];
