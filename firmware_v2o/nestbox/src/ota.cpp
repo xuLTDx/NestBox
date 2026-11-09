@@ -9,6 +9,8 @@
 #include "nb_sd.h"
 #include "store.h"
 #include "cellmodem.h"
+#include "netlog.h"
+#include <errno.h>
 
 extern const char FW_BUILD_STR[];
 extern nvs_handle_t nvs;
@@ -62,6 +64,12 @@ static char s_last[64] = "-";
 
 static void otaLog(const char* text)
 {
+  {
+    char m[120];                              // PG99/PG98: on /api/serial with the internal + DMA memory at that moment
+    snprintf(m, sizeof(m), "%s | heap=%u dma_max=%u", text, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+    netlogLine(m);
+  }
   logNetEvent(text);
   Serial.println(text);
   portENTER_CRITICAL(&s_mux);
@@ -356,11 +364,22 @@ static void check()
     while (written < size) {
       int want = size - written < OTA_CHUNK ? size - written : OTA_CHUNK;
       int n = c.body(s_buf, want, OTA_TIMEOUT_MS);
-      if (n <= 0) break;
+      if (n <= 0) {                           // PG99: which side stopped - the network ...
+        char d[64];
+        snprintf(d, sizeof(d), "OTA download: network read %d at %u", n, (unsigned)written);
+        netlogLine(d);
+        break;
+      }
       sdLock();
       bool ok = out.write(s_buf, n) == (size_t)n;
+      int e = errno;
       sdUnlock();
-      if (!ok) break;
+      if (!ok) {                              // ... or the SD card
+        char d[80];
+        snprintf(d, sizeof(d), "OTA download: SD write %d bytes failed errno=%d at %u", n, e, (unsigned)written);
+        netlogLine(d);
+        break;
+      }
       mbedtls_sha256_update(&ctx, s_buf, n);
       written += n;
       lastStep("OTA download %u/%u", (unsigned)written, (unsigned)size);

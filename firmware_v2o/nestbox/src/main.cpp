@@ -14,6 +14,7 @@
 #include "canbus1.h"
 #include "ota.h"
 #include "laststep.h"
+#include "netlog.h"
 #include "netlink.h"                           // PG96: WifiLink::saveDns
 #include "standby.h"
 
@@ -189,6 +190,7 @@ void setup()
   lastStep("boot");
   standbyEarly();                             // a deep-sleep wake: confirmed, or asleep again here
   Serial.begin(115200);
+  netlogBegin();                              // PG99: ESP-IDF log copied into RAM for /api/serial
   delay(100);
   Serial.printf("\nNestBox_v2O %s reset=%d step=%s\n", FW_BUILD_STR, (int)esp_reset_reason(), s_prevStep);
 

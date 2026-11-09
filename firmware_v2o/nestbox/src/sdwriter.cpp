@@ -1,6 +1,7 @@
 // SD writer - see sdwriter.h. Copied unchanged from NestBox_v1F (firmware_v5/telelogger);
 // the card is mounted by SD_MMC at the same SDW_MOUNT, the writes are the same POSIX calls.
 #include "sdwriter.h"
+#include "netlog.h"
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
@@ -37,6 +38,10 @@ static void noteError(const char* op, int err)
   s_lastErrErrno = err;
   strncpy(s_lastErrOp, op, sizeof(s_lastErrOp) - 1);
   Serial.printf("[SDW] %s failed errno=%d\n", op, err);
+  char m[64];
+  snprintf(m, sizeof(m), "[SDW] %s failed errno=%d heap=%u dma_max=%u", op, err,
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+  netlogLine(m);                              // PG99: on /api/serial (+ PG98: the memory at that moment)
 }
 
 // The card's answer for n bytes at the end of the file: write all + fsync.

@@ -33,6 +33,7 @@ void sdLock();
 void sdUnlock();
 void prepareRestart(const char* why);
 #include "standby.h"
+#include "netlog.h"
 int telemetryStatus(char* buf, int size);
 void telemetrySetRecS(uint32_t s);
 uint32_t telemetryRecS();
@@ -77,6 +78,15 @@ bool webSetPassword(const char* pw)
   s_auth[0].pchAuthString[0] = 0;                  // the library recomputes the Basic string
   s_webPrefs.putString("pw", s_webPw);
   return true;
+}
+
+// PG99: /api/serial?from=<n> - the serial log kept in RAM (netlog.h); read it in a loop with from=<next>
+static int handlerSerial(UrlHandlerParam* param)
+{
+  uint32_t from = strtoul(mwGetVarValue(param->pxVars, "from", "0"), nullptr, 10);
+  param->contentLength = netlogRead(from, param->pucBuffer, param->bufSize);
+  param->contentType = HTTPFILETYPE_TEXT;
+  return FLAG_DATA_RAW;
 }
 
 static int handlerInfo(UrlHandlerParam* param)
@@ -597,6 +607,7 @@ static UrlHandler urlHandlerList[] = {
   {"api/log", handlerLogFile},
   {"api/events", handlerLogEvents},
   {"api/control", handlerControl},
+  {"api/serial", handlerSerial},       // PG99
   {"api/ota", handlerOTA},
   {"api/sniff", handlerSniff},
   {0}
