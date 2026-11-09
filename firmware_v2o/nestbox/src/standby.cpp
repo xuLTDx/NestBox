@@ -7,6 +7,8 @@
 #include "esp32-hal-periman.h"
 #include <soc/rtc.h>
 #include <soc/sens_reg.h>
+#include <driver/gpio.h>
+#include <driver/rtc_io.h>
 #include "canbus1.h"
 #include "txqueue.h"
 #include "ota.h"
@@ -35,6 +37,20 @@ void prepareRestart(const char* why);  // main.cpp
 #define ULP_CHECK_MS    600           // > 2 ULP periods: the run counter must move before the sleep
 #define ULP_TRIES       3
 #define ULP_FALLBACK_S  600           // no ULP: wake every 10 min and measure 12 V (emergency only)
+// PG-p23 / PG60 (2026-11-09, FleetNest FN73, Vojtech). Why: Peugeot 9.11. boot 203 woke "wake=VOLTAGE" at 06:37:52
+// with the engine already running - the driver door opened before the start was never seen (the 12 V rises only
+// with the engine). CAN1 RX (GPIO 26 = an RTC pin) wakes the chip with ext1 at the first dominant bit (the
+// transceiver output is low): SN65HVD233 datasheet SLLS557H 10.3.4 - with RS high (listen only, as the box keeps it)
+// the receiver stays active, 200 uA typ., "monitor the R output pin for a falling edge". ext1, not ext0: ext0 cannot
+// run together with the ULP wake on the ESP32 (esp_sleep.h). Peugeot data (FleetNest DB, box awake): 26.-27.10. and
+// 28.-29.10. 0 CAN1 frames for ~18 h each night (no wakes of the bus by itself seen); 27.10. the first frames
+// 11:17:03 at 11.2 V, engine 14.3 V 11:17:14. NEOVERENE until the bench test: the transceiver part on the board,
+// RS high + its supply kept in deep sleep, ext1 catching a 2-10 us dominant bit, the sleep current.
+// False wakes (bus waking without the engine): more than CAN_WAKE_MAX in CAN_WAKE_WIN_S -> CAN wake off until the
+// engine runs or the 3 h report wake (the BOOT line says "wake=CAN n=<n> off") - precaution, none seen yet.
+#define CAN_WAKE_GPIO   26            // = HW_CAN1_RX
+#define CAN_WAKE_MAX    6
+#define CAN_WAKE_WIN_S  3600
 
 // RTC slow memory, start reserved for the ULP (CONFIG_ULP_COPROC_RESERVE_MEM 512 B = 128 words)
 // p62 (27.10.2026): counters of one sleep, read at the wake - where does the ULP wake fail?
@@ -49,6 +65,11 @@ RTC_DATA_ATTR static uint8_t s_ulpArmed;      // p62: the ULP watched this sleep
 // PG50 (2026-11-08): the ULP did not run before the sleep -> 10 min sleeps (12 V checked at each wake)
 // until it runs again; counted, reported at the next full boot
 RTC_DATA_ATTR static uint16_t s_ulpFallbacks;
+// PG-p23: CAN1 wakes without the engine in the current window, the window start (time()), CAN wake switched off
+RTC_DATA_ATTR static uint8_t s_canWakes;
+RTC_DATA_ATTR static time_t s_canWinAt;
+RTC_DATA_ATTR static uint8_t s_canWakeOff;
+RTC_DATA_ATTR static uint8_t s_canArmed;      // ext1 was on for this sleep (for the STANDBY / test lines)
 
 static char s_wake[48] = "-";
 static char s_ulpStats[56];                   // p62: the last sleep's ULP counters ("" = no ULP sleep)
@@ -183,9 +204,15 @@ static void sleepNow(bool ulp, uint32_t forceSeconds = 0)
     if (s_ulpFallbacks < 0xFFFF) s_ulpFallbacks++;
     if (!forceSeconds && secs > ULP_FALLBACK_S) secs = ULP_FALLBACK_S;
   }
+  // PG-p23: CAN1 RX low now = the bus is not idle (or the RX is stuck) - ext1 would wake at once, so not armed
+  s_canArmed = 0;
+  if (!s_canWakeOff && gpio_get_level((gpio_num_t)CAN_WAKE_GPIO) == 1 &&
+      esp_sleep_enable_ext1_wakeup(1ULL << CAN_WAKE_GPIO, ESP_EXT1_WAKEUP_ALL_LOW) == ESP_OK)
+    s_canArmed = 1;
   esp_sleep_enable_timer_wakeup((uint64_t)secs * 1000000ULL);
   lastStep("deep sleep %lus", (unsigned long)secs);
-  Serial.printf("[STANDBY] deep sleep %lu s%s\n", (unsigned long)secs, ulp ? " + ULP 12 V" : "");
+  Serial.printf("[STANDBY] deep sleep %lu s%s%s\n", (unsigned long)secs, ulp ? " + ULP 12 V" : "",
+                s_canArmed ? " + CAN1" : "");
   Serial.flush();
   esp_deep_sleep_disable_rom_logging();
   esp_deep_sleep_start();
@@ -207,6 +234,9 @@ static void standbyEarlyWake()
   // (after a VOLTAGE wake it has stopped itself with I_END, after a timer wake it was still running)
   ulp_timer_stop();
   delay(250);
+  // PG-p23: an ext1 pin stays an RTC IO after the wake (ESP-IDF sleep_modes docs: rtc_gpio_deinit before it is used
+  // as a digital pin again) - the TWAI driver reads CAN1 RX through the GPIO matrix
+  if (s_canArmed) { rtc_gpio_deinit((gpio_num_t)CAN_WAKE_GPIO); s_canArmed = 0; }
   esp_sleep_wakeup_cause_t c = esp_sleep_get_wakeup_cause();
   unsigned ulpSum = RTC_SLOW_MEM[ULP_LAST] & 0xFFFF;   // the ULP's last 4-sample sum
   if (s_ulpArmed)                     // runs, min/max sum, sums >= threshold, not ready, WAKE issued
@@ -220,7 +250,15 @@ static void standbyEarlyWake()
   if (s_ulpTest) {                    // SLEEP_ULP: report and boot, whatever woke it
     s_ulpTest = 0;
     snprintf(s_wake, sizeof(s_wake), "ULP_TEST %s ulp=%u v=%.2f", c == ESP_SLEEP_WAKEUP_ULP ? "ULP" :
-             c == ESP_SLEEP_WAKEUP_TIMER ? "TIMER" : "OTHER", ulpSum, read12V());
+             c == ESP_SLEEP_WAKEUP_TIMER ? "TIMER" : c == ESP_SLEEP_WAKEUP_EXT1 ? "CAN" : "OTHER", ulpSum, read12V());
+    return;
+  }
+  if (c == ESP_SLEEP_WAKEUP_EXT1) {   // PG-p23: CAN1 woke (door / unlock) - always a full boot, the car is awake
+    time_t now = time(nullptr);
+    if (!s_canWinAt || now - s_canWinAt > CAN_WAKE_WIN_S) { s_canWinAt = now; s_canWakes = 0; }
+    if (s_canWakes < 0xFF) s_canWakes++;
+    if (s_canWakes > CAN_WAKE_MAX) s_canWakeOff = 1;   // reset by the engine (standbyTick) or the report wake
+    snprintf(s_wake, sizeof(s_wake), "CAN n=%u v=%.2f%s", (unsigned)s_canWakes, read12V(), s_canWakeOff ? " off" : "");
     return;
   }
   if (c == ESP_SLEEP_WAKEUP_ULP) {
@@ -249,6 +287,7 @@ static void standbyEarlyWake()
       return;
     }
     s_parked = true;
+    s_canWakeOff = 0; s_canWakes = 0;  // PG-p23: the 3 h report gives the CAN wake a new chance
     snprintf(s_wake, sizeof(s_wake), "REPORT");
   }
 }
@@ -262,11 +301,12 @@ static uint32_t canQuietMs()
 
 static void goStandby()
 {
-  char m[96];
+  char m[160];                        // PG-p23: wake text (<= 47) + canwake
   float v = read12V();
   s_nextReport = time(nullptr) + STANDBY_REPORT_S;
-  snprintf(m, sizeof(m), "STANDBY v=%.2f quiet=%lus wake=%s next_report=%ds", v,
-           (unsigned long)(canQuietMs() / 1000), s_wake, STANDBY_REPORT_S);
+  snprintf(m, sizeof(m), "STANDBY v=%.2f quiet=%lus wake=%s next_report=%ds canwake=%s", v,
+           (unsigned long)(canQuietMs() / 1000), s_wake, STANDBY_REPORT_S,
+           s_canWakeOff ? "off" : gpio_get_level((gpio_num_t)CAN_WAKE_GPIO) ? "on" : "rx_low");
   logNetEvent(m);
   telemetryCellOff();
   prepareRestart("STANDBY");          // sniff file closed, queue saved, SD log synced
@@ -342,7 +382,10 @@ void standbyTick()
   if (millis() - lastCheck < 1000) return;
   lastCheck = millis();
   float v = read12V();
-  if (telemetryEngineOn()) s_parked = false;   // driven off during the parked report: a normal boot now
+  if (telemetryEngineOn()) {
+    s_parked = false;                 // driven off during the parked report: a normal boot now
+    s_canWakeOff = 0; s_canWakes = 0; // PG-p23: an engine run = the CAN wakes were real
+  }
   if (v < 7.0f || telemetryEngineOn() || v >= ENGINE_OFF_VOLTAGE) return;   // bench / engine / charging
   uint32_t need = s_parked ? 10000UL : STANDBY_QUIET_MS;   // the parked report: the car is asleep anyway
   if (canQuietMs() < need) return;
@@ -377,7 +420,8 @@ void standbyTest(uint32_t seconds, bool ulp) { s_testUlp = ulp; s_testS = second
 static void standbyTestNow(uint32_t seconds, bool ulp)
 {
   char m[64];
-  snprintf(m, sizeof(m), "STANDBY TEST %lus %s", (unsigned long)seconds, ulp ? "ULP + timer" : "(timer only)");
+  snprintf(m, sizeof(m), "STANDBY TEST %lus %s canwake=%s", (unsigned long)seconds, ulp ? "ULP + timer" : "(timer only)",
+           s_canWakeOff ? "off" : gpio_get_level((gpio_num_t)CAN_WAKE_GPIO) ? "on" : "rx_low");
   logNetEvent(m);
   if (s_nextReport < time(nullptr) + (time_t)seconds + 60) s_nextReport = time(nullptr) + STANDBY_REPORT_S;
   telemetryCellOff();

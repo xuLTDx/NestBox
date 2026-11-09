@@ -245,3 +245,37 @@ napájanie modemu (K11), APN logika (`nbApnPick`, skúšobné APN), fronta s ACK
    **OTA** na Arduino 3 – overí štart aplikácie 5.5 so starým zavádzačom (Espressif: skúšať so zavádzačom z výroby).
    Kód krokov 1 + 2: vetva `v2o-arduino3` (`/home/claude/Claude/nestbox_a3`), zbuildovaný 5.11., na boxe NEOVERENÝ.
 3. Auto: jazda s OTA cez modem; medzery v zázname > 2 s žiadne; SD = DB ok.
+
+## 10. Budenie od CAN1 (PG-p23, schválené PG60 9.11.2026 – iba vetva v2o-arduino3, test na nových krabičkách)
+
+**Prečo:** FleetNest FN73 (Vojtech). Peugeot 9.11.2026, boot 203: `wake=VOLTAGE` o 06:37:52 a motor už bežal.
+Otvorenie dverí vodiča pred štartom box nevidel, lebo 12 V stúpne až s motorom.
+
+**Overené (9.11.):**
+- Zapojenie: RX CAN1 = GPIO 26 (`hw.h`), čo je RTC pin.
+- ESP32: ext0 nejde spolu s ULP (`esp_sleep.h`, IDF 4.4.6 aj 5.5); ext1 ide.
+- Transceiver: OVMS uvádza „SN65HVD233 or similar“. Datasheet SLLS557H 10.3.4: pri RS vysoko vysielač vypnutý, prijímač aktívny,
+  200 µA typ. / 600 µA max. TI odporúča sledovať zostupnú hranu na R.
+- DB FleetNest, Peugeot, box bdel:
+  - 26.–27.10. a 28.–29.10. ~18 h po 0 rámcov CAN1 – zbernica sa sama nebudila;
+  - 27.10. prvé rámce 11:17:03 pri 11,2 V, motor (14,3 V) 11:17:14.
+
+**Správanie (`standby.cpp`):**
+- Pred spánkom ext1 na GPIO 26 (všetky nízko = dominantný bit), ak je RX práve vysoko.
+  Ak je nízko (zbernica nie je v pokoji), ext1 sa nezapne, aby box nebudilo hneď.
+- Prebudenie `BOOT … wake=CAN n=<počet> v=<12 V>` = vždy plný štart.
+  Ďalej platí 5 min ticha na CAN1 bez motora → spánok.
+- Falošné budenie (opatrenie, zatiaľ nevidené): viac ako 6 budení od CAN za hodinu bez motora → budenie od CAN vypnuté
+  (`wake=CAN n=7 … off`). Zapne sa znova po behu motora alebo po 3 h hlásení.
+- Riadok `STANDBY … canwake=on|off|rx_low` (SD).
+
+**Skúška na stole (12 V laboratórny zdroj pod 12,8 V, nie do Peugeota):**
+- Krabička A zaspí po 5 min ticha. Krabička B alebo iný nástroj pošle rámec na CAN1 → A musí hlásiť `wake=CAN`.
+- Odber A v spánku s ext1 a bez neho.
+- Označenie transceivera na doske.
+
+**NEOVERENÉ:**
+- Či MAX7317 drží RS vysoko a transceiver má v spánku napájanie.
+- Či ext1 zachytí dominantný bit 2–10 µs.
+- Čas od budenia po príjem CAN1.
+- Či Peugeot budí CAN1 už odomknutím, alebo až dverami.
