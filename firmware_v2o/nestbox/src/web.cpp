@@ -263,7 +263,7 @@ static int handlerOTA(UrlHandlerParam* param)
     fw_size = (size_t)atol(cl);
   }
   if (fw_size == 0) return otaErr(param, "ERR: missing Content-Length");
-  Serial.printf("[OTA] Starting update: %u bytes\n", (unsigned)fw_size);
+  nbout.printf("[OTA] Starting update: %u bytes\n", (unsigned)fw_size);
   if (!Update.begin(fw_size)) {
     param->contentLength = snprintf(param->pucBuffer, param->bufSize, "ERR: Update.begin failed: %s", Update.errorString());
     param->contentType = HTTPFILETYPE_TEXT;
@@ -304,13 +304,13 @@ static int handlerOTA(UrlHandlerParam* param)
     written += (size_t)n;
   }
   free(rb);
-  Serial.printf("[OTA] Upload complete: %u bytes\n", (unsigned)written);
+  nbout.printf("[OTA] Upload complete: %u bytes\n", (unsigned)written);
   if (!Update.end()) {
     param->contentLength = snprintf(param->pucBuffer, param->bufSize, "ERR: Update.end failed: %s", Update.errorString());
     param->contentType = HTTPFILETYPE_TEXT;
     return FLAG_DATA_RAW;
   }
-  Serial.println("[OTA] Flash successful, rebooting in 1.5 s");
+  nbout.println("[OTA] Flash successful, rebooting in 1.5 s");
   restartSoon("HTTP_OTA");
   strcpy(param->pucBuffer, "OK");
   param->contentLength = 2;

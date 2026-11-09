@@ -37,7 +37,7 @@ static void noteError(const char* op, int err)
   s_lastErrMs = millis();
   s_lastErrErrno = err;
   strncpy(s_lastErrOp, op, sizeof(s_lastErrOp) - 1);
-  Serial.printf("[SDW] %s failed errno=%d\n", op, err);
+  nbout.printf("[SDW] %s failed errno=%d\n", op, err);
   char m[64];
   snprintf(m, sizeof(m), "[SDW] %s failed errno=%d heap=%u dma_max=%u", op, err,
            (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
@@ -276,7 +276,7 @@ static void goDead()
   sdLock();
   wfCutAndClose(s_data);
   sdUnlock();
-  Serial.println("[SDW] card not answering - telemetry continues without SD copy, sniff stopped");
+  nbout.println("[SDW] card not answering - telemetry continues without SD copy, sniff stopped");
 }
 
 static void handleRequest()

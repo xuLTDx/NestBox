@@ -1,5 +1,6 @@
 // see canbus1.h - the TWAI part is the v1F sniff code (listen-only start/stop, rx task, probe)
 #include "canbus1.h"
+#include "netlog.h"                  // PG101: nbout = Serial + /api/serial
 #include "driver/twai.h"
 #include "esp_timer.h"
 #include "max7317.h"
@@ -78,7 +79,7 @@ void can1Begin()
   s_probeStart = millis();
   s_probeFrames = 0;
   xTaskCreatePinnedToCore(rxTask, "can1rx", 3072, nullptr, 10, nullptr, 0);
-  Serial.printf("[CAN1] listen-only %s\n", ok ? "started" : "FAILED");
+  nbout.printf("[CAN1] listen-only %s\n", ok ? "started" : "FAILED");
 }
 
 void can1Tick()
@@ -86,7 +87,7 @@ void can1Tick()
   if (s_found) return;           // the speed is kept for the rest of the boot (a sleeping car only goes quiet)
   if (s_frames > s_probeFrames) {
     s_found = true;
-    Serial.printf("[CAN1] speed %lu kbit/s\n", (unsigned long)s_speeds[s_speedIdx]);
+    nbout.printf("[CAN1] speed %lu kbit/s\n", (unsigned long)s_speeds[s_speedIdx]);
     return;
   }
   if (millis() - s_probeStart < SPEED_PROBE_MS) return;

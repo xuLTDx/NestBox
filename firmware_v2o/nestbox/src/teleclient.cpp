@@ -1,5 +1,6 @@
 // see teleclient.h - the logic is NestBox_v1F TeleClientUDP, link-neutral
 #include "teleclient.h"
+#include "netlog.h"                  // PG101: nbout = Serial + /api/serial
 #include "store.h"
 #include "txqueue.h"
 #include "udpmsg.h"
@@ -73,7 +74,7 @@ bool TeleClientUDP::notify(uint8_t event, const char* payload)
     if (event == EVENT_ACK) return true;
     int n = link->receive(m_rx, sizeof(m_rx) - 1, 3000);
     if (n <= 0) {
-      Serial.println("[UDP] Timeout");
+      nbout.println("[UDP] Timeout");
       logNetEvent("NET UDP_TIMEOUT");
       continue;
     }
@@ -85,7 +86,7 @@ bool TeleClientUDP::notify(uint8_t event, const char* payload)
     int bad = 0;
     udpSplit(m_rx, n, udpOnMessage, &rx, &bad);
     if (!rx.found) {
-      Serial.printf("[UDP] %s %s\n", bad ? "Checksum mismatch:" : "Invalid reply:", m_rx);
+      nbout.printf("[UDP] %s %s\n", bad ? "Checksum mismatch:" : "Invalid reply:", m_rx);
       logNetEvent(bad ? "NET UDP_CHECKSUM_MISMATCH" : "NET UDP_INVALID_REPLY");
       continue;
     }
@@ -121,7 +122,7 @@ bool TeleClientUDP::connect(bool quick)
     char diag[72];
     snprintf(diag, sizeof(diag), "%s %s %s:%u attempt=%d", event == EVENT_LOGIN ? "LOGIN" : "RECONNECT",
              link->name(), SERVER_HOST, (unsigned)SERVER_PORT, attempts);
-    Serial.println(diag);
+    nbout.println(diag);
     logNetEvent(diag);
     if (!link->open(SERVER_HOST, SERVER_PORT)) {
       logNetEvent("NET OPEN_FAIL");
@@ -166,7 +167,7 @@ bool TeleClientUDP::transmit(const char* packet, unsigned int size)
   if (!link || !link->send(packet, size)) return false;
   txBytes += size;
   txCount++;
-  Serial.printf("[%s] %u bytes sent\n", link->name(), size);
+  nbout.printf("[%s] %u bytes sent\n", link->name(), size);
   return true;
 }
 
@@ -184,7 +185,7 @@ void TeleClientUDP::onMessage(char* msg, UdpRx* rx)
   if (eventID == EVENT_COMMAND) {
     char* cmdp = strstr(msg, "CMD=");
     if (cmdp && !strncmp(cmdp + 4, "OTA_READY", 9)) {
-      Serial.println("[UDP] CMD:OTA_READY");
+      nbout.println("[UDP] CMD:OTA_READY");
       logNetEvent("NET CMD_OTA_READY");
       otaReadyRequested();
     }
@@ -193,7 +194,7 @@ void TeleClientUDP::onMessage(char* msg, UdpRx* rx)
       const char* c = strchr(cmdp + 10, ',');
       uint16_t min = c && c[1] != '*' ? (uint16_t)atoi(c + 1) : 0;
       sniffRequest(on, min);
-      Serial.printf("[UDP] CMD:SNIFF=%d,%u\n", on ? 1 : 0, (unsigned)min);
+      nbout.printf("[UDP] CMD:SNIFF=%d,%u\n", on ? 1 : 0, (unsigned)min);
       logNetEvent(on ? "NET CMD_SNIFF_ON" : "NET CMD_SNIFF_OFF");
     }
     if (cmdp && !strncmp(cmdp + 4, "APN=", 4)) {    // APN from the server, tried first (nbapn.h)
@@ -205,7 +206,7 @@ void TeleClientUDP::onMessage(char* msg, UdpRx* rx)
       int r = nbReadSubmit(cmdp + 9, &seq);
       char m[64];
       snprintf(m, sizeof(m), "NET CMD_READ #%u %s", (unsigned)seq, r ? "refused" : "accepted");
-      Serial.println(m);
+      nbout.println(m);
       logNetEvent(m);
     }
     // settings from FleetNest (27.10.2026, no WiFi needed): car profile and the sniff file's vehicle tag
@@ -235,7 +236,7 @@ void TeleClientUDP::onMessage(char* msg, UdpRx* rx)
 #if NESTBOX_DIAG                                // p60: debug D3 (NAVRH 7) - not in the final build
     if (cmdp && (!strcmp(cmdp + 4, "ULP_READ") || !strcmp(cmdp + 4, "STANDBY?") ||
                  !strncmp(cmdp + 4, "SLEEP_ULP=", 10) || !strncmp(cmdp + 4, "GPS_TEST=", 9))) {   // p59: sleep tests from FleetNest (standby.h)
-      Serial.printf("[UDP] CMD:%s\n", cmdp + 4);
+      nbout.printf("[UDP] CMD:%s\n", cmdp + 4);
       standbyRemote(cmdp + 4);
     }
 #endif
@@ -257,7 +258,7 @@ void TeleClientUDP::onMessage(char* msg, UdpRx* rx)
       bool started = txqResendRequest(f);
       char m[48];
       snprintf(m, sizeof(m), "NET CMD_RESEND file=%u %s", (unsigned)f, started ? "start" : "running");
-      Serial.println(m);
+      nbout.println(m);
       logNetEvent(m);
       // PG-p14: to FleetNest too (before: SD only - the server never saw the command taken)
       snprintf(m, sizeof(m), "CMD RESEND=%u %s", (unsigned)f, started ? "start" : "running");
@@ -286,7 +287,7 @@ void TeleClientUDP::inbound()
   int len = link->receive(m_rx, sizeof(m_rx) - 1, 10);
   if (len <= 0) return;
   m_rx[len] = 0;
-  Serial.printf("[UDP] %s\n", m_rx);
+  nbout.printf("[UDP] %s\n", m_rx);
   rxBytes += len;
   UdpRx rx;
   rx.self = this;

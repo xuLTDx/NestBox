@@ -1,5 +1,6 @@
 // SIM7600G - see cellmodem.h (sources, NAVRH 9 PPP)
 #include "cellmodem.h"
+#include "netlog.h"                  // PG101: nbout = Serial + /api/serial
 #include "max7317.h"
 #include "hw.h"
 #include <sys/time.h>
@@ -120,7 +121,7 @@ void CellLink::simInfoLine()
   }
   char m[57];
   snprintf(m, sizeof(m), "SIM ICCID=%s NUM=%s", iccid, num);
-  Serial.printf("[CELL] %s\n", m);
+  nbout.printf("[CELL] %s\n", m);
   statusLine(m);
 }
 
@@ -175,7 +176,7 @@ bool CellLink::start()
   // NAVRH 9: CMUX or nothing - the old single-UART path (AT sockets, CCH) is gone. A modem that does
   // not take CMUX is switched off; cellTask starts it again (as OVMS: power cycle and retry).
   if (!muxStart()) {
-    Serial.println("[CELL] CMUX failed - power off");
+    nbout.println("[CELL] CMUX failed - power off");
     muxStop();
     pressKey(3000);
     snprintf(m_status, sizeof(m_status), "CMUX failed");
@@ -184,7 +185,7 @@ bool CellLink::start()
   startGnss();
   m_alive = true;
   at("ATI\r", 1000);
-  if (!strstr(m_buf, "7600")) Serial.printf("[CELL] ATI: %s\n", m_buf);   // not the expected model: logged, continue
+  if (!strstr(m_buf, "7600")) nbout.printf("[CELL] ATI: %s\n", m_buf);   // not the expected model: logged, continue
   bool sim = false;
   for (int i = 0; i < 20 && !(sim = at("AT+CPIN?\r", 500, ": READY")); i++) delay(500);
   if (!sim) { snprintf(m_status, sizeof(m_status), "SIM not ready"); return false; }
@@ -198,13 +199,13 @@ bool CellLink::start()
     char* p = strstr(m_buf, "+CGDCONT:");
     char* e = p ? strpbrk(p, "\r\n") : nullptr;
     if (p && e) { *e = 0; snprintf(m_cgdcont, sizeof(m_cgdcont), "%s", p + 9); }
-    Serial.printf("[CELL] stored APN profile: %s\n", m_cgdcont);
+    nbout.printf("[CELL] stored APN profile: %s\n", m_cgdcont);
   }
   // "PPP failed" = registered, but no data session: telemetry.cpp counts it for a trial APN (nbapn.h),
   // as "NETOPEN failed" before NAVRH 9
   if (!pppDial(30000)) { snprintf(m_status, sizeof(m_status), "PPP failed err=%d", m_pppErr); return false; }
   snprintf(m_status, sizeof(m_status), "online ip=%s", m_ipStr);
-  Serial.printf("[CELL] online, PPP ip %s\n", m_ipStr);
+  nbout.printf("[CELL] online, PPP ip %s\n", m_ipStr);
   return true;
 }
 
@@ -287,7 +288,7 @@ bool CellLink::pppDial(uint32_t timeoutMs)
   while (m_dial == 0 && millis() - t < timeoutMs) delay(20);
   if (m_dial != 1) {
     unlock();
-    Serial.printf("[CELL] PPP dial: %s\n", m_dial < 0 ? "refused" : "no CONNECT");
+    nbout.printf("[CELL] PPP dial: %s\n", m_dial < 0 ? "refused" : "no CONNECT");
     return false;
   }
   m_pppMode = true;                    // from here every port 2 byte goes to lwIP
@@ -296,7 +297,7 @@ bool CellLink::pppDial(uint32_t timeoutMs)
     p = pppapi_pppos_create(&s_pppNetif, pppOutCb, pppStatusCb, this);
     m_ppp = p;
   }
-  if (!p) { m_pppMode = false; unlock(); Serial.println("[CELL] pppos_create failed"); return false; }
+  if (!p) { m_pppMode = false; unlock(); nbout.println("[CELL] pppos_create failed"); return false; }
   ppp_set_auth(p, PPPAUTHTYPE_PAP, "", "");   // OVMS: PAP with the configured user/password (empty here)
   ppp_set_usepeerdns(p, 1);                   // up to 2 DNS servers from the network (OVMS gsmpppos.cpp:244)
   int seen = m_pppStatusSeen;
@@ -742,7 +743,7 @@ void CellLink::muxTx(int ch, const uint8_t* d, size_t n)
 bool CellLink::muxStart()
 {
   if (!at("AT+CMUX=0;+CATR=6\r", 2000)) {      // OVMS simcom_7600.cpp:232
-    Serial.printf("[CELL] AT+CMUX: %s\n", m_buf);
+    nbout.printf("[CELL] AT+CMUX: %s\n", m_buf);
     return false;
   }
   delay(200);
@@ -767,11 +768,11 @@ bool CellLink::muxStart()
     }
     ok = m_chOpen[c];
   }
-  if (!ok) { unlock(); Serial.println("[CELL] CMUX channel did not open"); return false; }
+  if (!ok) { unlock(); nbout.println("[CELL] CMUX channel did not open"); return false; }
   at("ATE0\r", 1000);                           // port 4: our AT link
   muxTxStr(2, "ATE0\r");                        // port 2: no echo of the dial line
   unlock();
-  Serial.println("[CELL] CMUX up");
+  nbout.println("[CELL] CMUX up");
   return true;
 }
 

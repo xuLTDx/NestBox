@@ -62,3 +62,27 @@ int netlogRead(uint32_t from, char* out, int cap)
   for (uint32_t i = 0; i < n; i++) out[hdr + i] = s_ring[(from + i) % NETLOG_SIZE];
   return hdr + n;
 }
+
+// ------------------------------------------------------------------ PG101 ---
+NbOut nbout;
+static volatile bool s_lineStart = true;
+
+static void addTimed(const uint8_t* b, size_t n)
+{
+  size_t i = 0;
+  while (i < n) {
+    if (s_lineStart) {
+      char t[16];
+      int k = snprintf(t, sizeof(t), "(%lu) ", (unsigned long)millis());
+      add(t, k);
+      s_lineStart = false;
+    }
+    size_t j = i;
+    while (j < n && b[j] != '\n') j++;
+    if (j < n) { add((const char*)b + i, j - i + 1); s_lineStart = true; i = j + 1; }
+    else { add((const char*)b + i, n - i); i = n; }
+  }
+}
+
+size_t NbOut::write(uint8_t c) { addTimed(&c, 1); return Serial.write(c); }
+size_t NbOut::write(const uint8_t* b, size_t n) { addTimed(b, n); return Serial.write(b, n); }

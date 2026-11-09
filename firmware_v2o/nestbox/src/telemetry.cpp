@@ -19,6 +19,7 @@
 #include <Preferences.h>
 #include <nvs.h>
 #include "store.h"
+#include "netlog.h"                  // PG101: nbout = Serial + /api/serial
 #include "txqueue.h"
 #include "sddigest.h"
 #include "sdwriter.h"
@@ -168,7 +169,7 @@ struct Rec {
   {
     int len = wire.length();
     if (len && buf[len - 1] == ',') len--;
-    if (!txqPush(ts, buf, len)) Serial.println("[TXQ] record not queued");
+    if (!txqPush(ts, buf, len)) nbout.println("[TXQ] record not queued");
     sdwDataMark(ts);             // confirmed to the queue once the card has these lines
   }
 };
@@ -916,7 +917,7 @@ static void netTask(void*)
       s_client.setLink(cur);
       char m[40];
       snprintf(m, sizeof(m), "NET LINK %s", cur ? cur->name() : "none");
-      Serial.println(m);
+      nbout.println(m);
       logNetEvent(m);
       lastStep("%s", m);
     }
@@ -938,7 +939,7 @@ static void netTask(void*)
       bool ok = s_client.connect();
       if (cur == &s_cell) { nbApnAfterLogin(nvs, ok); loadApn(); }   // a trial APN: kept on login, dropped after 2 failures
       if (!ok) { vTaskDelay(pdMS_TO_TICKS(10000)); continue; }
-      Serial.printf("[NET] logged in as %s\n", devid);
+      nbout.printf("[NET] logged in as %s\n", devid);
     }
     int n = txqNextPacket(pkt, sizeof(pkt), devid);
     if (n > 0) {
@@ -963,7 +964,7 @@ void telemetryBegin(uint32_t bootId, bool sdOk)
 {
   if (s_gpsNext == 'H' || s_gpsNext == 'C' || s_gpsNext == 'N') s_cell.setGpsStart(s_gpsNext);   // p66, one boot
   s_gpsNext = 0;
-  if (nvs_open("storage", NVS_READWRITE, &nvs) != ESP_OK) Serial.println("[NVS] storage not open");
+  if (nvs_open("storage", NVS_READWRITE, &nvs) != ESP_OK) nbout.println("[NVS] storage not open");
   uint32_t r = 60;
   if (nvs_get_u32(nvs, "REC_S", &r) == ESP_OK && r >= 10) s_recS = r;
   char veh[8] = "K0";
@@ -980,7 +981,7 @@ void telemetryBegin(uint32_t bootId, bool sdOk)
   s_cell.setApn(s_apn);
   s_cell.begin();
   genDeviceID(devid);
-  Serial.printf("[TEL] device ID %s\n", devid);
+  nbout.printf("[TEL] device ID %s\n", devid);
   txqBegin(bootId);
   if (sdOk) {
     uint32_t last = 0;
@@ -1176,7 +1177,7 @@ void readTick()
   nbReadSetResult(seq, res, nrc, resp, len);
   char line[300];
   nbReadLine(line, sizeof(line), seq, &r, res, nrc, resp, len);
-  Serial.println(line);
+  nbout.println(line);
   s_log.logEvent(line);
 }
 

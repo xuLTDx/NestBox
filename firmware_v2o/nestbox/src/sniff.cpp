@@ -2,6 +2,7 @@
 // line format, stats, SD writer hand-off, 60-day purge, auto-off); new here:
 // three buses (TWAI + 2x MCP2515), a bus column, per-bus speed probe and stats.
 #include "sniff.h"
+#include "netlog.h"                  // PG101: nbout = Serial + /api/serial
 #include <SD_MMC.h>
 #include <Preferences.h>
 #include "canbus1.h"
@@ -239,7 +240,7 @@ int sniffFill(char* buf, int cap, uint32_t* frames, bool* last)
   if (millis() - s_lastStats >= STATS_EVERY_MS && n + (int)sizeof(line) < cap) {
     s_lastStats = millis();
     statsLine(line, sizeof(line));
-    Serial.println(line);
+    nbout.println(line);
     int l = strlen(line);
     memcpy(buf + n, line, l);
     n += l;
@@ -338,7 +339,7 @@ static void openFile()
   addLine(line);
   addLine("# format: <ms>.<us>,<bus>,<ID hex>,<s=11-bit|x=29-bit>,<dlc>,<data hex>");
   s_fileOk = sdwSniffOpen(path);
-  Serial.printf("[SNIFF] file %s %s\n", path, s_fileOk ? "open" : "FAILED");
+  nbout.printf("[SNIFF] file %s %s\n", path, s_fileOk ? "open" : "FAILED");
 }
 
 static void closeFile(const char* tag)
@@ -351,7 +352,7 @@ static void closeFile(const char* tag)
     s_fileOk = false;
     s_closing = false;
   } else {
-    Serial.println("[SNIFF] file not closed within 5 s (writer still busy)");
+    nbout.println("[SNIFF] file not closed within 5 s (writer still busy)");
   }
 }
 
@@ -387,7 +388,7 @@ int sniffPurgeOld(time_t now)
     snprintf(path, sizeof(path), SNIFF_DIR "/%s", names[i]);
     if (SD_MMC.remove(path)) {
       removed++;
-      Serial.printf("[SNIFF] removed %s (older than %u days)\n", path, (unsigned)SNIFF_KEEP_DAYS);
+      nbout.printf("[SNIFF] removed %s (older than %u days)\n", path, (unsigned)SNIFF_KEEP_DAYS);
     }
   }
   sdUnlock();
@@ -413,7 +414,7 @@ static void makeTasks()
     s_queue = (Frame*)malloc(sizeof(Frame) * 512);
     s_queueCap = 512;
   }
-  Serial.printf("[SNIFF] queue %lu frames\n", (unsigned long)s_queueCap);
+  nbout.printf("[SNIFF] queue %lu frames\n", (unsigned long)s_queueCap);
 #ifdef TEST_SNIFF_LOAD
   xTaskCreate(loadTask, "sniffload", 2048, nullptr, 5, nullptr);
 #endif
@@ -424,7 +425,7 @@ static bool startNow(uint16_t minutes)
   int used = sdUsedPct();
   if (used >= s_sdLimitPct) {
     s_refused = true;
-    Serial.printf("[SNIFF] NOT started: SD %d %% full (limit %d %%)\n", used, s_sdLimitPct);
+    nbout.printf("[SNIFF] NOT started: SD %d %% full (limit %d %%)\n", used, s_sdLimitPct);
     return false;
   }
   s_refused = false;
@@ -457,14 +458,14 @@ static bool startNow(uint16_t minutes)
     b.probeStart = millis();
     b.probeFrames = 0;
     b.probeErr = mcpFor(i) ? mcpFor(i)->stats().errIrq : 0;
-    Serial.printf("[SNIFF] CAN%d listen-only %s\n", i + 1, ok ? "started" : "FAILED");
+    nbout.printf("[SNIFF] CAN%d listen-only %s\n", i + 1, ok ? "started" : "FAILED");
     if (i == 1 && b.speedFound) addLine("# can2 speed 500 kbit/s (Peugeot_K0, fixed)");
   }
   xSemaphoreGive(s_canMux);
   s_minLeft = minutes;
   s_minuteMs = millis();
   saveMinutes();
-  Serial.printf("[SNIFF] ON %u min\n", minutes);
+  nbout.printf("[SNIFF] ON %u min\n", minutes);
   return true;
 }
 
@@ -482,7 +483,7 @@ void sniffStopNow()
   s_active = false;
   closeFile("# end");
   saveMinutes();
-  Serial.println("[SNIFF] OFF");
+  nbout.println("[SNIFF] OFF");
 }
 
 void sniffCloseForRestart()
@@ -492,7 +493,7 @@ void sniffCloseForRestart()
   stopBuses();
   s_active = false;
   closeFile("# restart");
-  Serial.println("[SNIFF] closed for restart");
+  nbout.println("[SNIFF] closed for restart");
 }
 
 void sniffSetSdLimit(int pct) { s_sdLimitPct = pct; }
@@ -512,7 +513,7 @@ static void speedTick()
       char line[64];
       snprintf(line, sizeof(line), "# can%d speed %lu kbit/s", i + 1, (unsigned long)s_speeds[b.speedIdx]);
       addLine(line);
-      Serial.println(line);
+      nbout.println(line);
       continue;
     }
     if (millis() - b.probeStart < SPEED_PROBE_MS) continue;
@@ -536,7 +537,7 @@ bool sniffInit()
   s_bus[0].present = true;                    // TWAI is inside the ESP32
   s_bus[1].present = s_mcp1.begin(onMcpFrame);
   s_bus[2].present = s_mcp2.begin(onMcpFrame);
-  Serial.printf("[SNIFF] buses: CAN1 yes, CAN2 %s, CAN3 %s\n", s_bus[1].present ? "yes" : "NO",
+  nbout.printf("[SNIFF] buses: CAN1 yes, CAN2 %s, CAN3 %s\n", s_bus[1].present ? "yes" : "NO",
                 s_bus[2].present ? "yes" : "NO");
   uint16_t m = s_prefs.getUShort("min", 0);
   if (m) sniffRequest(true, m);
@@ -575,7 +576,7 @@ int sniffTick()
     s_minuteMs += 60000;
     if (s_minLeft) s_minLeft--;
     if (!s_minLeft) {
-      Serial.println("[SNIFF] time is up");
+      nbout.println("[SNIFF] time is up");
       sniffStopNow();
       return SNIFF_EV_STOPPED;
     }
@@ -748,7 +749,7 @@ static void checkTask(void*)
       (unsigned long)s_checkFile, (unsigned long)lines, (unsigned long)frames, (unsigned long)lastWritten,
       frames == lastWritten ? 1 : 0, (unsigned long)bad, (unsigned long)gaps, (unsigned long long)firstGapAt,
       (unsigned long)repeats, (unsigned long)sderr, endTag ? 1 : 0);
-  Serial.println(s_checkResult);
+  nbout.println(s_checkResult);
   s_checkRunning = false;
   vTaskDelete(nullptr);
 }

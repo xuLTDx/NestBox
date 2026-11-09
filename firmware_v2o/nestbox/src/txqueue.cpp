@@ -11,6 +11,7 @@
 #include <unistd.h>
 #include <stdarg.h>
 #include "sddigest.h"
+#include "netlog.h"                  // PG101: nbout = Serial + /api/serial
 #include "txqueue.h"
 // esp_spiram_writeback_cache() of ESP-IDF 4.4 is esp_psram_extram_writeback_cache() in ESP-IDF 5
 // (esp_psram/include/esp_private/esp_psram_extram.h - declared here: that header clashes with the Arduino
@@ -222,7 +223,7 @@ static bool validateRing()
     pos = nextPos(pos);
     n++;
   }
-  if (n != H->count) Serial.printf("[TXQ] reserve damaged after %u of %u records\n", (unsigned)n, (unsigned)H->count);
+  if (n != H->count) nbout.printf("[TXQ] reserve damaged after %u of %u records\n", (unsigned)n, (unsigned)H->count);
   s_validN = n;
   s_validCount = H->count;
   H->count = n;
@@ -261,7 +262,7 @@ void txqBegin(uint32_t bootId)
     s_sdTs = s_saved.ts;
     s_sdPos = s_saved.pos;
   }
-  Serial.printf("[TXQ] %s %u KB, %u records kept%s, SD replay %s, standby records restored %u\n",
+  nbout.printf("[TXQ] %s %u KB, %u records kept%s, SD replay %s, standby records restored %u\n",
       s_psram ? "PSRAM" : "internal RAM", (unsigned)(s_cap >> 10), (unsigned)H->count,
       kept ? "" : " (reserve lost)", s_sdActive ? "from saved cursor" : "off", (unsigned)s_sbRestored);
   persist();
@@ -322,7 +323,7 @@ static void dropTail()
         s_sdBoot = e->boot;
         s_sdTs = e->ts;
         s_sdPos = 0;
-        Serial.printf("[TXQ] full - SD replay from file %u ts %u\n", (unsigned)e->file, (unsigned)e->ts);
+        nbout.printf("[TXQ] full - SD replay from file %u ts %u\n", (unsigned)e->file, (unsigned)e->ts);
         ev("DROP %u:%u st=%u fl=%u -> replay start", (unsigned)e->boot, (unsigned)e->ts, e->state, e->flags);
       } else {
         ev("DROP %u:%u st=%u fl=%u replay on at %u:%u", (unsigned)e->boot, (unsigned)e->ts, e->state, e->flags,
@@ -797,14 +798,14 @@ static int buildSdPacket(char* out, int cap, const char* devid, Flight* f)
       s_saved = c;
       nvs_set_blob(nvs, "TXQ_CUR", &c, sizeof(c));
       nvs_commit(nvs);
-      Serial.printf("[TXQ] SD replay deferred (no SD file this boot) at file %u ts %u\n", (unsigned)s_sdFile, (unsigned)s_sdTs);
+      nbout.printf("[TXQ] SD replay deferred (no SD file this boot) at file %u ts %u\n", (unsigned)s_sdFile, (unsigned)s_sdTs);
     } else if (s_sdFile < s_maxFile) {
       // deleted (SD space cleanup) or not written: go on with the next file
       s_sdFile++; s_sdTs = 0; s_sdPos = 0; s_sdBoot = 0;
     } else {
       s_sdActive = false;
       s_replayAbandoned++;
-      Serial.printf("[TXQ] SD replay ended: /DATA/%u.CSV missing\n", (unsigned)s_sdFile);
+      nbout.printf("[TXQ] SD replay ended: /DATA/%u.CSV missing\n", (unsigned)s_sdFile);
       replayEnd("missing");
     }
     return 0;

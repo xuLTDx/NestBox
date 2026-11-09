@@ -1,5 +1,6 @@
 // see store.h - the bodies are NestBox_v1F telestore.cpp
 #include "store.h"
+#include "netlog.h"                  // PG101: nbout = Serial + /api/serial
 #include "nb_sd.h"
 #include "sdwriter.h"
 
@@ -110,9 +111,9 @@ uint32_t DataLog::begin(uint32_t lastId)
   }
   sdUnlock();                                // the SD writer takes the lock itself
   sprintf(path, "/DATA/%u.CSV", (unsigned)m_id);
-  Serial.printf("[SD] data file %s\n", path);
+  nbout.printf("[SD] data file %s\n", path);
   if (!sdwDataOpen(path)) {
-    Serial.println("[SD] data file error");
+    nbout.println("[SD] data file error");
     m_id = 0;
   }
   return m_id;

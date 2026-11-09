@@ -1,5 +1,6 @@
 // Standby of NestBox_v2O - see standby.h.
 #include "standby.h"
+#include "netlog.h"                  // PG101: nbout = Serial + /api/serial
 #include <WiFi.h>
 #include <esp_sleep.h>
 #include <esp32/ulp.h>
@@ -200,7 +201,7 @@ static void sleepNow(bool ulp, uint32_t forceSeconds = 0)
   if (ulp && ulpStartChecked(rawX4(ENGINE_OFF_VOLTAGE) + s_thrRaise)) {
     s_ulpArmed = 1;
   } else if (ulp) {                    // PG50: no ULP -> the 12 V is checked by the timer every 10 min
-    Serial.println("[STANDBY] ULP not running - timer 10 min");
+    nbout.println("[STANDBY] ULP not running - timer 10 min");
     if (s_ulpFallbacks < 0xFFFF) s_ulpFallbacks++;
     if (!forceSeconds && secs > ULP_FALLBACK_S) secs = ULP_FALLBACK_S;
   }
@@ -211,7 +212,7 @@ static void sleepNow(bool ulp, uint32_t forceSeconds = 0)
     s_canArmed = 1;
   esp_sleep_enable_timer_wakeup((uint64_t)secs * 1000000ULL);
   lastStep("deep sleep %lus", (unsigned long)secs);
-  Serial.printf("[STANDBY] deep sleep %lu s%s%s\n", (unsigned long)secs, ulp ? " + ULP 12 V" : "",
+  nbout.printf("[STANDBY] deep sleep %lu s%s%s\n", (unsigned long)secs, ulp ? " + ULP 12 V" : "",
                 s_canArmed ? " + CAN1" : "");
   Serial.flush();
   esp_deep_sleep_disable_rom_logging();

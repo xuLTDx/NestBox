@@ -1,5 +1,6 @@
 // MCP2515 listen-only driver - see mcp2515.h.
 #include "mcp2515.h"
+#include "netlog.h"                  // PG101: nbout = Serial + /api/serial
 #include "spibus.h"
 #include "esp_timer.h"
 #include "driver/gpio.h"
@@ -138,7 +139,7 @@ bool Mcp2515::begin(CanRxFn fn)
   // after reset the chip is in configuration mode (CANSTAT 0x80) - that is the probe
   m_present = (readReg(REG_CANSTAT) & MODE_MASK) == MODE_CONFIG;
   if (!m_present) {
-    Serial.printf("[CAN%u] MCP2515 not answering\n", m_bus);
+    nbout.printf("[CAN%u] MCP2515 not answering\n", m_bus);
     return false;
   }
   writeReg(REG_BFPCTRL, 0x3C);                // transceiver transmitter off (OVMS: listen mode)
@@ -177,12 +178,12 @@ bool Mcp2515::start(uint32_t kbit)
   spiXfer(m_cs, ro, ri, 5);
   back[0] = ri[2]; back[1] = ri[3]; back[2] = ri[4];
   if (back[0] != c3 || back[1] != c2 || back[2] != c1) {
-    Serial.printf("[CAN%u] bit timing not taken (%02X %02X %02X)\n", m_bus, back[2], back[1], back[0]);
+    nbout.printf("[CAN%u] bit timing not taken (%02X %02X %02X)\n", m_bus, back[2], back[1], back[0]);
     return false;
   }
   writeReg(REG_CANINTE, 0x23);                // RX0, RX1, error
   if (!setMode(MODE_LISTEN)) {
-    Serial.printf("[CAN%u] listen mode not taken\n", m_bus);
+    nbout.printf("[CAN%u] listen mode not taken\n", m_bus);
     return false;
   }
   m_running = true;

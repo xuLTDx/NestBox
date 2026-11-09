@@ -71,7 +71,7 @@ static void otaLog(const char* text)
     netlogLine(m);
   }
   logNetEvent(text);
-  Serial.println(text);
+  nbout.println(text);
   portENTER_CRITICAL(&s_mux);
   uint8_t slot = (s_head + s_count) % OTA_STATUS_Q;
   if (s_count == OTA_STATUS_Q) s_head = (s_head + 1) % OTA_STATUS_Q;
@@ -134,7 +134,7 @@ static uint32_t s_dAt;
 static void udpDiagNote(const char* text)
 {
   logNetEvent(text);
-  Serial.println(text);
+  nbout.println(text);
   portENTER_CRITICAL(&s_mux);
   uint8_t slot = (s_dHead + s_dCount) % UDP_DIAG_Q;
   if (s_dCount == UDP_DIAG_Q) s_dHead = (s_dHead + 1) % UDP_DIAG_Q;
