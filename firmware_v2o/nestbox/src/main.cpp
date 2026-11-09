@@ -15,6 +15,7 @@
 #include "ota.h"
 #include "laststep.h"
 #include "netlog.h"
+void sdPinsLine(const char* when);            // sdwriter.cpp (PG102)
 #include "netlink.h"                           // PG96: WifiLink::saveDns
 #include "standby.h"
 
@@ -206,6 +207,7 @@ void setup()
   mx7317Out(MX_CAN1_RS, 1);                   // CAN1 transmitter off from the start
 
   s_sdOk = sdMount();
+  sdPinsLine(s_sdOk ? "after-mount" : "mount-failed");   // PG102 (sdwriter.cpp)
   if (s_sdOk) {
     nbout.printf("[SD] %llu MB, %llu MB used\n", SD_MMC.totalBytes() >> 20, SD_MMC.usedBytes() >> 20);
     sdwStart();

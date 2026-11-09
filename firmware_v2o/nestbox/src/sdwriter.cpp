@@ -2,6 +2,31 @@
 // the card is mounted by SD_MMC at the same SDW_MOUNT, the writes are the same POSIX calls.
 #include "sdwriter.h"
 #include "netlog.h"
+#include "hw.h"
+#include <driver/gpio.h>
+
+// PG102 (9.11.2026): the SD pins' pull-up / pull-down / drive / function, into /api/serial. Why: U9K4M3G6 on
+// Arduino 3.3.11 (ESP-IDF 5.5.5) the SD fails 72-101 s after boot with 'sdmmc_send_cmd returned 0x109' (CRC),
+// on master (Arduino 2.0.14, ESP-IDF 4.4) with the same sdMount() it does not. Arduino 3 SD_MMC.begin() clears
+// the pins (perimanClearPinBus) and ESP-IDF 5.5 sdmmc_host_init_slot() enables the internal pull-ups only with
+// SDMMC_SLOT_FLAG_INTERNAL_PULLUP, which Arduino 3 does not set - our gpio_set_pull_mode() before begin() may be
+// gone. This line shows whether CMD (15) and D0 (2) still have their pull-up after the mount and at the failure.
+void sdPinsLine(const char* when)
+{
+  const int pins[3] = {HW_SD_CLK, HW_SD_CMD, HW_SD_D0};
+  const char* names[3] = {"CLK", "CMD", "D0"};
+  char m[160];
+  int n = snprintf(m, sizeof(m), "SDPINS %s", when);
+  for (int i = 0; i < 3; i++) {
+    gpio_io_config_t c;
+    if (gpio_get_io_config((gpio_num_t)pins[i], &c) == ESP_OK)
+      n += snprintf(m + n, sizeof(m) - n, " %s%d pu=%d pd=%d drv=%d fun=%u", names[i], pins[i], c.pu, c.pd, (int)c.drv,
+                    (unsigned)c.fun_sel);
+    else
+      n += snprintf(m + n, sizeof(m) - n, " %s%d ?", names[i], pins[i]);
+  }
+  netlogLine(m);
+}
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
@@ -42,6 +67,7 @@ static void noteError(const char* op, int err)
   snprintf(m, sizeof(m), "[SDW] %s failed errno=%d heap=%u dma_max=%u", op, err,
            (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
   netlogLine(m);                              // PG99: on /api/serial (+ PG98: the memory at that moment)
+  if (s_errors == 1) sdPinsLine("first-error");   // PG102
 }
 
 // The card's answer for n bytes at the end of the file: write all + fsync.
