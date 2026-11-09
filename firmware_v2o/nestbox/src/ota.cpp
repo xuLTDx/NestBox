@@ -269,6 +269,7 @@ static void check()
   snprintf(path, sizeof(path), "/api/nestbox/ota/%s/meta.json?build=%s&variant=%s", s_token,
            urlBuild().c_str(), OTA_VARIANT);
   if (cell) cell->makeDefault();              // NAVRH 9: the download goes over PPP
+  else WifiLink::makeDefault();               // PG96: WiFi's route + DNS (PPP may have overwritten the DNS)
   OtaConn& c = s_wc;
   otaLog(cell ? "OTA-PULL CHECK cell" : "OTA-PULL CHECK wifi");
   long len = 0;
@@ -476,6 +477,7 @@ static void udpDiagUpload(CellLink* cell)
   }
   if (!sent) return;
   if (cell) cell->makeDefault();
+  else WifiLink::makeDefault();               // PG96
   long len = 0;
   int code = httpGet(s_wc, path, 0, &len);
   s_wc.stop();
@@ -575,6 +577,7 @@ static void logTick()
   }
   if (n <= 0) { snprintf(m, sizeof(m), "LOG %u ERR SD read @%u", (unsigned)s_logFile, (unsigned)s_logOff); logEnd(m); return; }
   if (cell) cell->makeDefault();
+  else WifiLink::makeDefault();               // PG96
   snprintf(path, sizeof(path), "/api/nestbox/ota/%s/log?file=%u&off=%u&size=%u", s_token, (unsigned)s_logFile,
            (unsigned)s_logOff, (unsigned)s_logSize);
   String answer;

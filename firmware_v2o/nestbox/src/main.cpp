@@ -14,6 +14,7 @@
 #include "canbus1.h"
 #include "ota.h"
 #include "laststep.h"
+#include "netlink.h"                           // PG96: WifiLink::saveDns
 #include "standby.h"
 
 extern const char FW_BUILD_STR[] = __DATE__ " " __TIME__;
@@ -167,6 +168,7 @@ static void wifiTick()
   WiFi.begin(WIFI_NETS[best][0], WIFI_NETS[best][1]);
   for (uint32_t t = millis(); millis() - t < WIFI_JOIN_MS && WiFi.status() != WL_CONNECTED;) delay(100);
   if (WiFi.status() == WL_CONNECTED) {
+    WifiLink::saveDns();                      // PG96: DHCP has just set WiFi's DNS - kept (netlink.cpp)
     Serial.printf("[WIFI] %s IP %s\n", WIFI_NETS[best][0], WiFi.localIP().toString().c_str());
     char ln[64];                              // p58: the box's address on a phone hotspot, seen in FleetNest
     snprintf(ln, sizeof(ln), "WIFI %s IP %s", WIFI_NETS[best][0], WiFi.localIP().toString().c_str());

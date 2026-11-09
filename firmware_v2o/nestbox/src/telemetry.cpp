@@ -911,6 +911,7 @@ static void netTask(void*)
       s_client.login = false;
       cur = want;
       if (cur == &s_cell) s_cell.makeDefault();   // NAVRH 9: lwIP route + DNS to PPP (WiFi's DHCP had them)
+      if (cur == &s_wifi) WifiLink::makeDefault();   // PG96: and back to WiFi's (netlink.cpp)
       linkSince = millis();
       s_client.setLink(cur);
       char m[40];
@@ -923,6 +924,7 @@ static void netTask(void*)
       vTaskDelay(pdMS_TO_TICKS(1000));
       continue;
     }
+    if (cur == &s_wifi) WifiLink::restoreDns();   // PG96: PPP coming up overwrites the DNS (netlink.cpp)
     // PG-p1 (c): on the modem, session not reported lost, but no server answer for 15 min -> modem restart
     if (cur == &s_cell && s_cell.up()) {
       uint32_t ref = s_client.lastSyncTime;

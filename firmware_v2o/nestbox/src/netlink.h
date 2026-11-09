@@ -27,4 +27,8 @@ public:
   bool send(const char* data, unsigned int len) override;
   int receive(char* buf, int cap, unsigned int timeoutMs) override;
   void close() override;
+  // PG96 (9.11.2026): WiFi = lwIP default route + WiFi's own DNS servers (netlink.cpp)
+  static void saveDns();             // right after the WiFi join (DHCP has just set its DNS)
+  static void makeDefault();         // route + DNS: when WiFi becomes the link in use, before OTA/LOG over WiFi
+  static void restoreDns();          // DNS only, if PPP overwrote them (netTask, every pass on WiFi)
 };
