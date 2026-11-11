@@ -4,6 +4,7 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <Update.h>
+#include "otaverify.h"
 #include <nvs.h>
 #include <mbedtls/sha256.h>
 #include "nb_sd.h"
@@ -273,6 +274,8 @@ static void check()
   CellLink* cell = WiFi.status() == WL_CONNECTED ? nullptr : telemetryCellLink();
   if (WiFi.status() != WL_CONNECTED && !cell) { otaLog("OTA-PULL STOP no wifi, no cell"); return; }
   if (s_staged) { otaLog("OTA-PULL STAGED waits for engine off"); return; }
+  // PG147: an unconfirmed build does not fetch the next one - the next restart would throw it away anyway
+  if (otaVerifyPending()) { otaLog("OTA-PULL WAIT build not confirmed (no login yet)"); return; }
   char path[300];
   snprintf(path, sizeof(path), "/api/nestbox/ota/%s/meta.json?build=%s&variant=%s", s_token,
            urlBuild().c_str(), OTA_VARIANT);
@@ -309,6 +312,9 @@ static void check()
     if (a >= 0 && b > a) sha = body.substring(a + 1, b);
   }
   if (size < OTA_MIN_SIZE || sha.length() != 64) { otaLog("OTA-PULL ERR=META_FIELDS"); return; }
+  // PG147: this image went back to the previous build once (crash / no login in 15 min) - never again
+  // (each try = download + flash + 15 min awake on a parked car); a new build from the server has a new sha256
+  if (otaVerifyRejected(sha.c_str())) { otaLog("OTA-PULL SKIP rejected sha256 (went back once)"); s_retries = 0; return; }
   char m[64];
   snprintf(m, sizeof(m), "OTA-PULL START SIZE=%u", (unsigned)size);
   otaLog(m);
@@ -413,7 +419,7 @@ static void check()
   }
   sdLock();
   File mf = SD.open(OTA_META_PATH, FILE_WRITE);
-  if (mf) { mf.printf("%u\n", (unsigned)size); mf.close(); }
+  if (mf) { mf.printf("%u\n%s\n", (unsigned)size, hex); mf.close(); }   // PG147: + sha256 for otaVerifyFlashed()
   sdUnlock();
   snprintf(path, sizeof(path), "/api/nestbox/ota/%s/ota_confirm?size=%u&sha256=%.16s", s_token,
            (unsigned)size, hex);
@@ -430,6 +436,8 @@ static void flashStaged()
   sdLock();
   File mf = SD.open(OTA_META_PATH, FILE_READ);
   size_t size = mf ? (size_t)mf.readStringUntil('\n').toInt() : 0;
+  String fsha = mf ? mf.readStringUntil('\n') : String();   // PG147: empty in a meta file of an older build
+  fsha.trim();
   if (mf) mf.close();
   File f = SD.open(OTA_PENDING_PATH, FILE_READ);
   size_t actual = f ? f.size() : 0;
@@ -463,6 +471,7 @@ static void flashStaged()
   }
   sdLock(); SD.remove(OTA_PENDING_PATH); SD.remove(OTA_META_PATH); SD.remove(OTA_RESUME_PATH); sdUnlock();
   otaLog("OTA-PULL FLASH OK - restart");
+  otaVerifyFlashed(fsha.c_str());             // PG147
   // p79: the modem off first, as before the sleep (AT+CPOF; fully off after 25-26 s per the SIM7600G
   // Hardware Design table 9) - the new firmware then finds it off and its start() step 1 powers it on
   telemetryCellOff();
@@ -624,7 +633,7 @@ static void otaTask(void*)
   uint32_t last = 0;
   vTaskDelay(pdMS_TO_TICKS(60000));          // after the boot: network and clock first
   for (;;) {
-    if (s_staged && flashAllowed()) flashStaged();
+    if (s_staged && flashAllowed() && !otaVerifyPending()) flashStaged();   // PG147: not over an unconfirmed build
     if (s_retryAt && millis() - s_retryAt > 60000) {   // p74: resume the broken download
       s_retryAt = 0;
       char m[40];
@@ -658,6 +667,7 @@ static void otaTask(void*)
 
 void otaBegin()
 {
+  otaVerifyBegin();                           // PG147: first, the 15 min limit starts as early as possible
   size_t l = sizeof(s_token);
   nvs_get_str(nvs, "OTA_TOKEN", s_token, &l);
   l = sizeof(s_host);

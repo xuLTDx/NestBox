@@ -29,6 +29,7 @@
 #include "cardecode.h"
 #include "canbus1.h"
 #include "ota.h"
+#include "otaverify.h"
 #include "standby.h"
 #include "laststep.h"
 
@@ -940,6 +941,7 @@ static void netTask(void*)
       if (cur == &s_cell) { nbApnAfterLogin(nvs, ok); loadApn(); }   // a trial APN: kept on login, dropped after 2 failures
       if (!ok) { vTaskDelay(pdMS_TO_TICKS(10000)); continue; }
       nbout.printf("[NET] logged in as %s\n", devid);
+      otaVerifyLoggedIn();                       // PG147: a new build is confirmed here
     }
     int n = txqNextPacket(pkt, sizeof(pkt), devid);
     if (n > 0) {

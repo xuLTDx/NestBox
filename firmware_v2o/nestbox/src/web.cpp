@@ -34,6 +34,7 @@ void sdUnlock();
 void prepareRestart(const char* why);
 #include "standby.h"
 #include "netlog.h"
+#include "otaverify.h"
 int telemetryStatus(char* buf, int size);
 void telemetrySetRecS(uint32_t s);
 uint32_t telemetryRecS();
@@ -311,6 +312,7 @@ static int handlerOTA(UrlHandlerParam* param)
     return FLAG_DATA_RAW;
   }
   nbout.println("[OTA] Flash successful, rebooting in 1.5 s");
+  otaVerifyFlashed("");                       // PG147: the new build also needs a server login (no sha: never rejected)
   restartSoon("HTTP_OTA");
   strcpy(param->pucBuffer, "OK");
   param->contentLength = 2;

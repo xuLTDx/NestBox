@@ -219,6 +219,13 @@ void setup()
   sniffInit();
   telemetryBegin(s_bootId, s_sdOk);
   otaBegin();                                 // pull-OTA (needs the NVS handle opened by telemetryBegin)
+#ifdef TEST_OTA_CRASH
+  // PG147 bench only: this build crashes 20 s after start, before any server login - the bootloader must boot
+  // the previous build and that one must report 'OTA ROLLBACK crash-or-reset' (otaverify.cpp; bench 11.11.2026: OK)
+  nbout.println("[TEST] TEST_OTA_CRASH: abort in 20 s");
+  delay(20000);
+  abort();
+#endif
   {
     char ln[120] = "BOOT ";                   // p58: reset reason + wake to FleetNest (the BOOT event is SD only)
     bootResetInfo(ln + 5, sizeof(ln) - 5);

@@ -1,4 +1,5 @@
 // Standby of NestBox_v2O - see standby.h.
+#include "otaverify.h"
 #include "standby.h"
 #include "netlog.h"                  // PG101: nbout = Serial + /api/serial
 #include <WiFi.h>
@@ -409,6 +410,9 @@ void standbyTick()
     }
     if (txqPending() && millis() - s_recAt < STANDBY_REPORT_SEND_S * 1000UL) return;
   }
+  // PG147: no deep sleep while a new build waits for its server login - the wake would boot the previous build
+  // (bootloader: reset in PENDING_VERIFY = ABORTED); otaverify.cpp goes back by itself after 15 min
+  if (otaVerifyPending()) return;
   if (otaBusy()) {
     if (!s_otaWaitSince) s_otaWaitSince = millis();
     if (millis() - s_otaWaitSince < STANDBY_OTA_WAIT_MS) return;
