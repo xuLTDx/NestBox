@@ -1,4 +1,5 @@
 // see teleclient.h - the logic is NestBox_v1F TeleClientUDP, link-neutral
+#include "errreport.h"
 #include "teleclient.h"
 #include "store.h"
 #include "txqueue.h"
@@ -74,6 +75,7 @@ bool TeleClientUDP::notify(uint8_t event, const char* payload)
     if (n <= 0) {
       Serial.println("[UDP] Timeout");
       logNetEvent("NET UDP_TIMEOUT");
+      errReport("NET", "udp", "timeout");     // PG149: before only in the SD log
       continue;
     }
     m_rx[n] = 0;
@@ -86,8 +88,10 @@ bool TeleClientUDP::notify(uint8_t event, const char* payload)
     if (!rx.found) {
       Serial.printf("[UDP] %s %s\n", bad ? "Checksum mismatch:" : "Invalid reply:", m_rx);
       logNetEvent(bad ? "NET UDP_CHECKSUM_MISMATCH" : "NET UDP_INVALID_REPLY");
+      errReport("NET", "udp", bad ? "checksum" : "badreply");
       continue;
     }
+    errOk("NET", "udp");
     char* data = rx.reply;
     if (event == EVENT_LOGIN) {
       char* p = strstr(data, "TM=");            // the server's clock
@@ -124,6 +128,7 @@ bool TeleClientUDP::connect(bool quick)
     logNetEvent(diag);
     if (!link->open(SERVER_HOST, SERVER_PORT)) {
       logNetEvent("NET OPEN_FAIL");
+      errReport("NET", "open", link->name());
       delay(1000);
       continue;
     }
@@ -139,7 +144,13 @@ bool TeleClientUDP::connect(bool quick)
     success = true;
     break;
   }
-  if (!success) logNetEvent("NET CONNECT_FAILED_ALL_ATTEMPTS");
+  if (!success) {
+    logNetEvent("NET CONNECT_FAILED_ALL_ATTEMPTS");
+    errReport("NET", "connect", link->name());
+  } else {
+    errOk("NET", "open");
+    errOk("NET", "connect");
+  }
   if (event == EVENT_LOGIN) startTime = millis();
   if (success) lastSyncTime = millis();
   return success;

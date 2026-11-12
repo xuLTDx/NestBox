@@ -1,6 +1,12 @@
 // NestBox_v2O - main. Step 1 of ../NAVRH.md: hardware (MAX7317, SD over
 // SDMMC, CAN1 TWAI + CAN2/CAN3 MCP2515), sniff on all buses, WiFi, local HTTP
 // API with OTA. Step 2a: records to FleetNest over WiFi (telemetry.cpp).
+#include "wdt.h"
+// PG155: limit of loop() (wdt.h). Why 3 min: one pass does web requests (an upload feeds, web.cpp), the CAN READ /
+// probe (one ECU per pass), the standby check; the sleep itself never returns. NEOVERENE whether a web request
+// other than the upload can take longer - the bench test shows it.
+#define WDT_LOOP_MS (180UL * 1000UL)
+#include "errreport.h"
 #include <Arduino.h>
 #include <WiFi.h>
 #include <SD_MMC.h>
@@ -155,6 +161,7 @@ void setup()
   Serial.begin(115200);
   delay(100);
   Serial.printf("\nNestBox_v2O %s reset=%d step=%s\n", FW_BUILD_STR, (int)esp_reset_reason(), s_prevStep);
+  wdtBegin();                                 // PG155: core-1 idle WDT + the task check (wdt.h)
 
   Preferences p;
   p.begin("nestbox", false);
@@ -178,7 +185,19 @@ void setup()
   can1Begin();                                // CAN1 listens all the time (car values; sniff takes its frames)
   sniffInit();
   telemetryBegin(s_bootId, s_sdOk);
+  // PG152 (11.11.2026): a box that boots without a working card sent nothing to the server - only "[SD] NO CARD" on
+  // the serial log; ERR SD write/dead come only from writes to a card that mounted. "ERR SD dead" prefix = the same
+  // e-mail to the Admin in FleetNest as a card that died while running. After telemetryBegin: logNetEvent is set up.
+  if (!s_sdOk) errReport("SD", "dead", "nocard");
+  wdtReportLast();                            // PG155: "ERR SYS wdt <task> <step> <s>s" of the restart before this boot
   otaBegin();                                 // pull-OTA (needs the NVS handle opened by telemetryBegin)
+#ifdef TEST_OTA_CRASH
+  // PG147 bench only: this build crashes 20 s after start, before any server login - the bootloader must boot
+  // the previous build and that one must report 'OTA ROLLBACK crash-or-reset' (otaverify.cpp; a3 bench 11.11.2026: OK)
+  Serial.println("[TEST] TEST_OTA_CRASH: abort in 20 s");
+  delay(20000);
+  abort();
+#endif
   {
     char ln[120] = "BOOT ";                   // p58: reset reason + wake to FleetNest (the BOOT event is SD only)
     bootResetInfo(ln + 5, sizeof(ln) - 5);
@@ -190,10 +209,13 @@ void setup()
   WiFi.setAutoReconnect(true);
   wifiTick();
   webStart();
+  wdtRegister(WDT_LOOP, WDT_LOOP_MS);         // PG155: setup() runs in the loop task - from here on it is watched
 }
 
 void loop()
 {
+  wdtTestPoint(WDT_LOOP);
+  wdtFeed(WDT_LOOP, "loop");
   webProcess(20);
   can1Tick();
   readTick();                                 // READ command: the request waiting for the bus
@@ -201,6 +223,7 @@ void loop()
   if (ev == SNIFF_EV_STARTED) Serial.println("[SNIFF] started");
   wifiTick();
   standbyTick();
+  errTick();                                  // PG149: error summaries + SD / CAN1 counters to the server
   static uint32_t lastPurge;
   if (millis() - lastPurge > 3600000UL || !lastPurge) {   // hourly, once the clock is set
     if (time(nullptr) > 1735689600) { lastPurge = millis(); sniffPurgeOld(time(nullptr)); }

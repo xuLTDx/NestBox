@@ -10,6 +10,8 @@
 //                               READ=<bus>,<tx hex>,<rx hex>,<request hex>
 //   /api/ota                    raw firmware POST (v1F handlerOTA)
 //   /api/sniff, /api/sniff/live?id=&mask=, /api/sniff/list, /api/sniff/<n>[?from=&to=]
+#include "wdt.h"
+#include "otaverify.h"
 #include <Arduino.h>
 #include <WiFi.h>
 #include <SD_MMC.h>
@@ -208,6 +210,9 @@ static int handlerControl(UrlHandlerParam* param)
     else { standbyTest(sec, true); n = snprintf(buf, bufsize, "OK sleep %lu s with ULP in ~2 s", (unsigned long)sec); }
   } else if (!strcmp(cmd, "ULP_READ")) {
     n = standbyUlpRead(buf, bufsize);
+  } else if (!strncmp(cmd, "WDT_TEST=", 9)) {       // PG155 bench: record|net|cell|loop|hog (wdt.h)
+    n = wdtTest(cmd + 9) ? snprintf(buf, bufsize, "OK %s stops in ~1 s, restart within its limit", cmd + 9)
+                         : snprintf(buf, bufsize, "ERR record|net|cell|loop|hog");
   } else if (!strncmp(cmd, "AT=", 3)) {             // modem diagnostics, local only: AT=AT+CGDCONT?
     n = telemetryModemAt(cmd + 3, buf, bufsize);
 #endif
@@ -272,6 +277,7 @@ static int handlerOTA(UrlHandlerParam* param)
   if (!rb) { Update.abort(); return otaErr(param, "ERR: out of memory for recv buffer"); }
   int sock = param->hs->socket;
   while (written < fw_size) {
+    wdtFeedSelf();                            // PG155: an upload over WiFi runs in loop() - a long one is not a hang
     size_t remaining = fw_size - written;
     int to_read = (int)(remaining < OTA_RECV_BUF_SIZE ? remaining : OTA_RECV_BUF_SIZE);
     fd_set rfds;
@@ -303,6 +309,7 @@ static int handlerOTA(UrlHandlerParam* param)
     return FLAG_DATA_RAW;
   }
   Serial.println("[OTA] Flash successful, rebooting in 1.5 s");
+  otaVerifyFlashed("");                       // PG147: the new build also needs a server login (no sha: never rejected)
   restartSoon("HTTP_OTA");
   strcpy(param->pucBuffer, "OK");
   param->contentLength = 2;
