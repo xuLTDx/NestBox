@@ -1,5 +1,6 @@
 // SD writer - see sdwriter.h. Copied unchanged from NestBox_v1F (firmware_v5/telelogger);
 // the card is mounted by SD_MMC at the same SDW_MOUNT, the writes are the same POSIX calls.
+#include "errreport.h"
 #include "sdwriter.h"
 #include "netlog.h"
 #include "hw.h"
@@ -68,6 +69,8 @@ static void noteError(const char* op, int err)
            (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
   netlogLine(m);                              // PG99: on /api/serial (+ PG98: the memory at that moment)
   if (s_errors == 1) sdPinsLine("first-error");   // PG102
+  snprintf(m, sizeof(m), "op=%s errno=%d", op, err);
+  errReport("SD", "write", m);                // PG149: to the server, not only to the failing card
 }
 
 // The card's answer for n bytes at the end of the file: write all + fsync.
@@ -102,6 +105,7 @@ static bool wfAppend(WFile& f, const char* a, int na, const char* b, int nb, con
   if (ok && fsync(f.fd) != 0) { ok = false; op = "fsync"; }
   if (ok) {
     f.confirmed += na + nb;
+    errOk("SD", "write");                     // PG149: nothing unless a write failed before
     return true;
   }
   noteError(op, errno);
@@ -285,6 +289,13 @@ static void goDead()
   s_dead = true;
   xSemaphoreTake(s_ringMux, portMAX_DELAY);
   s_lostBytes += s_head - s_tail;
+  {
+    char d[24];
+    snprintf(d, sizeof(d), "lost=%lu", (unsigned long)s_lostBytes);
+    xSemaphoreGive(s_ringMux);
+    errReport("SD", "dead", d);               // PG149: "ERR SD dead" = e-mail to the Admin (FleetNest)
+    xSemaphoreTake(s_ringMux, portMAX_DELAY);
+  }
   s_tail = s_head;
   s_markTail = s_markHead;
   xSemaphoreGive(s_ringMux);
@@ -418,6 +429,7 @@ void sdwDataClose(uint32_t timeoutMs)
 }
 
 bool sdwDataDead() { return s_dead; }
+uint32_t sdwLostBytes() { return s_lostBytes; }
 
 bool sdwSniffOpen(const char* path)
 {

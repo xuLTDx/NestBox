@@ -14,6 +14,10 @@
 
 #define ENGINE_OFF_VOLTAGE     12.8f      // V, v1F config.h: at or above = engine running
 #define STANDBY_QUIET_MS       300000UL   // CAN1 silent this long -> sleep (5 min, user 21.10.2026)
+// PG148: the 12 V must stay under ENGINE_OFF_VOLTAGE this long without a break before the sleep. Why: bench
+// 11.11.2026 U9K2M3J0 on a steady 13.5 V supply: single read12V() values 12.33-12.58 V (6x in 2 h); at 18:07:40
+// one of them (12.35 V) with CAN quiet sent the box to sleep (boot 11 -> 12, wake=VOLTAGE 8 s later).
+#define STANDBY_LOW_MS         10000UL
 #define STANDBY_REPORT_S       10800      // parked report every 3 h
 #define STANDBY_REPORT_GPS_S   150        // max wait for a fix in the parked report
 #define STANDBY_REPORT_SEND_S  60         // max wait for the delivery after the record

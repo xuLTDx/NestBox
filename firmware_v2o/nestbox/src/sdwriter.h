@@ -38,6 +38,7 @@ void sdwDataMark(uint32_t ts);       // a delivery-queue record ends here (confi
 bool sdwDataSync(uint32_t timeoutMs);     // wait until everything is on the card
 void sdwDataClose(uint32_t timeoutMs);    // sync, then close
 void sdwKick();                      // write now (no waiting)
+uint32_t sdwLostBytes();             // PG149: telemetry bytes that never reached the card
 bool sdwDataDead();                  // the card stopped taking telemetry
 
 // sniff channel - the writer opens/closes the file; sniff.cpp supplies the bytes

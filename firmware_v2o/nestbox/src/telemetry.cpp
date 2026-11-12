@@ -14,6 +14,7 @@
 // (system clock from NTP / the server's login reply, as v1F does for engine
 // event records - addTimeOf), the 12 V level, the chip temperature, the WiFi
 // signal, and the SD fingerprint (PID 0x398) every 10 min.
+#include "errreport.h"
 #include <Arduino.h>
 #include <WiFi.h>
 #include <Preferences.h>
@@ -109,9 +110,14 @@ static void ttffCheck()
   if (s_ttffSent || !fx.valid || !s_cell.gpsStartedAt()) return;
   s_ttffSent = true;
   char m[57];
-  snprintf(m, sizeof(m), "GPS ttff=%lus boot=%lus mode=%c ok=%d sats=%u",
-           (unsigned long)((fx.at - s_cell.gpsStartedAt()) / 1000), (unsigned long)(fx.at / 1000),
-           s_cell.gpsMode(), s_cell.gpsStartOk() ? 1 : 0, (unsigned)fx.sats);
+  // PG150: a fix older than the GNSS start = ttff 0 + "pre". Why: Peugeot 27.10. boot 82 sent "GPS ttff=4294967s
+  // boot=4s" - fx.at was before gpsStartedAt() and the unsigned difference wrapped. startGnss() sets the start time
+  // only after up to 2 s + 2 s of commands; a GNSS still running from before (OVMS simcom_7600.cpp: it may) sends
+  // NMEA with a fix meanwhile (NEOVERENE that this was the case in boot 82, the numbers fit).
+  bool pre = (int32_t)(fx.at - s_cell.gpsStartedAt()) < 0;
+  snprintf(m, sizeof(m), "GPS ttff=%lus%s boot=%lus mode=%c ok=%d sats=%u",
+           pre ? 0UL : (unsigned long)((fx.at - s_cell.gpsStartedAt()) / 1000), pre ? " pre" : "",
+           (unsigned long)(fx.at / 1000), s_cell.gpsMode(), s_cell.gpsStartOk() ? 1 : 0, (unsigned)fx.sats);
   statusLine(m);
 }
 static char s_apn[40] = "internet";          // the CELL_APN in force (NVS), home operator 4ka
@@ -119,6 +125,72 @@ static volatile uint32_t s_recS = 60;
 static volatile bool s_otaReq;
 
 void logNetEvent(const char* text) { s_log.logEvent(text); }
+
+// PG149: the modem start result as ERR/OK (errreport.h). The "CELL <status> mux=..." line above says the same in its
+// own words, but FleetNest e-mails the Admin only on a line starting "ERR CELL noanswer" (handoff 11.11.2026).
+static void cellStartErr(bool up, const char* st)
+{
+  static const struct { const char* status; const char* what; } k[] = {
+    {"no answer", "noanswer"}, {"CMUX failed", "cmux"}, {"SIM not ready", "sim"}, {"not registered", "notreg"},
+    {"PPP failed", "ppp"}};
+  for (auto& e : k) {
+    if (up) errOk("CELL", e.what);
+    else if (!strncmp(st, e.status, strlen(e.status))) errReport("CELL", e.what, strncmp(st, "PPP", 3) ? nullptr : st + 11);
+  }
+  if (s_cell.gpsStartedAt()) {               // the GNSS start command was sent (after CMUX)
+    if (s_cell.gpsStartOk()) errOk("GNSS", "start");
+    else errReport("GNSS", "start");
+  }
+}
+
+// PG151: GNSS errors (agreed 11.11.2026, Vojtech + FleetNest handoff).
+// - "ERR GNSS nonmea": the modem runs, no NMEA on port 1 for 10 s (gnssPushed() = -1) -> "OK GNSS nmea".
+// - "ERR GNSS nofix <min>min drives=<n>": 2 drives in a row without a single fix, each >= GNSS_NOFIX_MOVE_MS moving by
+//   the CAN speed -> "OK GNSS fix" at the next fix. Why not "no fix for N min": an underground garage, a parking house
+//   or a tunnel is no fault (Vojtech 11.11.); two whole drives without a fix are - antenna / module. Without a CAN
+//   speed (no car profile) nothing counts: the CAN speed is a required value for every car (notes PROJEKT_STAV 7).
+//   FleetNest ttff 1.-11.11.: Peugeot max 96 s, U9K4M3G6 max 201 s - far under 10 min.
+#define GNSS_NOFIX_MOVE_MS (10UL * 60UL * 1000UL)
+#define GNSS_NOFIX_DRIVES  2
+RTC_DATA_ATTR static uint8_t s_noFixDrives;   // drives in a row without a fix - kept over the deep sleep between them
+RTC_DATA_ATTR static uint32_t s_noFixMin;     // their moving minutes
+static uint32_t s_driveMoveMs, s_driveTickAt;
+static bool s_driveFix;
+
+static void gnssErrTick(const CarValues& cv, bool engineOn, bool started, bool stopped)
+{
+  uint32_t ms = millis();
+  GnssFix fx = fixGet();
+  bool fix = fx.valid && ms - fx.at < 5000;
+  if (fix) errOk("GNSS", "nofix", "fix");
+  if (started) { s_driveMoveMs = 0; s_driveFix = false; s_driveTickAt = ms; }
+  if (engineOn) {
+    if (fix) s_driveFix = true;
+    bool moving = cv.speedAt && ms - cv.speedAt < 3000 && cv.speedKmh >= 3.0f;
+    if (moving && s_driveTickAt) s_driveMoveMs += ms - s_driveTickAt;
+    s_driveTickAt = ms;
+  }
+  if (stopped && s_driveMoveMs >= GNSS_NOFIX_MOVE_MS) {   // a shorter drive changes nothing
+    if (s_driveFix) { s_noFixDrives = 0; s_noFixMin = 0; }
+    else {
+      if (s_noFixDrives < 255) s_noFixDrives++;
+      s_noFixMin += s_driveMoveMs / 60000;
+      if (s_noFixDrives >= GNSS_NOFIX_DRIVES) {
+        char d[32];
+        snprintf(d, sizeof(d), "%lumin drives=%u", (unsigned long)s_noFixMin, (unsigned)s_noFixDrives);
+        errReport("GNSS", "nofix", d);
+      }
+    }
+  }
+  static uint32_t lastNmea;
+  if (s_cellUp && ms - lastNmea >= 10000) {
+    lastNmea = ms;
+    GnssFix g;
+    int r = s_cell.gnssPushed(&g);
+    if (r < 0) errReport("GNSS", "nonmea");
+    else if (r == 1 || s_cell.nmeaSeen()) errOk("GNSS", "nonmea", "nmea");
+  }
+}
 static void loadApn()
 {
   char a[40] = "";
@@ -473,18 +545,22 @@ static void engineTick()
   CarValues cv = carValues();
   uint32_t ms = millis();
   time_t now = time(nullptr);
+  bool started = false, stopped = false;
   if (!s_engineOn) {
     if (cv.rpmPosAt && ms - cv.rpmPosAt < 3000) {
       s_engineOn = true;
+      started = true;
       logNetEvent("ENGINE START");
       makeRecord(1, now);
     }
   } else if (!cv.rpmAt || ms - cv.rpmAt > ENGINE_SILENT_MS) {
     s_engineOn = false;
+    stopped = true;
     time_t when = now - (time_t)((ms - cv.rpmPosAt) / 1000);   // the last rpm > 0
     logNetEvent("ENGINE STOP");
     makeRecord(2, when);
   }
+  gnssErrTick(cv, s_engineOn, started, stopped);   // PG151
   refuelTick(cv);
 }
 
@@ -803,6 +879,7 @@ static void cellTask(void*)
                s_cell.gpsMode(), s_cell.gpsStartOk() ? 1 : 0, s_cell.startStep(),
                (unsigned)(s_cell.startMs() / 1000));   // p79: power key step / seconds
       statusLine(m);                             // p69: visible in FleetNest (Stav zariadenia)
+      cellStartErr(s_cellUp, s_cell.status());   // PG149
     }
     if (!s_cellOn && s_cellUp) { s_cellUp = false; s_cell.stop(); logNetEvent("CELL OFF"); }
     if (s_cellUp && s_cell.muxDead()) {           // p69: no good CMUX frame for 3 min (OVMS) -> restart
@@ -842,6 +919,7 @@ static void cellTask(void*)
                    (unsigned long)tries, s_cell.ip());
           statusLine(m);
           lostAt = 0;
+          errOk("CELL", "ppp");               // PG149: a failed start before, the session is back
         } else if (tries >= CELL_PPP_RETRIES) {
           snprintf(s_cellRestartWhy, sizeof(s_cellRestartWhy), "PPP %lu tries", (unsigned long)tries);
           s_cellRestartReq = true;

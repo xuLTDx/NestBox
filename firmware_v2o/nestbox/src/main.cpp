@@ -1,6 +1,7 @@
 // NestBox_v2O - main. Step 1 of ../NAVRH.md: hardware (MAX7317, SD over
 // SDMMC, CAN1 TWAI + CAN2/CAN3 MCP2515), sniff on all buses, WiFi, local HTTP
 // API with OTA. Step 2a: records to FleetNest over WiFi (telemetry.cpp).
+#include "errreport.h"
 #include <Arduino.h>
 #include <WiFi.h>
 #include <SD_MMC.h>
@@ -218,7 +219,11 @@ void setup()
   can1Begin();                                // CAN1 listens all the time (car values; sniff takes its frames)
   sniffInit();
   telemetryBegin(s_bootId, s_sdOk);
-  otaBegin();                                 // pull-OTA (needs the NVS handle opened by telemetryBegin)
+  // PG152 (11.11.2026): a box that boots without a working card sent nothing to the server - only "[SD] NO CARD" on
+  // the serial log; ERR SD write/dead come only from writes to a card that mounted. "ERR SD dead" prefix = the same
+  // e-mail to the Admin in FleetNest as a card that died while running. After telemetryBegin: logNetEvent is set up.
+  if (!s_sdOk) errReport("SD", "dead", "nocard");
+  otaBegin();                                // pull-OTA (needs the NVS handle opened by telemetryBegin)
 #ifdef TEST_OTA_CRASH
   // PG147 bench only: this build crashes 20 s after start, before any server login - the bootloader must boot
   // the previous build and that one must report 'OTA ROLLBACK crash-or-reset' (otaverify.cpp; bench 11.11.2026: OK)
@@ -248,6 +253,7 @@ void loop()
   if (ev == SNIFF_EV_STARTED) nbout.println("[SNIFF] started");
   wifiTick();
   standbyTick();
+  errTick();                                  // PG149: error summaries + SD / CAN1 counters to the server
   static uint32_t lastPurge;
   if (millis() - lastPurge > 3600000UL || !lastPurge) {   // hourly, once the clock is set
     if (time(nullptr) > 1735689600) { lastPurge = millis(); sniffPurgeOld(time(nullptr)); }

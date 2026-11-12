@@ -70,6 +70,7 @@ public:
   char gpsMode() const { return m_gpsMode; }
   uint32_t gpsStartedAt() const { return m_gpsAt; }   // millis() of the GNSS start command, 0 = not yet
   bool gpsStartOk() const { return m_gpsOk; }
+  bool nmeaSeen() const { return m_nmeaAt && millis() - m_nmeaAt < 10000; }   // PG151: NMEA on port 1 in the last 10 s
   int rssi();                  // dBm, 0 = unknown (AT+CSQ on port 4)
   const char* status() { return m_status; }
   const char* storedApn() { return m_cgdcont; }

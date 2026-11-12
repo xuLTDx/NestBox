@@ -78,6 +78,9 @@ static char s_ulpStats[56];                   // p62: the last sleep's ULP count
 static bool s_parked;
 static uint32_t s_otaWaitSince, s_reportAt, s_recAt;
 static bool s_reportFix, s_reportRecDone;
+static bool s_lowOn;                   // PG148: 12 V under ENGINE_OFF_VOLTAGE since s_lowSince without a break
+static uint32_t s_lowSince;
+static float s_lowMin, s_lowMax;
 static volatile uint32_t s_testS, s_testAt;   // SLEEP_TEST / SLEEP_ULP from the web
 static volatile bool s_testUlp;
 static void standbyTestNow(uint32_t seconds, bool ulp);
@@ -306,7 +309,8 @@ static void goStandby()
   char m[160];                        // PG-p23: wake text (<= 47) + canwake
   float v = read12V();
   s_nextReport = time(nullptr) + STANDBY_REPORT_S;
-  snprintf(m, sizeof(m), "STANDBY v=%.2f quiet=%lus wake=%s next_report=%ds canwake=%s", v,
+  snprintf(m, sizeof(m), "STANDBY v=%.2f low=%.2f-%.2f/%lus quiet=%lus wake=%s next_report=%ds canwake=%s", v,
+           s_lowMin, s_lowMax, (unsigned long)((millis() - s_lowSince) / 1000),
            (unsigned long)(canQuietMs() / 1000), s_wake, STANDBY_REPORT_S,
            s_canWakeOff ? "off" : gpio_get_level((gpio_num_t)CAN_WAKE_GPIO) ? "on" : "rx_low");
   logNetEvent(m);
@@ -388,7 +392,14 @@ void standbyTick()
     s_parked = false;                 // driven off during the parked report: a normal boot now
     s_canWakeOff = 0; s_canWakes = 0; // PG-p23: an engine run = the CAN wakes were real
   }
-  if (v < 7.0f || telemetryEngineOn() || v >= ENGINE_OFF_VOLTAGE) return;   // bench / engine / charging
+  if (v < 7.0f || telemetryEngineOn() || v >= ENGINE_OFF_VOLTAGE) {   // bench / engine / charging
+    s_lowOn = false;                  // PG148: one reading at or above = the 10 s start again
+    return;
+  }
+  if (!s_lowOn) { s_lowOn = true; s_lowSince = millis(); s_lowMin = s_lowMax = v; }
+  if (v < s_lowMin) s_lowMin = v;
+  if (v > s_lowMax) s_lowMax = v;
+  if (millis() - s_lowSince < STANDBY_LOW_MS) return;   // PG148: a single low reading is not a sleep (standby.h)
   uint32_t need = s_parked ? 10000UL : STANDBY_QUIET_MS;   // the parked report: the car is asleep anyway
   if (canQuietMs() < need) return;
   if (s_parked) {
