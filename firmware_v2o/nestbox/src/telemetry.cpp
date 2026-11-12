@@ -14,6 +14,7 @@
 // (system clock from NTP / the server's login reply, as v1F does for engine
 // event records - addTimeOf), the 12 V level, the chip temperature, the WiFi
 // signal, and the SD fingerprint (PID 0x398) every 10 min.
+#include "wdt.h"
 #include "errreport.h"
 #include <Arduino.h>
 #include <WiFi.h>
@@ -125,6 +126,7 @@ static volatile uint32_t s_recS = 60;
 static volatile bool s_otaReq;
 
 void logNetEvent(const char* text) { s_log.logEvent(text); }
+bool telemetryWifiForData();                 // PG164, below netTask
 
 // PG149: the modem start result as ERR/OK (errreport.h). The "CELL <status> mux=..." line above says the same in its
 // own words, but FleetNest e-mails the Admin only on a line starting "ERR CELL noanswer" (handoff 11.11.2026).
@@ -439,7 +441,7 @@ static void makeRecord(int event = 0, time_t when = 0)
   }
   r.f(PID_BATTERY_VOLTAGE, read12V() * 100, "%.0f");    // v1F: 0.01 V units (FleetNest: /100 V)
   r.i32(PID_DEVICE_TEMP, (int32_t)((temprature_sens_read() - 32) / 1.8f));
-  if (WiFi.status() == WL_CONNECTED) r.i32(PID_CSQ, WiFi.RSSI());
+  if (telemetryWifiForData()) r.i32(PID_CSQ, WiFi.RSSI());   // PG164: the signal of the link the data uses
   else if (s_cellUp && s_csq && millis() - s_csqAt < CSQ_FRESH_MS) r.i32(PID_CSQ, s_csq);   // PG-p19: cellTask's reading
   if (sniffActive()) r.u32(PID_SNIFF_LEFT, sniffMinutesLeft());
   static uint32_t lastFrames;
@@ -586,17 +588,30 @@ static uint32_t recordEveryMs()
   return s_recS * 1000UL;
 }
 
+// PG155 (wdt.h): limits of the own watchdog. Why these: the record task never waits for the modem (PG-p19) and
+// loops every 100 ms - 2 min is far above any normal step. The net and cell tasks wait for the modem: AT waits feed
+// (CellLink::waitFor); the PPP dial / up waits are 30 s each (cellmodem.cpp pppDial), the UDP receive 3 s, an SMS send
+// up to 5 + 60 s holds the modem lock; CellLink::start() lasts minutes without coverage, but its parts feed or are short.
+#define WDT_RECORD_MS (120UL * 1000UL)
+#define WDT_NET_MS    (180UL * 1000UL)
+#define WDT_CELL_MS   (180UL * 1000UL)
+
 static void recordTask(void*)
 {
   uint32_t last = 0;
+  wdtRegister(WDT_RECORD, WDT_RECORD_MS);
   for (;;) {
+    wdtTestPoint(WDT_RECORD);
+    wdtFeed(WDT_RECORD, "engine");
     engineTick();
     uint32_t every = recordEveryMs();
     if (!last || millis() - last >= every || s_recNow) {
       last = millis();
+      wdtFeed(WDT_RECORD, "makeRecord");
       makeRecord();
       s_recNow = false;
     }
+    wdtFeed(WDT_RECORD, "wait");
     vTaskDelay(pdMS_TO_TICKS(100));
   }
 }
@@ -766,6 +781,13 @@ static void smsSendLogged(const char* num, const char* text)
 }
 
 // one received SMS: a command from an allowed number, a forwarded answer, or only logged
+// PG155: SMS "RESTART" restarts the whole box this much later. Why 10 s: the reply SMS is sent first (smsHandle) and
+// the status line "SMS RESTART in 10 s" goes into a record (one per record, records every 1-5 s while awake) and
+// so into the delivery queue, which survives the restart (txqueue.cpp) - else nothing would say why the box restarted.
+#define SMS_RESTART_DELAY_MS 10000UL
+static volatile uint32_t s_smsRestartAt;
+void prepareRestart(const char* why);   // main.cpp
+
 static void smsHandle(const char* from, const char* text)
 {
   if (s_fwdUntil && millis() < s_fwdUntil && smsSameNumber(from, s_fwdFrom)) {
@@ -800,6 +822,11 @@ static void smsHandle(const char* from, const char* text)
     strcpy(s_cellRestartWhy, "SMS");
     s_cellRestartReq = true;
     snprintf(reply, sizeof(reply), "%s CELL RESTART ok", devid);
+  } else if (!strncasecmp(c, "RESTART", 7)) {   // PG155: the whole box (CELL RESTART = the modem only)
+    s_smsRestartAt = millis() + SMS_RESTART_DELAY_MS;
+    if (!s_smsRestartAt) s_smsRestartAt = 1;
+    statusLine("SMS RESTART in 10 s");
+    snprintf(reply, sizeof(reply), "%s RESTART in 10 s", devid);
   } else if (!strncasecmp(c, "OTA", 3)) {
     otaRequest();
     snprintf(reply, sizeof(reply), "%s OTA check ok", devid);
@@ -817,7 +844,7 @@ static void smsHandle(const char* from, const char* text)
       snprintf(reply, sizeof(reply), "%s SMS to %s sent, answers forwarded 15 min", devid, num);
     }
   } else {
-    snprintf(reply, sizeof(reply), "%s ? STAV | CELL RESTART | OTA | SMS <cislo> <text>", devid);
+    snprintf(reply, sizeof(reply), "%s ? STAV | CELL RESTART | RESTART | OTA | SMS <cislo> <text>", devid);
   }
   smsSendLogged(from, reply);
 }
@@ -864,8 +891,16 @@ static void cellTask(void*)
 {
   uint32_t lastTry = 0;
   uint32_t lostAt = 0, lastReopen = 0, tries = 0, ackRestartAt = 0;
+  wdtRegister(WDT_CELL, WDT_CELL_MS);
   for (;;) {
+    wdtTestPoint(WDT_CELL);
+    wdtFeed(WDT_CELL, "loop");
+    if (s_smsRestartAt && (int32_t)(millis() - s_smsRestartAt) >= 0) {   // PG155: SMS RESTART, the line went out
+      prepareRestart("SMS RESTART");
+      esp_restart();
+    }
     if (s_cellOn && !s_cellUp && !s_standby && (!lastTry || millis() - lastTry > 300000UL)) {
+      wdtFeed(WDT_CELL, "start");
       lastTry = millis();
       logNetEvent("CELL START");
       s_cell.setApn(nbApnPick(nvs, s_apn));   // a server APN= is tried first (nbapn.h)
@@ -971,21 +1006,100 @@ static void cellTask(void*)
       int q = s_cell.rssi();
       if (q) { s_csq = q; s_csqAt = millis(); }
     }
+    wdtFeed(WDT_CELL, "sms");
     smsTick();                                       // PG-p8
     vTaskDelay(pdMS_TO_TICKS(1000));
   }
 }
 
 // the net task (v1F telemetry(): delivery part)
+// ---- PG164 (12.11.2026): WiFi without internet -> the data over the modem ----------------------------------------
+// Why (master 6e6128e, bench U9K2M3J0 12.11.2026 11:16-11:26): the router blocked the box's traffic but kept it on
+// NTLIRIS with its IP: the box stayed on WiFi ("ERR NET open WIFI", "ERR NET connect WIFI"), the modem was online and unused, 10 min of
+// data waited (sent later from SD, REPLAY sent=807). Before, the modem was used only when WiFi was not joined at all.
+// A WiFi restart would not help where the network gives an IP but has no internet (a hotspot without data): the box
+// gets the IP again and stays - agreed design (Vojtech 12.11.2026, PG164):
+//  - 2 failed logins in a row on WiFi (connect(): 3 attempts each) with the modem online -> this access point (BSSID)
+//    is marked: the data, OTA and the UDP diag go over the modem; WiFi stays joined (the local web works);
+//  - after WIFI_BAD_MS of normal running: the mark is dropped = one new try on WiFi;
+//  - every new WiFi join drops it (arriving at a depot after a drive: WiFi is tried at once), except in the parked
+//    report boot on the same access point: the report has 60 s for its delivery (STANDBY_REPORT_SEND_S), the 2 logins
+//    take ~1 min - so the mark lives in RTC memory over the deep sleep;
+//  - without the modem online the WiFi is used anyway (nothing better).
+//  a3: the modem data is PPP (lwIP), the route + DNS follow lwIP's default netif - netTask makes PPP the default on the
+//  switch (CellLink::makeDefault) and keeps it so while it uses the modem with WiFi still joined (see netTask).
+#define WIFI_BAD_MS     (30UL * 60UL * 1000UL)
+#define WIFI_BAD_LOGINS 2
+RTC_DATA_ATTR static uint8_t s_wifiBadBssid[6];
+RTC_DATA_ATTR static bool s_wifiBadSet;
+static volatile bool s_wifiBad;               // the mark holds for the access point joined now
+static uint32_t s_wifiBadAt;
+static uint8_t s_wifiLoginFails;
+
+static bool bssidNow(uint8_t out[6])
+{
+  if (WiFi.status() != WL_CONNECTED) return false;
+  uint8_t* b = WiFi.BSSID();
+  if (!b) return false;
+  memcpy(out, b, 6);
+  return true;
+}
+
+// netTask, every pass: a new join and the end of the 30 min
+static void wifiBadTick()
+{
+  static bool wasUp;
+  uint8_t b[6];
+  bool up = bssidNow(b);
+  if (up && !wasUp) {                         // a new join
+    s_wifiLoginFails = 0;
+    bool same = s_wifiBadSet && !memcmp(b, s_wifiBadBssid, 6);
+    if (same && standbyParkedBoot()) { s_wifiBad = true; s_wifiBadAt = millis(); }
+    else { s_wifiBad = false; s_wifiBadSet = false; }
+  }
+  if (!up) s_wifiBad = false;                 // the mark (RTC) stays for the same access point
+  wasUp = up;
+  if (s_wifiBad && !standbyParkedBoot() && millis() - s_wifiBadAt >= WIFI_BAD_MS) {
+    s_wifiBad = false;                        // one new try on WiFi (2 failed logins mark it again)
+    s_wifiBadSet = false;
+    s_wifiLoginFails = 0;
+  }
+}
+
+static void wifiLoginResult(bool ok)
+{
+  if (ok) {
+    s_wifiLoginFails = 0;
+    errOk("NET", "wifi-nointernet", "wifi");  // "OK NET wifi", nothing unless it was marked
+    return;
+  }
+  if (++s_wifiLoginFails < WIFI_BAD_LOGINS || !s_cellUp || !s_cell.up()) return;
+  uint8_t b[6];
+  if (!bssidNow(b)) return;
+  memcpy(s_wifiBadBssid, b, 6);
+  s_wifiBadSet = true;
+  s_wifiBad = true;
+  s_wifiBadAt = millis();
+  s_wifiLoginFails = 0;
+  errReport("NET", "wifi-nointernet");
+}
+
+// WiFi for the data (netTask, OTA, UDP diag): joined and not marked - or marked but the modem is not online
+bool telemetryWifiForData() { return WiFi.status() == WL_CONNECTED && (!s_wifiBad || !s_cellUp || !s_cell.up()); }
+
 static void netTask(void*)
 {
   static char pkt[TXQ_PACKET_BUF];
   s_client.reset();
   NetLink* cur = nullptr;
   uint32_t linkSince = 0;
+  wdtRegister(WDT_NET, WDT_NET_MS);
   for (;;) {
-    // WiFi first, the modem when WiFi is not there (v1F: cellular fallback)
-    NetLink* want = s_wifi.up() ? (NetLink*)&s_wifi : (s_cellUp && s_cell.up() ? (NetLink*)&s_cell : nullptr);
+    wdtTestPoint(WDT_NET);
+    wdtFeed(WDT_NET, "loop");
+    // WiFi first, the modem when WiFi is not there (v1F: cellular fallback) or has no internet (PG164)
+    wifiBadTick();
+    NetLink* want = telemetryWifiForData() ? (NetLink*)&s_wifi : (s_cellUp && s_cell.up() ? (NetLink*)&s_cell : nullptr);
     if (want != cur) {
       if (cur) cur->close();
       s_client.login = false;
@@ -1005,6 +1119,12 @@ static void netTask(void*)
       continue;
     }
     if (cur == &s_wifi) WifiLink::restoreDns();   // PG96: PPP coming up overwrites the DNS (netlink.cpp)
+    // PG164: on the modem with WiFi still joined (no internet there) - a WiFi DHCP renewal may make WiFi lwIP's default
+    // again (NEOVERENE whether esp_netif does that on a renewal); PPP back as the default every 10 s (cheap)
+    if (cur == &s_cell && WiFi.status() == WL_CONNECTED) {
+      static uint32_t lastDef;
+      if (millis() - lastDef >= 10000) { lastDef = millis(); s_cell.makeDefault(); }
+    }
     // PG-p1 (c): on the modem, session not reported lost, but no server answer for 15 min -> modem restart
     if (cur == &s_cell && s_cell.up()) {
       uint32_t ref = s_client.lastSyncTime;
@@ -1015,23 +1135,30 @@ static void netTask(void*)
       }
     }
     if (!s_client.login) {
+      wdtFeed(WDT_NET, "login");
       bool ok = s_client.connect();
+      if (cur == &s_wifi) wifiLoginResult(ok);   // PG164
       if (cur == &s_cell) { nbApnAfterLogin(nvs, ok); loadApn(); }   // a trial APN: kept on login, dropped after 2 failures
       if (!ok) { vTaskDelay(pdMS_TO_TICKS(10000)); continue; }
       nbout.printf("[NET] logged in as %s\n", devid);
       otaVerifyLoggedIn();                       // PG147: a new build is confirmed here
     }
+    wdtFeed(WDT_NET, "packet");
     int n = txqNextPacket(pkt, sizeof(pkt), devid);
     if (n > 0) {
+      wdtFeed(WDT_NET, "send");
       if (!s_client.transmit(pkt, n)) {
         txqSendFailed();
         s_client.connect(true);
       }
     }
+    wdtFeed(WDT_NET, "inbound");
     for (int i = 0; i < 4; i++) s_client.inbound();
+    wdtFeed(WDT_NET, "save");
     txqSave(false);
     // nothing heard for 2 min (no ACK, no reply): log in again (v1F "Poor connection")
     if (millis() - s_client.lastSyncTime > 120000UL) {
+      wdtFeed(WDT_NET, "ping");
       if (!s_client.ping()) s_client.login = false;
     }
     if (n <= 0) vTaskDelay(pdMS_TO_TICKS(50));

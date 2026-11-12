@@ -1,6 +1,13 @@
 // NestBox_v2O - main. Step 1 of ../NAVRH.md: hardware (MAX7317, SD over
 // SDMMC, CAN1 TWAI + CAN2/CAN3 MCP2515), sniff on all buses, WiFi, local HTTP
 // API with OTA. Step 2a: records to FleetNest over WiFi (telemetry.cpp).
+#include "crash.h"
+#include "dbglog.h"
+#include "wdt.h"
+// PG155: limit of loop() (wdt.h). Why 3 min: one pass does web requests (an upload feeds, web.cpp), the CAN READ /
+// probe (one ECU per pass), the standby check; the sleep itself never returns. Bench master 12.11.2026: loop() was
+// never restarted during the tests and the OTA over the modem (that runs in the ota task).
+#define WDT_LOOP_MS (180UL * 1000UL)
 #include "errreport.h"
 #include <Arduino.h>
 #include <WiFi.h>
@@ -195,6 +202,8 @@ void setup()
   netlogBegin();                              // PG99: ESP-IDF log copied into RAM for /api/serial
   delay(100);
   nbout.printf("\nNestBox_v2O %s reset=%d step=%s\n", FW_BUILD_STR, (int)esp_reset_reason(), s_prevStep);
+  wdtBegin();                                 // PG155: core-1 idle WDT + the task check (wdt.h)
+  crashBegin();                               // PG175: panic reason + backtrace into RTC memory (crash.h)
 
   Preferences p;
   p.begin("nestbox", false);
@@ -223,6 +232,9 @@ void setup()
   // the serial log; ERR SD write/dead come only from writes to a card that mounted. "ERR SD dead" prefix = the same
   // e-mail to the Admin in FleetNest as a card that died while running. After telemetryBegin: logNetEvent is set up.
   if (!s_sdOk) errReport("SD", "dead", "nocard");
+  wdtReportLast();                            // PG155: "ERR SYS wdt <task> <step> <s>s" of the restart before this boot
+  crashReportLast();                          // PG175: "ERR SYS panic ..." + "PANIC bt ..." of a panic before this boot
+  dbglogBegin(s_bootId, s_sdOk);              // PG175: debug log to SD (DEBUG=1), the crash log of the boot before
   otaBegin();                                // pull-OTA (needs the NVS handle opened by telemetryBegin)
 #ifdef TEST_OTA_CRASH
   // PG147 bench only: this build crashes 20 s after start, before any server login - the bootloader must boot
@@ -242,10 +254,13 @@ void setup()
   WiFi.setAutoReconnect(true);
   wifiTick();
   webStart();
+  wdtRegister(WDT_LOOP, WDT_LOOP_MS);         // PG155: setup() runs in the loop task - from here on it is watched
 }
 
 void loop()
 {
+  wdtTestPoint(WDT_LOOP);
+  wdtFeed(WDT_LOOP, "loop");
   webProcess(20);
   can1Tick();
   readTick();                                 // READ command: the request waiting for the bus
@@ -256,6 +271,6 @@ void loop()
   errTick();                                  // PG149: error summaries + SD / CAN1 counters to the server
   static uint32_t lastPurge;
   if (millis() - lastPurge > 3600000UL || !lastPurge) {   // hourly, once the clock is set
-    if (time(nullptr) > 1735689600) { lastPurge = millis(); sniffPurgeOld(time(nullptr)); }
+    if (time(nullptr) > 1735689600) { lastPurge = millis(); sniffPurgeOld(time(nullptr)); dbglogPurge(time(nullptr)); }
   }
 }

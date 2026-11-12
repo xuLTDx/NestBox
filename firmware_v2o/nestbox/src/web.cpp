@@ -10,6 +10,8 @@
 //                               READ=<bus>,<tx hex>,<rx hex>,<request hex>
 //   /api/ota                    raw firmware POST (v1F handlerOTA)
 //   /api/sniff, /api/sniff/live?id=&mask=, /api/sniff/list, /api/sniff/<n>[?from=&to=]
+#include "dbglog.h"
+#include "wdt.h"
 #include <Arduino.h>
 #include <WiFi.h>
 #include <SD_MMC.h>
@@ -205,6 +207,10 @@ static int handlerControl(UrlHandlerParam* param)
                  carProfile(), (unsigned long)v.odoKm, v.odoAt ? (long)(ms - v.odoAt) : -1L, v.fuelL, v.fuelRaw,
                  v.fuelAt ? (long)(ms - v.fuelAt) : -1L, (unsigned long)v.ureaKm, v.urea[0], v.urea[1], v.urea[2],
                  v.urea[3], v.urea[4], v.urea[5], v.urea[6], v.urea[7], v.ureaAt ? (long)(ms - v.ureaAt) : -1L);
+  } else if (!strcmp(cmd, "DEBUG=1") || !strcmp(cmd, "DEBUG=0")) {   // PG175: debug log to SD (dbglog.h)
+    n = snprintf(buf, bufsize, dbglogSet(cmd[6] == '1') ? "OK debug=%c" : "ERR nvs debug=%c", cmd[6]);
+  } else if (!strcmp(cmd, "DEBUG?")) {
+    n = snprintf(buf, bufsize, "debug=%d", dbglogOn() ? 1 : 0);
   } else if (!strcmp(cmd, "STANDBY?")) {
     n = standbyStatus(buf, bufsize);
 #if NESTBOX_DIAG                                    // p60: debug commands D1, D2, D4 (NAVRH 7) - not in the final build
@@ -216,6 +222,9 @@ static int handlerControl(UrlHandlerParam* param)
     uint32_t sec = strtoul(cmd + 10, nullptr, 10);
     if (sec < 10 || sec > 600) n = snprintf(buf, bufsize, "ERR 10..600 s");
     else { standbyTest(sec, true); n = snprintf(buf, bufsize, "OK sleep %lu s with ULP in ~2 s", (unsigned long)sec); }
+  } else if (!strncmp(cmd, "WDT_TEST=", 9)) {       // PG155 bench: record|net|cell|loop|hog (wdt.h)
+    n = wdtTest(cmd + 9) ? snprintf(buf, bufsize, "OK %s stops in ~1 s, restart within its limit", cmd + 9)
+                         : snprintf(buf, bufsize, "ERR record|net|cell|loop|hog|panic");
   } else if (!strcmp(cmd, "ULP_READ")) {
     n = standbyUlpRead(buf, bufsize);
   } else if (!strncmp(cmd, "AT=", 3)) {             // modem diagnostics, local only: AT=AT+CGDCONT?
@@ -281,6 +290,7 @@ static int handlerOTA(UrlHandlerParam* param)
   if (!rb) { Update.abort(); return otaErr(param, "ERR: out of memory for recv buffer"); }
   int sock = param->hs->socket;
   while (written < fw_size) {
+    wdtFeedSelf();                            // PG155: an upload over WiFi runs in loop() - a long one is not a hang
     size_t remaining = fw_size - written;
     int to_read = (int)(remaining < OTA_RECV_BUF_SIZE ? remaining : OTA_RECV_BUF_SIZE);
     fd_set rfds;

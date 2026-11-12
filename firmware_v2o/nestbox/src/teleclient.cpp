@@ -1,4 +1,5 @@
 // see teleclient.h - the logic is NestBox_v1F TeleClientUDP, link-neutral
+#include "dbglog.h"
 #include "errreport.h"
 #include "teleclient.h"
 #include "netlog.h"                  // PG101: nbout = Serial + /api/serial
@@ -256,9 +257,15 @@ void TeleClientUDP::onMessage(char* msg, UdpRx* rx)
       telemetrySmsSetting(cmdp + 4, m, sizeof(m));
       statusLine(m);
     }
+    if (cmdp && !strncmp(cmdp + 4, "DEBUG=", 6)) {    // PG175: DEBUG=1|0 - the debug log to SD (dbglog.h)
+      bool on = cmdp[10] == '1';
+      statusLine(dbglogSet(on) ? (on ? "CMD DEBUG=1 OK" : "CMD DEBUG=0 OK") : "CMD DEBUG ERR nvs");
+    }
     if (cmdp && !strncmp(cmdp + 4, "LOG=", 4)) {      // PG49: LOG=<file>[,<from byte>] -> HTTPS upload (ota.cpp)
       char* e = nullptr;
-      uint32_t f = (uint32_t)strtoul(cmdp + 8, &e, 10);
+      // PG175: LOG=D<boot> / LOG=C<boot> = /DEBUG/D<boot>.LOG / C<boot>.LOG, file id 1000000+ / 2000000+<boot>
+      uint32_t base = cmdp[8] == 'D' ? 1000000UL : cmdp[8] == 'C' ? 2000000UL : 0;
+      uint32_t f = base + (uint32_t)strtoul(cmdp + 8 + (base ? 1 : 0), &e, 10);
       uint32_t from = (e && *e == ',') ? (uint32_t)strtoul(e + 1, nullptr, 10) : 0;
       char m[48];
       snprintf(m, sizeof(m), "CMD LOG=%u %s", (unsigned)f, otaLogRequest(f, from) ? "start" : "running");

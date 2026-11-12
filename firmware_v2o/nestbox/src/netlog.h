@@ -4,7 +4,7 @@
 // during OTA (EIO, 4 of 5 downloads) could not be seen without USB. In the car there is never USB.
 // What is kept: every ESP-IDF log line (esp_log_set_vprintf - sdmmc, diskio, wifi, lwip, ...) and the lines
 // given to netlogLine() (sdwriter errors), and since PG101 every print of our code (nbout).
-// RAM only (PSRAM ring, NETLOG_SIZE bytes, the oldest bytes overwritten), lost on restart.
+// RAM only (PSRAM ring, NETLOG_SIZE bytes, the oldest bytes overwritten). PG175: kept over a crash restart.
 #pragma once
 #include <Arduino.h>
 
@@ -25,3 +25,6 @@ extern NbOut nbout;
 // /api/serial?from=<n>: the bytes from position n (older than the ring = from the oldest kept);
 // first line "head=<bytes ever written> from=<n> next=<n>", then the text
 int netlogRead(uint32_t from, char* out, int cap);
+bool netlogTakePrev(char** buf, uint32_t* len);       // PG175: the boot before's last 64 KB (free() it), once
+uint32_t netlogHead();                                // PG175: bytes ever written this boot
+int netlogCopy(uint32_t* from, char* out, int cap, uint32_t* lost);   // PG175: raw bytes from *from (dbglog.cpp)

@@ -19,6 +19,7 @@ void logNetEvent(const char* text);
 void prepareRestart(const char* why);
 void telemetryCellOff();
 bool telemetryEngineOn();
+bool telemetryWifiForData();                 // PG164: WiFi joined and with internet (telemetry.cpp)
 class CellLink;
 CellLink* telemetryCellLink();
 float read12V();
@@ -271,8 +272,8 @@ static bool fileHasMark(const char* path)
 static void check()
 {
   if (!s_token[0]) { otaLog("OTA-PULL STOP no token"); return; }
-  CellLink* cell = WiFi.status() == WL_CONNECTED ? nullptr : telemetryCellLink();
-  if (WiFi.status() != WL_CONNECTED && !cell) { otaLog("OTA-PULL STOP no wifi, no cell"); return; }
+  CellLink* cell = telemetryWifiForData() ? nullptr : telemetryCellLink();   // PG164: not a WiFi without internet
+  if (!telemetryWifiForData() && !cell) { otaLog("OTA-PULL STOP no wifi, no cell"); return; }
   if (s_staged) { otaLog("OTA-PULL STAGED waits for engine off"); return; }
   // PG147: an unconfirmed build does not fetch the next one - the next restart would throw it away anyway
   if (otaVerifyPending()) { otaLog("OTA-PULL WAIT build not confirmed (no login yet)"); return; }
@@ -570,13 +571,15 @@ static void logEnd(const char* m) { otaLog(m); s_logReq = false; }
 static void logTick()
 {
   if (!s_logReq || (s_logAt && millis() - s_logAt < s_logWait)) return;
-  CellLink* cell = WiFi.status() == WL_CONNECTED ? nullptr : telemetryCellLink();
-  if (WiFi.status() != WL_CONNECTED && !cell) return;   // no network: wait (no try counted)
+  CellLink* cell = telemetryWifiForData() ? nullptr : telemetryCellLink();   // PG164
+  if (!telemetryWifiForData() && !cell) return;   // no network: wait (no try counted)
   char m[64];
   if (!s_logBuf) s_logBuf = (uint8_t*)ps_malloc(LOG_CHUNK);
   if (!s_logBuf) { snprintf(m, sizeof(m), "LOG %u ERR no memory", (unsigned)s_logFile); logEnd(m); return; }
   char path[200];
-  snprintf(path, sizeof(path), "/DATA/%u.CSV", (unsigned)s_logFile);
+  if (s_logFile >= 2000000UL) snprintf(path, sizeof(path), "/DEBUG/C%u.LOG", (unsigned)(s_logFile - 2000000UL));   // PG175
+  else if (s_logFile >= 1000000UL) snprintf(path, sizeof(path), "/DEBUG/D%u.LOG", (unsigned)(s_logFile - 1000000UL));
+  else snprintf(path, sizeof(path), "/DATA/%u.CSV", (unsigned)s_logFile);
   sdLock();
   File f = SD.open(path, FILE_READ);
   bool opened = (bool)f;               // a File is false again after close()
@@ -655,7 +658,7 @@ static void otaTask(void*)
     if (!s_staged || !flashAllowed()) logTick();   // PG49
     CellLink* cell = telemetryCellLink();     // p71
     if (cell && !cell->udpDiag) cell->udpDiag = udpDiagNote;
-    if (cell && s_dCount && s_token[0] && WiFi.status() != WL_CONNECTED && millis() - s_dAt > 20000) {
+    if (cell && s_dCount && s_token[0] && !telemetryWifiForData() && millis() - s_dAt > 20000) {
       s_dAt = millis();
       s_busy = true;
       udpDiagUpload(cell);

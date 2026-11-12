@@ -1,4 +1,5 @@
 // SIM7600G - see cellmodem.h (sources, NAVRH 9 PPP)
+#include "wdt.h"
 #include "cellmodem.h"
 #include "netlog.h"                  // PG101: nbout = Serial + /api/serial
 #include "max7317.h"
@@ -67,6 +68,7 @@ bool CellLink::waitFor(const char* a, const char* b, unsigned int timeoutMs)
       if (hitA && strcmp(a, "\r\nOK") != 0) return true;
       if (hitB) return false;
     }
+    wdtFeedSelf();                     // PG155: a task waiting here for the modem is not stuck (wdt.h)
     delay(2);
   } while (millis() - t < timeoutMs);
   return false;

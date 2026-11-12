@@ -3,8 +3,18 @@
 #include <esp_log.h>
 #include <stdarg.h>
 
+// PG175 (12.11.2026): the ring keeps its content over a panic / watchdog restart. Why: a3 bench 12.11. 16:47 PANIC
+// with nothing of what happened before (the ring was new after the restart). The ring sits right after the delivery
+// queue's PSRAM reserve (netlogBegin() is the 2nd PSRAM allocation in setup(), main.cpp) - the same address every
+// boot, and the Arduino PSRAM test spares it (txqueue.cpp testSPIRAM: only the top 64 KB). A header in PSRAM says
+// whether the content is from the boot before (magic + its own address); the head counter lives in it.
+#define RING_MAGIC 0x4E4C4F47u
+struct RingHdr { uint32_t magic, addr; volatile uint32_t head; };
+static RingHdr* s_hdr;
 static char* s_ring;
-static volatile uint32_t s_head;              // bytes ever written; ring index = s_head % NETLOG_SIZE
+#define s_head (s_hdr->head)                  // bytes ever written; ring index = s_head % NETLOG_SIZE
+static char* s_prev64;                        // the boot before's last NETLOG_SIZE bytes (after a crash), or null
+static uint32_t s_prevLen;
 static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 static vprintf_like_t s_prev;
 
@@ -33,9 +43,54 @@ static int hook(const char* fmt, va_list ap)
 void netlogBegin()
 {
   if (s_ring) return;
-  s_ring = (char*)ps_malloc(NETLOG_SIZE);
-  if (!s_ring) return;                        // no PSRAM: no network log (never on this board)
+  uint8_t* m = (uint8_t*)ps_malloc(sizeof(RingHdr) + NETLOG_SIZE);
+  if (!m) return;                             // no PSRAM: no network log (never on this board)
+  RingHdr* h = (RingHdr*)m;
+  char* ring = (char*)(m + sizeof(RingHdr));
+  esp_reset_reason_t r = esp_reset_reason();
+  bool crash = r == ESP_RST_PANIC || r == ESP_RST_TASK_WDT || r == ESP_RST_INT_WDT || r == ESP_RST_WDT || r == ESP_RST_SW;
+  if (crash && h->magic == RING_MAGIC && h->addr == (uint32_t)m && h->head) {
+    uint32_t n = h->head < NETLOG_SIZE ? h->head : NETLOG_SIZE;
+    s_prev64 = (char*)ps_malloc(n);
+    if (s_prev64) {
+      for (uint32_t i = 0; i < n; i++) s_prev64[i] = ring[(h->head - n + i) % NETLOG_SIZE];
+      s_prevLen = n;
+    }
+  }
+  h->magic = RING_MAGIC;
+  h->addr = (uint32_t)m;
+  h->head = 0;
+  s_hdr = h;
+  s_ring = ring;
   s_prev = esp_log_set_vprintf(hook);
+}
+
+// PG175: the boot before's log (after a panic / watchdog / software restart), taken once by dbglog.cpp
+bool netlogTakePrev(char** buf, uint32_t* len)
+{
+  if (!s_prev64) return false;
+  *buf = s_prev64;
+  *len = s_prevLen;
+  s_prev64 = nullptr;
+  return true;
+}
+uint32_t netlogHead() { return s_ring ? s_head : 0; }
+
+// PG175: raw bytes from *from (no header line, as netlogRead has); bytes the ring overwrote meanwhile -> *lost
+int netlogCopy(uint32_t* from, char* out, int cap, uint32_t* lost)
+{
+  if (!s_ring) return 0;
+  portENTER_CRITICAL(&s_mux);
+  uint32_t head = s_head;
+  portEXIT_CRITICAL(&s_mux);
+  uint32_t oldest = head > NETLOG_SIZE ? head - NETLOG_SIZE : 0;
+  if (*from > head) *from = head;            // a new boot's ring (never here: the task starts after netlogBegin)
+  if (*from < oldest) { *lost += oldest - *from; *from = oldest; }
+  uint32_t n = head - *from;
+  if ((int)n > cap) n = cap;
+  for (uint32_t i = 0; i < n; i++) out[i] = s_ring[(*from + i) % NETLOG_SIZE];
+  *from += n;
+  return (int)n;
 }
 
 void netlogLine(const char* text)
