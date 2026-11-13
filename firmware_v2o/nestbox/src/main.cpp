@@ -1,6 +1,7 @@
 // NestBox_v2O - main. Step 1 of ../NAVRH.md: hardware (MAX7317, SD over
 // SDMMC, CAN1 TWAI + CAN2/CAN3 MCP2515), sniff on all buses, WiFi, local HTTP
 // API with OTA. Step 2a: records to FleetNest over WiFi (telemetry.cpp).
+#include "part.h"
 #include "crash.h"
 #include "dbglog.h"
 #include "wdt.h"
@@ -234,6 +235,7 @@ void setup()
   if (!s_sdOk) errReport("SD", "dead", "nocard");
   wdtReportLast();                            // PG155: "ERR SYS wdt <task> <step> <s>s" of the restart before this boot
   crashReportLast();                          // PG175: "ERR SYS panic ..." + "PANIC bt ..." of a panic before this boot
+  partBootReport();                           // PG177: "PART OK coredump ..." once after the table change
   dbglogBegin(s_bootId, s_sdOk);              // PG175: debug log to SD (DEBUG=1), the crash log of the boot before
   otaBegin();                                // pull-OTA (needs the NVS handle opened by telemetryBegin)
 #ifdef TEST_OTA_CRASH
@@ -269,6 +271,7 @@ void loop()
   wifiTick();
   standbyTick();
   errTick();                                  // PG149: error summaries + SD / CAN1 counters to the server
+  partTick();                                 // PG177: the one-time partition table change when armed (part.h)
   static uint32_t lastPurge;
   if (millis() - lastPurge > 3600000UL || !lastPurge) {   // hourly, once the clock is set
     if (time(nullptr) > 1735689600) { lastPurge = millis(); sniffPurgeOld(time(nullptr)); dbglogPurge(time(nullptr)); }

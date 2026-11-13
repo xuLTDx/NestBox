@@ -781,7 +781,7 @@ static void smsSendLogged(const char* num, const char* text)
 }
 
 // one received SMS: a command from an allowed number, a forwarded answer, or only logged
-// PG155: SMS "RESTART" restarts the whole box this much later. Why 10 s: the reply SMS is sent first (smsHandle) and
+// PG155: SMS "RESTART" restarts the whole box this much later. Why 10 s: the answer (PG195: a status line) and
 // the status line "SMS RESTART in 10 s" goes into a record (one per record, records every 1-5 s while awake) and
 // so into the delivery queue, which survives the restart (txqueue.cpp) - else nothing would say why the box restarted.
 #define SMS_RESTART_DELAY_MS 10000UL
@@ -791,12 +791,7 @@ void prepareRestart(const char* why);   // main.cpp
 static void smsHandle(const char* from, const char* text)
 {
   if (s_fwdUntil && millis() < s_fwdUntil && smsSameNumber(from, s_fwdFrom)) {
-    smsStatusLine("SMS IN", from, text);
-    if (s_fwdTo[0]) {
-      char f[160];
-      snprintf(f, sizeof(f), "%s: %s", from, text);
-      smsSendLogged(s_fwdTo, f);
-    }
+    smsStatusLine("SMS IN", from, text);   // PG195: to the server only - no SMS back to the sender of the command
     return;
   }
   bool allowed = smsAllowed(from);
@@ -811,8 +806,15 @@ static void smsHandle(const char* from, const char* text)
   snprintf(m, sizeof(m), "SMS CMD %s: %.30s", from, c);
   statusLine(m);
   logNetEvent(m);
+  // PG195 (13.11.2026, FleetNest FN161 + Vojtech): the answer to an SMS command goes to the server as status lines
+  // "SMS ANS <number>: <answer>" (FleetNest shows them; the command will come from the Android NestApp, which does not
+  // read answers). Only STAV is also answered by SMS: it is asked exactly when the data is down, the status line would
+  // arrive only after the data is back. SMS the box still sends: STAV answer, the 30 min data outage alert, and
+  // "SMS <number> <text>" / FleetNest SMS= to <number>.
+  bool bySms = false;
   char reply[160];
   if (!strncasecmp(c, "STAV", 4)) {
+    bySms = true;
     char net[40];
     s_cell.netInfo(net, sizeof(net));
     snprintf(reply, sizeof(reply), "%s fw %s %s rssi=%d data=%s q=%lu gps=%.5f,%.5f %s", devid, FW_BUILD_STR, net,
@@ -841,12 +843,13 @@ static void smsHandle(const char* from, const char* text)
       snprintf(s_fwdFrom, sizeof(s_fwdFrom), "%s", num);
       snprintf(s_fwdTo, sizeof(s_fwdTo), "%s", from);
       s_fwdUntil = millis() + SMS_FWD_MS;
-      snprintf(reply, sizeof(reply), "%s SMS to %s sent, answers forwarded 15 min", devid, num);
+      snprintf(reply, sizeof(reply), "%s SMS to %s sent, answers to the server 15 min", devid, num);
     }
   } else {
     snprintf(reply, sizeof(reply), "%s ? STAV | CELL RESTART | RESTART | OTA | SMS <cislo> <text>", devid);
   }
-  smsSendLogged(from, reply);
+  smsStatusLine("SMS ANS", from, reply);
+  if (bySms) smsSendLogged(from, reply);
 }
 
 // cellTask: a queued SMS= and the SIM's received SMS (every minute; the modem answers AT)

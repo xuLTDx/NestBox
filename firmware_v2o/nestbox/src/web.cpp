@@ -10,6 +10,7 @@
 //                               READ=<bus>,<tx hex>,<rx hex>,<request hex>
 //   /api/ota                    raw firmware POST (v1F handlerOTA)
 //   /api/sniff, /api/sniff/live?id=&mask=, /api/sniff/list, /api/sniff/<n>[?from=&to=]
+#include "part.h"
 #include "dbglog.h"
 #include "wdt.h"
 #include <Arduino.h>
@@ -209,6 +210,11 @@ static int handlerControl(UrlHandlerParam* param)
                  v.urea[3], v.urea[4], v.urea[5], v.urea[6], v.urea[7], v.ureaAt ? (long)(ms - v.ureaAt) : -1L);
   } else if (!strcmp(cmd, "DEBUG=1") || !strcmp(cmd, "DEBUG=0")) {   // PG175: debug log to SD (dbglog.h)
     n = snprintf(buf, bufsize, dbglogSet(cmd[6] == '1') ? "OK debug=%c" : "ERR nvs debug=%c", cmd[6]);
+  } else if (!strcmp(cmd, "PART=CD") || !strcmp(cmd, "PART=0")) {   // PG177: one-time partition table change (part.h)
+    n = snprintf(buf, bufsize, partArm(cmd[5] == 'C') ? "OK part armed=%d (%s)" : "ERR nvs armed=%d (%s)",
+                 cmd[5] == 'C' ? 1 : 0, partState());
+  } else if (!strcmp(cmd, "PART?")) {
+    n = snprintf(buf, bufsize, "%s", partState());
   } else if (!strcmp(cmd, "DEBUG?")) {
     n = snprintf(buf, bufsize, "debug=%d", dbglogOn() ? 1 : 0);
   } else if (!strcmp(cmd, "STANDBY?")) {

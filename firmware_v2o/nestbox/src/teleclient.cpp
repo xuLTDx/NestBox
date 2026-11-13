@@ -1,4 +1,5 @@
 // see teleclient.h - the logic is NestBox_v1F TeleClientUDP, link-neutral
+#include "part.h"
 #include "dbglog.h"
 #include "errreport.h"
 #include "teleclient.h"
@@ -255,6 +256,12 @@ void TeleClientUDP::onMessage(char* msg, UdpRx* rx)
     if (cmdp && !strncmp(cmdp + 4, "SMS", 3)) {      // PG-p8: SMS_ALLOW= / SMS_PIN= / SMS=<number>,<text>
       char m[57];
       telemetrySmsSetting(cmdp + 4, m, sizeof(m));
+      statusLine(m);
+    }
+    if (cmdp && (!strcmp(cmdp + 4, "PART=CD") || !strcmp(cmdp + 4, "PART=0"))) {   // PG177 (part.h)
+      bool on = cmdp[9] == 'C';
+      char m[56];
+      snprintf(m, sizeof(m), "CMD %s %s %s", cmdp + 4, partArm(on) ? "OK" : "ERR nvs", partState());
       statusLine(m);
     }
     if (cmdp && !strncmp(cmdp + 4, "DEBUG=", 6)) {    // PG175: DEBUG=1|0 - the debug log to SD (dbglog.h)

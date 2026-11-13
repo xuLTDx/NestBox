@@ -1,0 +1,8 @@
+# NestBox_v2O - OVMS v3.3, 16 MB flash; PG177 (12.11.2026): + coredump 64 KB at the end, spiffs 64 KB smaller
+# Name,   Type, SubType, Offset,   Size
+nvs,      data, nvs,     0x9000,   0x5000
+otadata,  data, ota,     0xe000,   0x2000
+app0,     app,  ota_0,   0x10000,  0x400000
+app1,     app,  ota_1,   0x410000, 0x400000
+spiffs,   data, spiffs,  0x810000, 0x7E0000
+coredump, data, coredump,0xFF0000, 0x10000
