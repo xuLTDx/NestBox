@@ -10,6 +10,14 @@
 // The next boot sends "ERR SYS panic <reason> <task>" + "PANIC bt <addresses>" lines (FleetNest area SYS) and the
 // full text as an SD event. Addresses -> function + line with addr2line on the build's firmware.elf (kept per build).
 #pragma once
+#include <stdint.h>
 
 void crashBegin();                  // setup(), early: the panic handler
+// PG198 (13.11.2026): the core dump ESP-IDF saved in the flash partition "coredump" (part.h adds it) to the server.
+// Why: "PANIC bt" has only 8 return addresses of the task that crashed; the core dump has every task's stack - where
+// the others stood (e.g. who held a lock). After boot: "COREDUMP <bytes> boot=<n>" while one is stored; FleetNest
+// LOG=K<n> uploads it (ota.cpp, file 3000000+<n>, OTA server keeps it as K<n>.ELF); after the whole upload it is
+// erased. Decoded with ESP-IDF esp-coredump + the build's firmware.elf.
+void crashCoreDumpReport(uint32_t bootId);   // setup(), after telemetryBegin()
+void crashCoreDumpSent();                    // ota.cpp: uploaded whole -> erase
 void crashReportLast();              // setup(), after telemetryBegin(): the lines of a panic before this boot

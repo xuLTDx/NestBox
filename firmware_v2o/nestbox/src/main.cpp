@@ -236,6 +236,7 @@ void setup()
   wdtReportLast();                            // PG155: "ERR SYS wdt <task> <step> <s>s" of the restart before this boot
   crashReportLast();                          // PG175: "ERR SYS panic ..." + "PANIC bt ..." of a panic before this boot
   partBootReport();                           // PG177: "PART OK coredump ..." once after the table change
+  crashCoreDumpReport(s_bootId);              // PG198: "COREDUMP <bytes> boot=<n>" while a core dump waits in flash
   dbglogBegin(s_bootId, s_sdOk);              // PG175: debug log to SD (DEBUG=1), the crash log of the boot before
   otaBegin();                                // pull-OTA (needs the NVS handle opened by telemetryBegin)
 #ifdef TEST_OTA_CRASH

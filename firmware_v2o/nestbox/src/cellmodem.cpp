@@ -274,10 +274,30 @@ void CellLink::pppStatus(int err)
   m_pppStatusSeen++;
 }
 
+// PG202 (13.11.2026): the PPP session object is used again only when lwIP has really ended the old session.
+// Why: bench U9K2M3J0 13.11. 17:02 boot 31, after "CELL REG LOST": netRecover() -> pppClose() -> pppDial() ->
+// "assert failed: ppp_set_auth ppp.c:219 (pcb->phase == PPP_PHASE_DEAD)" -> panic (core dump K32.ELF, task cell).
+// pppClose() waited only for the first status callback of the close, not for the dead phase.
+#define PPP_DEAD_WAIT_MS 10000UL     // lwIP's own close: LCP terminate requests, 2 x 3 s by default (NEOVERENE for
+                                     // this build's ppp_opts.h) - 10 s covers it; not dead after that = no dial now
+static bool pppDead(void* pcb, uint32_t waitMs)
+{
+  ppp_pcb* p = (ppp_pcb*)pcb;
+  if (!p) return true;
+  for (uint32_t t = millis(); p->phase != PPP_PHASE_DEAD && millis() - t < waitMs;) delay(20);
+  return p->phase == PPP_PHASE_DEAD;
+}
+
 bool CellLink::pppDial(uint32_t timeoutMs)
 {
   lock();
   m_pppMode = false;
+  // before the modem is put into data mode: an old session still closing = no dial (the caller tries again later)
+  if (!pppDead(m_ppp, PPP_DEAD_WAIT_MS)) {
+    unlock();
+    nbout.println("[CELL] PPP dial: old session not closed yet");
+    return false;
+  }
   m_dial = 0;
   m_lineLen[2] = 0;
   // OVMS NetStart (ovms_cellular.cpp:1008-1012): APN and the dial in one line on the data channel. Without our
@@ -326,6 +346,7 @@ void CellLink::pppClose()
       pppapi_close(p, 1);
       for (uint32_t t = millis(); m_pppStatusSeen == seen && millis() - t < 2000;) delay(20);
     }
+    pppDead(p, PPP_DEAD_WAIT_MS);      // PG202: until lwIP has ended the session (see pppDial)
   }
   m_pppMode = false;
   m_pppUp = false;

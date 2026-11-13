@@ -56,8 +56,13 @@ static const uint8_t PART_NEW[224] = {
   0x53, 0x28, 0xc1, 0x19, 0x17, 0x02, 0x6a, 0xaa, 0x50, 0xc3, 0x54, 0x99, 0x83, 0xfd, 0xed, 0x91,
 };
 
-static uint8_t s_sector[PART_SECTOR];        // the whole sector as it is in flash (the old one, for the way back)
-static uint8_t s_want[PART_SECTOR];
+// PG201 (13.11.2026): the 3 sector buffers come from PSRAM only while the change runs. Why: as statics (15 KB of
+// internal RAM for good) the free heap after login fell from ~94 KB (12.11.) to ~79 KB and the HTTPS connection over
+// WiFi with PPP up failed at once ("OTA-PULL ERR=META_HTTP-1", "LOG ... ERR http=-1", bench 13.11. 17:41, largest
+// block 34.8 KB) - mbedTLS needs its buffers from internal RAM.
+static uint8_t* s_sector;                    // the whole sector as it is in flash (the old one, for the way back)
+static uint8_t* s_want;
+static uint8_t* s_back;
 static uint32_t s_highSince;
 static bool s_tried;                         // once per boot
 
@@ -85,8 +90,9 @@ static int tableKind(const uint8_t* t)     // 0 unknown, 1 old, 2 new
 const char* partState()
 {
   static char s[40];
-  static uint8_t t[PART_TABLE_LEN];   // not on the caller stack
-  int k = esp_flash_read(NULL, t, PART_ADDR, sizeof(t)) == ESP_OK ? tableKind(t) : -1;
+  uint8_t* t = (uint8_t*)ps_malloc(PART_TABLE_LEN);
+  int k = t && esp_flash_read(NULL, t, PART_ADDR, PART_TABLE_LEN) == ESP_OK ? tableKind(t) : -1;
+  free(t);
   snprintf(s, sizeof(s), "table=%s armed=%d", k == 1 ? "old" : k == 2 ? "new" : k == 0 ? "unknown" : "readerr",
            armed() ? 1 : 0);
   return s;
@@ -133,20 +139,24 @@ void partTick()
   if (txqPending() > 5 || otaBusy() || otaVerifyPending()) return;
   s_tried = true;
   char m[64];
+  if (!s_sector) s_sector = (uint8_t*)ps_malloc(PART_SECTOR);
+  if (!s_want) s_want = (uint8_t*)ps_malloc(PART_SECTOR);
+  if (!s_back) s_back = (uint8_t*)ps_malloc(PART_SECTOR);
+  if (!s_sector || !s_want || !s_back) { statusLine("PART ERR no memory"); return; }
   if (esp_flash_read(NULL, s_sector, PART_ADDR, PART_SECTOR) != ESP_OK) { statusLine("PART ERR read"); return; }
   int k = tableKind(s_sector);
   if (k == 2) { partArm(false); statusLine("PART CD already"); return; }
   if (k != 1) { partArm(false); statusLine("PART ERR unknown table - nothing written"); return; }
   for (int i = PART_TABLE_LEN; i < PART_SECTOR; i++)
     if (s_sector[i] != 0xFF) { partArm(false); statusLine("PART ERR sector tail not empty"); return; }
-  memset(s_want, 0xFF, sizeof(s_want));
+  memset(s_want, 0xFF, PART_SECTOR);
   memcpy(s_want, PART_NEW, sizeof(PART_NEW));
   partArm(false);                            // first: a crash / restart during the change never repeats it by itself
   nvs_set_u8(nvs, "PART_NEW", 1);
   nvs_commit(nvs);
   logNetEvent("PART CD write start");
   bool ok = writeSector(s_want);
-  static uint8_t back[PART_SECTOR];   // not on the loop task stack (8 KB)
+  uint8_t* back = s_back;
   bool same = ok && esp_flash_read(NULL, back, PART_ADDR, PART_SECTOR) == ESP_OK && !memcmp(back, s_want, PART_SECTOR);
   if (!same) {
     bool restored = writeSector(s_sector) && esp_flash_read(NULL, back, PART_ADDR, PART_SECTOR) == ESP_OK &&

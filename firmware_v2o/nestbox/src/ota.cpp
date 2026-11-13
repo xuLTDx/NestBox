@@ -1,4 +1,7 @@
 // see ota.h
+#include "crash.h"
+#include <esp_core_dump.h>
+#include <esp_flash.h>
 #include "ota.h"
 #include "laststep.h"
 #include <WiFi.h>
@@ -580,11 +583,28 @@ static void logTick()
   if (s_logFile >= 2000000UL) snprintf(path, sizeof(path), "/DEBUG/C%u.LOG", (unsigned)(s_logFile - 2000000UL));   // PG175
   else if (s_logFile >= 1000000UL) snprintf(path, sizeof(path), "/DEBUG/D%u.LOG", (unsigned)(s_logFile - 1000000UL));
   else snprintf(path, sizeof(path), "/DATA/%u.CSV", (unsigned)s_logFile);
-  sdLock();
-  File f = SD.open(path, FILE_READ);
-  bool opened = (bool)f;               // a File is false again after close()
+  // PG198: file 3000000+<boot> = the core dump in the flash partition "coredump" (ESP-IDF wrote it at the panic),
+  // read straight from flash - no SD involved
+  bool core = s_logFile >= 3000000UL;
+  size_t cdAddr = 0, cdSize = 0;
+  bool opened = false;
   int n = -1;
-  if (opened) {
+  if (core) {
+    opened = esp_core_dump_image_get(&cdAddr, &cdSize) == ESP_OK && cdSize > 0;
+    if (opened) {
+      if (!s_logSize) s_logSize = cdSize;
+      if (s_logOff < s_logSize) {
+        uint32_t want = s_logSize - s_logOff < LOG_CHUNK ? s_logSize - s_logOff : LOG_CHUNK;
+        n = esp_flash_read(NULL, s_logBuf, cdAddr + s_logOff, want) == ESP_OK ? (int)want : -1;
+      } else {
+        n = 0;
+      }
+    }
+  }
+  sdLock();
+  File f = core ? File() : SD.open(path, FILE_READ);
+  if (!core) opened = (bool)f;         // a File is false again after close()
+  if (!core && opened) {
     if (!s_logSize) s_logSize = f.size();
     if (s_logOff < s_logSize && f.seek(s_logOff)) {
       uint32_t want = s_logSize - s_logOff < LOG_CHUNK ? s_logSize - s_logOff : LOG_CHUNK;
@@ -602,6 +622,7 @@ static void logTick()
   }
   s_logAt = millis();
   if (s_logOff >= s_logSize) {
+    if (core) crashCoreDumpSent();             // PG198: the server has it whole - erased, not offered again
     snprintf(m, sizeof(m), "LOG %u done %u", (unsigned)s_logFile, (unsigned)s_logSize);
     logEnd(m);
     return;

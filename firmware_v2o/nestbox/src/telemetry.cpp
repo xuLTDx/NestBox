@@ -1122,9 +1122,13 @@ static void netTask(void*)
       continue;
     }
     if (cur == &s_wifi) WifiLink::restoreDns();   // PG96: PPP coming up overwrites the DNS (netlink.cpp)
-    // PG164: on the modem with WiFi still joined (no internet there) - a WiFi DHCP renewal may make WiFi lwIP's default
-    // again (NEOVERENE whether esp_netif does that on a renewal); PPP back as the default every 10 s (cheap)
-    if (cur == &s_cell && WiFi.status() == WL_CONNECTED) {
+    // PG164 + PG197: while the modem is the link, PPP is made lwIP's default route again every 10 s. Why: our PPP is a
+    // raw lwIP pcb (pppapi_set_default), not an esp_netif - every esp_netif event of the WiFi station (it keeps trying
+    // to join every 30 s) lets ESP-IDF pick the default interface anew among its own (esp_netif_lwip.c 334-345), and a
+    // station joined without an IP takes it. Bench U9K2M3J0 13.11.2026 boot 28, MAC blocked on the router: UDP dead
+    // 15:11-15:25 ("ERR NET udp x148") with PPP up, back only after NETCHK called makeDefault() (NEOVERENE that this
+    // was the route - the times fit). Before PG197 only while WiFi.status() == WL_CONNECTED.
+    if (cur == &s_cell) {
       static uint32_t lastDef;
       if (millis() - lastDef >= 10000) { lastDef = millis(); s_cell.makeDefault(); }
     }

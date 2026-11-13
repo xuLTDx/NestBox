@@ -271,7 +271,8 @@ void TeleClientUDP::onMessage(char* msg, UdpRx* rx)
     if (cmdp && !strncmp(cmdp + 4, "LOG=", 4)) {      // PG49: LOG=<file>[,<from byte>] -> HTTPS upload (ota.cpp)
       char* e = nullptr;
       // PG175: LOG=D<boot> / LOG=C<boot> = /DEBUG/D<boot>.LOG / C<boot>.LOG, file id 1000000+ / 2000000+<boot>
-      uint32_t base = cmdp[8] == 'D' ? 1000000UL : cmdp[8] == 'C' ? 2000000UL : 0;
+      // PG198: LOG=K<boot> = the core dump in flash, file id 3000000+<boot>
+      uint32_t base = cmdp[8] == 'D' ? 1000000UL : cmdp[8] == 'C' ? 2000000UL : cmdp[8] == 'K' ? 3000000UL : 0;
       uint32_t f = base + (uint32_t)strtoul(cmdp + 8 + (base ? 1 : 0), &e, 10);
       uint32_t from = (e && *e == ',') ? (uint32_t)strtoul(e + 1, nullptr, 10) : 0;
       char m[48];

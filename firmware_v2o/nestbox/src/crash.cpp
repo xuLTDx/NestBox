@@ -4,6 +4,10 @@
 #include <esp_attr.h>
 #include <esp_system.h>
 #include "errreport.h"
+#include <esp_core_dump.h>
+#include <nvs.h>
+
+extern nvs_handle_t nvs;                     // telemetry.cpp
 
 extern "C" void esp_psram_extram_writeback_cache(void);   // as txqueue.cpp persist()
 void statusLine(const char* text);                          // ota.cpp
@@ -70,4 +74,31 @@ void crashReportLast()
     statusLine(m);
   }
   logNetEvent(full);
+}
+
+// PG198 - see crash.h. NVS "CD_BOOT" = the boot that crashed (the dump stays until uploaded, over later boots)
+void crashCoreDumpReport(uint32_t bootId)
+{
+  size_t addr = 0, size = 0;
+  if (esp_core_dump_image_get(&addr, &size) != ESP_OK || !size) return;   // none / damaged / no partition
+  esp_reset_reason_t r = esp_reset_reason();
+  bool crashedNow = r == ESP_RST_PANIC || r == ESP_RST_TASK_WDT || r == ESP_RST_INT_WDT || r == ESP_RST_WDT;
+  uint32_t cdBoot = 0;
+  if (crashedNow || nvs_get_u32(nvs, "CD_BOOT", &cdBoot) != ESP_OK || !cdBoot) {
+    cdBoot = bootId - 1;
+    nvs_set_u32(nvs, "CD_BOOT", cdBoot);
+    nvs_commit(nvs);
+  }
+  char m[56];
+  snprintf(m, sizeof(m), "COREDUMP %u boot=%lu", (unsigned)size, (unsigned long)cdBoot);
+  statusLine(m);
+  logNetEvent(m);
+}
+
+void crashCoreDumpSent()
+{
+  esp_core_dump_image_erase();
+  nvs_erase_key(nvs, "CD_BOOT");
+  nvs_commit(nvs);
+  statusLine("COREDUMP sent - erased");
 }
