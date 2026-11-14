@@ -633,7 +633,11 @@ static UrlHandler urlHandlerList[] = {
 
 bool webStart()
 {
-  mwInitParam(&httpParam, 80, "/spiffs");
+  // PG238 (14.11.2026, Vojtech "PG238 ano"): no files served from the internal flash any more. Why: the web root was
+  // /spiffs, and since PG223 /spiffs/txq_sb.bin holds the records not confirmed before a sleep - anyone with the web
+  // password could download it. Every page is a handler (urlHandlerList, page.h); "/nowww" is no VFS mount, so a
+  // file request (also with "../") finds nothing.
+  mwInitParam(&httpParam, 80, "/nowww");
   httpParam.pxUrlHandler = urlHandlerList;
   s_webPrefs.begin("web", false);
   String pw = s_webPrefs.getString("pw", "");

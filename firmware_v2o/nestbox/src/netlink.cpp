@@ -53,11 +53,37 @@ void WifiLink::restoreDns()
   }
 }
 
+// PG249. Why: every login attempt asked DNS again; on a WiFi without internet one lookup took 14 s (bench U9K2M3J0
+// 14.11.2026 boot 43, D43.LOG: "LOGIN WIFI ... attempt=0" at 8144198 ms, the first "[UDP] Timeout" - 3 s after the
+// send - at 8161200; open() = DNS + nothing else, no "NET OPEN_FAIL"), so 3 attempts took 69 s instead of 27 s.
+#define RESOLVE_KEEP_MS (3600UL * 1000UL)
+static IPAddress s_resIp;
+static char s_resHost[64];
+static uint32_t s_resAt;
+static bool s_resFresh;                       // the remembered address may be used without DNS
+bool nbResolve(const char* host, IPAddress& ip)
+{
+  bool same = s_resAt && !strcmp(host, s_resHost);
+  if (same && s_resFresh && millis() - s_resAt < RESOLVE_KEEP_MS) { ip = s_resIp; return true; }
+  IPAddress got;
+  if (WiFi.hostByName(host, got) && (uint32_t)got != 0) {
+    s_resIp = got;
+    snprintf(s_resHost, sizeof(s_resHost), "%s", host);
+    s_resAt = millis() | 1;
+    s_resFresh = true;
+    ip = got;
+    return true;
+  }
+  if (same) { ip = s_resIp; return true; }    // DNS down: the last address it gave
+  return false;
+}
+void nbResolveForget() { s_resFresh = false; }
+
 bool WifiLink::open(const char* host, uint16_t port)
 {
   if (!up()) return false;
   IPAddress ip;
-  if (!WiFi.hostByName(host, ip)) return false;
+  if (!nbResolve(host, ip)) return false;
   s_ip = ip;
   s_port = port;
   if (!s_begun) s_begun = s_udp.begin(0);    // any local port; replies come back to it
@@ -102,7 +128,7 @@ int WifiLink::probe(const char* host, uint16_t port, const char* pkt, int len, c
 {
   if (WiFi.status() != WL_CONNECTED || len <= 0) return 0;
   IPAddress srv;
-  if (!WiFi.hostByName(host, srv)) return 0;
+  if (!nbResolve(host, srv)) return 0;        // PG249
   int fd = lwip_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
   if (fd < 0) return 0;
   struct sockaddr_in me = {};

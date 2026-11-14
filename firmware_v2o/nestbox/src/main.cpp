@@ -119,6 +119,43 @@ bool telemetryCell();                          // telemetry.cpp
 bool telemetryEngineOn();
 bool telemetryPosition(float* lat, float* lng);
 bool telemetryLastPosition(float* lat, float* lng);   // PG232
+bool telemetryWifiMarked();                    // PG239
+bool telemetryWifiSkip(const uint8_t* bssid);
+// PG239 (14.11.2026, Vojtech "239 ano"): a joined WiFi marked "no internet" is left for another network of the list
+// in range. Why: bench U9K2M3J0 14.11. 20:41, MAC blocked: the router keeps the station joined and only drops its
+// traffic, so the box stayed on NTLIRIS and never tried the phone hotspot Pocof7ultra in range. Every WIFI_ALT_MS
+// while marked: one scan; a listed network allowed here, not the marked access point -> leave and join it. The
+// marked access point is skipped by every scan for WIFI_BAD_MS (then tried again, PG164).
+#define WIFI_ALT_MS 60000UL
+static uint32_t s_altTry;
+// PG241 (14.11.2026, Vojtech "ano"): a network that failed to join twice in a row is skipped for WIFI_SKIP_MS, so the
+// next network of the list gets its turn. Why: bench U9K2M3J0 14.11. 20:57-21:05, MAC blocked: every 30 s the
+// strongest listed network NTLIRIS (-66 dBm) was tried and refused ("join timeout reason=8"); the phone hotspot of
+// the list was never tried. After WIFI_SKIP_MS the network is tried again.
+#define WIFI_SKIP_MS (5UL * 60UL * 1000UL)
+#define WIFI_SKIP_N  4
+struct WifiFail { char ssid[33]; uint8_t fails; uint32_t until; };
+static WifiFail s_wfail[WIFI_SKIP_N];
+static WifiFail* wifiFail(const char* ssid, bool make)
+{
+  WifiFail* freeSlot = nullptr;
+  for (auto& f : s_wfail) {
+    if (f.ssid[0] && !strcmp(f.ssid, ssid)) return &f;
+    if (!f.ssid[0] && !freeSlot) freeSlot = &f;
+  }
+  if (!make) return nullptr;
+  if (!freeSlot) freeSlot = &s_wfail[0];
+  memset(freeSlot, 0, sizeof(*freeSlot));
+  snprintf(freeSlot->ssid, sizeof(freeSlot->ssid), "%s", ssid);
+  return freeSlot;
+}
+static bool wifiSkipped(const char* ssid)
+{
+  WifiFail* f = wifiFail(ssid, false);
+  if (!f || !f->until) return false;
+  if ((int32_t)(millis() - f->until) >= 0) { f->until = 0; return false; }
+  return true;
+}
 
 // PG205 + PG208 (13.-14.11.2026, wifiplaces.h - why there): which networks may be searched right now.
 // Agreed with Vojtech 13.11.2026:
@@ -153,8 +190,11 @@ static int wifiSearch(const char** why, float* lat, float* lng)
   bool eng = telemetryEngineOn();
   if (eng && !wasEngine) s_wifiStartAt = millis() | 1;
   wasEngine = eng;
-  if (s_wifiCmdAt && millis() - s_wifiCmdAt >= WIFI_CMD_MS) s_wifiCmdAt = 0;
-  if (s_wifiStartAt && millis() - s_wifiStartAt >= WIFI_START_MS) s_wifiStartAt = 0;
+  // signed: "millis() | 1" is 1 ms in the future for an even millis() - unsigned, the difference was 0xFFFFFFFF and the
+  // 30 min ended at once (bench U9K2M3J0 14.11.2026 boot 53: WIFI=1 at 56 s, "search on (cmd)" never came, the listed
+  // hotspot Pocof7ultra in range never tried; the same trap as sdwriter.cpp 2026-10-12)
+  if (s_wifiCmdAt && (int32_t)(millis() - s_wifiCmdAt) >= (int32_t)WIFI_CMD_MS) s_wifiCmdAt = 0;
+  if (s_wifiStartAt && (int32_t)(millis() - s_wifiStartAt) >= (int32_t)WIFI_START_MS) s_wifiStartAt = 0;
   if (!wifiPlacesCount()) { *why = "nolist"; return 0; }   // PG230: no list = no network known, also after WIFI=1
   if (s_wifiCmdAt) { *why = "cmd"; return 2; }
   if (s_wifiStartAt) { *why = "start"; return 2; }
@@ -171,6 +211,22 @@ bool wifiRequest(bool on)
   s_wifiReq = on ? 1 : 0;
   return true;
 }
+
+// PG248 (14.11.2026, Vojtech "248 ano, preco ma blokovat hlavnu slucku navyse ak WiFi je raz za cas"): the scan and
+// the join do not wait in loop() any more. Why: scanNetworks() (2-3 s) and the join wait (up to WIFI_JOIN_MS 15 s)
+// stopped loop() - the web, READ requests, the standby check and the error summaries - up to ~18 s every 30 s where
+// a listed network refused the box (bench U9K2M3J0 14.11.2026, MAC blocked). Now: the scan runs in the driver
+// (scanNetworks(true)), the join is started and checked on the next passes; loop() goes on meanwhile.
+enum { WS_IDLE, WS_SCAN, WS_JOIN };
+static uint8_t s_ws;
+static uint32_t s_wsAt;
+static int s_wsNets;
+static float s_wsLat, s_wsLng;
+static bool s_wsAlt;
+static WifiPlace s_wsNet;                      // the network being joined (with its password until the end)
+#define WIFI_SCAN_MAX_MS 10000UL
+static void wifiScanDone(int n);
+static void wifiJoinEnd(bool ok);
 
 static void wifiTick()
 {
@@ -196,8 +252,28 @@ static void wifiTick()
       statusLine("WIFI search 30 min (WIFI=1)");
     }
   }
-  if (s_wifiOff) return;
-  if (WiFi.status() == WL_CONNECTED) { s_knownAt = millis(); apOff(); return; }
+  if (s_wifiOff) { if (s_ws == WS_SCAN) WiFi.scanDelete(); s_ws = WS_IDLE; return; }
+  if (s_ws == WS_SCAN) {                       // PG248
+    int n = WiFi.scanComplete();
+    if (n == WIFI_SCAN_RUNNING && millis() - s_wsAt < WIFI_SCAN_MAX_MS) return;
+    s_ws = WS_IDLE;
+    if (n < 0) { WiFi.scanDelete(); return; }
+    wifiScanDone(n);
+    return;
+  }
+  if (s_ws == WS_JOIN) {                       // PG248
+    if (WiFi.status() == WL_CONNECTED) wifiJoinEnd(true);
+    else if (millis() - s_wsAt >= WIFI_JOIN_MS) wifiJoinEnd(false);
+    return;
+  }
+  bool alt = false;                            // PG239: looking for another network while joined to a marked one
+  if (WiFi.status() == WL_CONNECTED) {
+    s_knownAt = millis();
+    apOff();
+    if (!telemetryWifiMarked() || millis() - s_altTry < WIFI_ALT_MS) return;
+    s_altTry = millis();
+    alt = true;
+  }
   if (s_apOn && !webApAllowed()) apOff();
   if (!s_apOn && webApAllowed() && millis() - s_knownAt > WIFI_AP_AFTER_MS && strlen(webPassword()) >= 8) {
     char ssid[24];
@@ -220,30 +296,65 @@ static void wifiTick()
     if (nets) s_wifiTry = 0;                   // entering a place: scan now
   }
   if (!nets) {
-    if (!idle) { WiFi.disconnect(); idle = true; }   // the station stops retrying the network it lost
+    if (!alt && !idle) { WiFi.disconnect(); idle = true; }   // the station stops retrying the network it lost
     return;
   }
   idle = false;
-  if (s_wifiTry && millis() - s_wifiTry < WIFI_RETRY_MS) return;
+  if (!alt && s_wifiTry && millis() - s_wifiTry < WIFI_RETRY_MS) return;
   s_wifiTry = millis();
-  // the network in range: scan, then join the strongest network of the list allowed here (PG208)
-  static WifiPlace bestNet;                    // static: 112 bytes with a password, not on the loop task's stack twice
+  // PG248: the scan runs in the WiFi driver; wifiScanDone() picks the network when it is finished
+  s_wsNets = nets; s_wsLat = lat; s_wsLng = lng; s_wsAlt = alt;
+  if (WiFi.scanNetworks(true) == WIFI_SCAN_FAILED) return;
+  s_ws = WS_SCAN;
+  s_wsAt = millis();
+}
+
+// PG248: the scan is finished (n networks) - join the strongest network of the list allowed here (PG208)
+static void wifiScanDone(int n)
+{
+  int nets = s_wsNets;
+  float lat = s_wsLat, lng = s_wsLng;
+  bool alt = s_wsAlt;
   static WifiPlace cand;
-  int n = WiFi.scanNetworks();
+  WifiPlace& bestNet = s_wsNet;
   int best = -1, bestRssi = -1000;
+  char seen[160];                              // PG241: the listed networks in range, into the debug log
+  int sl = 0;
+  seen[0] = 0;
   for (int i = 0; i < n; i++) {
-    if (WiFi.RSSI(i) <= bestRssi) continue;
     String ssid = WiFi.SSID(i);
     bool hit = false;
     for (int k = 0; !hit && wifiPlaceGet(k, &cand); k++)
       hit = ssid == cand.ssid && (nets == 2 || wifiPlaceHolds(cand, lat, lng));
     if (!hit) continue;
+    bool skip = telemetryWifiSkip(WiFi.BSSID(i)) || wifiSkipped(cand.ssid);   // PG239 / PG241
+    if (sl < (int)sizeof(seen) - 48)
+      sl += snprintf(seen + sl, sizeof(seen) - sl, " %s(%d)%s", cand.ssid, (int)WiFi.RSSI(i), skip ? "-skip" : "");
+    if (skip || WiFi.RSSI(i) <= bestRssi) continue;
     best = i; bestRssi = WiFi.RSSI(i); bestNet = cand;
+  }
+  if (sl) nbout.printf("[WIFI] listed in range:%s\n", seen);
+  {                                            // PG243 (14.11.2026, Vojtech "pg243 ano"): every network the scan saw -
+    char all[400];                             // the phone hotspot of the list was not among the listed ones (21:14-21:27)
+    int al = 0;                                // and the box could not tell whether it saw it at all
+    all[0] = 0;
+    for (int i = 0; i < n && al < (int)sizeof(all) - 48; i++)
+      al += snprintf(all + al, sizeof(all) - al, " %.24s(%d,ch%d)", WiFi.SSID(i).c_str(), (int)WiFi.RSSI(i), (int)WiFi.channel(i));
+    nbout.printf("[WIFI] scan %d:%s\n", n, all);
   }
   WiFi.scanDelete();
   if (best < 0) {
-    nbout.printf("[WIFI] no known network in range (%d seen)\n", n);
+    if (!alt) nbout.printf("[WIFI] no known network in range (%d seen)\n", n);
     return;
+  }
+  if (alt) {                                   // PG239
+    if (WiFi.status() != WL_CONNECTED) alt = false;   // lost meanwhile: a plain join
+    else {
+      char ln[57];
+      snprintf(ln, sizeof(ln), "WIFI %.16s no internet - trying %.16s", WiFi.SSID().c_str(), bestNet.ssid);
+      statusLine(ln);
+      WiFi.disconnect();
+    }
   }
   s_knownAt = millis();
   nbout.printf("[WIFI] joining %s (%d dBm)\n", bestNet.ssid, bestRssi);
@@ -251,8 +362,16 @@ static void wifiTick()
   if (!reasonHooked) { WiFi.onEvent(wifiReasonEvent, ARDUINO_EVENT_WIFI_STA_DISCONNECTED); reasonHooked = true; }
   s_wifiReason = 0;
   WiFi.begin(bestNet.ssid, bestNet.pass);
-  for (uint32_t t = millis(); millis() - t < WIFI_JOIN_MS && WiFi.status() != WL_CONNECTED;) delay(100);
-  if (WiFi.status() == WL_CONNECTED) {
+  s_ws = WS_JOIN;                              // PG248: wifiJoinTick() watches it
+  s_wsAt = millis();
+}
+
+// PG248: the join started by wifiScanDone(), checked on every pass of loop() until it worked or WIFI_JOIN_MS passed
+static void wifiJoinEnd(bool ok)
+{
+  WifiPlace& bestNet = s_wsNet;
+  s_ws = WS_IDLE;
+  if (ok) {
     WifiLink::saveDns();                      // PG96: DHCP has just set WiFi's DNS - kept (netlink.cpp)
     nbout.printf("[WIFI] %s IP %s\n", bestNet.ssid, WiFi.localIP().toString().c_str());
     char ln[64];                              // p58: the box's address on a phone hotspot, seen in FleetNest
@@ -260,13 +379,23 @@ static void wifiTick()
     statusLine(ln);
     configTime(0, 0, "pool.ntp.org");        // the sniff file's clock line
     errOk("WIFI", "join");
+    WifiFail* f = wifiFail(bestNet.ssid, false);   // PG241
+    if (f) memset(f, 0, sizeof(*f));
   } else {
     int r = s_wifiReason;                     // PG219
     nbout.printf("[WIFI] join timeout reason=%d\n", r);
     char d[48];
     snprintf(d, sizeof(d), "%.24s r=%d", bestNet.ssid, r);
     errReport("WIFI", "join", d);
+    WifiFail* f = wifiFail(bestNet.ssid, true);    // PG241
+    if (++f->fails >= 2) {
+      f->fails = 0;
+      f->until = (millis() + WIFI_SKIP_MS) | 1;
+      nbout.printf("[WIFI] %s skipped for %lu min (2 failed joins)\n", bestNet.ssid, WIFI_SKIP_MS / 60000UL);
+      s_wifiTry = 0;                            // the next network at once
+    }
   }
+  memset(bestNet.pass, 0, sizeof(bestNet.pass));   // the password does not stay in RAM longer than the join
 }
 
 void setup()

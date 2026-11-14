@@ -3,6 +3,7 @@
 #include "dbglog.h"
 #include "errreport.h"
 #include "teleclient.h"
+#include "netlink.h"
 #include "netlog.h"                  // PG101: nbout = Serial + /api/serial
 #include "store.h"
 #include "txqueue.h"
@@ -167,6 +168,7 @@ bool TeleClientUDP::connect(bool quick)
     break;
   }
   if (!success) {
+    nbResolveForget();                         // PG249: the next login asks DNS again
     logNetEvent("NET CONNECT_FAILED_ALL_ATTEMPTS");
     errReport("NET", "connect", link->name());
   } else {

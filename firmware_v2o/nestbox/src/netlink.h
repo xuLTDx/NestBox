@@ -5,6 +5,12 @@
 #pragma once
 #include <Arduino.h>
 
+// PG249 (14.11.2026, Vojtech "249 moze byt"): the server's address, looked up with DNS at most once an hour; when
+// the lookup fails the last address is used. nbResolveForget(): a login failed - the next open asks DNS again (the
+// home line's address can change, ultd.mooo.com is a dynamic name).
+bool nbResolve(const char* host, IPAddress& ip);
+void nbResolveForget();
+
 class NetLink {
 public:
   virtual ~NetLink() {}

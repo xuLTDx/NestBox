@@ -1139,16 +1139,19 @@ static volatile bool s_wifiBad;               // the mark holds for the access p
 static uint32_t s_wifiBadAt;
 static uint8_t s_wifiLoginFails;
 static bool s_wifiProbe;                      // PG204: a new join with the modem online - ask WiFi at once
-// PG228 (14.11.2026, Vojtech "228 ok"): the first WIFI_WATCH_MS after the data moved to WiFi with the modem online,
-// a WiFi where the server goes silent for WIFI_SILENT_MS while packets wait for their answer is marked at once
-// (data back to the modem), not after 2 failed logins. Why: bench U9K2M3J0 14.11.2026 15:58 (MAC blocked, the
+// PG228 (14.11.2026, Vojtech "228 ok") + PG240 (14.11.2026, Vojtech "pg240 ano"): while the data goes over WiFi with
+// the modem online, a WiFi where the server is silent for WIFI_SILENT_MS while packets wait for their answer is
+// marked at once (data back to the modem), not after 2 failed logins. PG228 watched only the first 2 min after the
+// move; bench 14.11. 21:07 (MAC blocked on a WiFi used for hours) took 6 min again, records up to 350 s late.
+// 30 s, not 20 (Vojtech): a short hiccup of the WiFi must not move the data; 30 s = almost 4 unanswered packets of
+// TXQ_ACK_TIMEOUT_MS 8 s. A marked WiFi is asked again every WIFI_PROBE_MS (one PG204 test packet, the data stays
+// on the modem), so after an internet outage of a few minutes the data is back on WiFi within 2 min, not 30. Why: bench U9K2M3J0 14.11.2026 15:58 (MAC blocked, the
 // router let the box in for ~1 s): the PG204 probe and the login worked, then WiFi went dead; the 2-login rule
 // took 6 min, 334 records arrived up to 350 s late. 20 s = more than 2 ACK timeouts (TXQ_ACK_TIMEOUT_MS 8 s) - a
 // working link answers every packet within ~1 s (bench). Only with packets in flight: a parked box with nothing
 // to send is not "silent".
-#define WIFI_WATCH_MS  120000UL
-#define WIFI_SILENT_MS 20000UL
-static uint32_t s_wifiWatchAt;                // millis() | 1 of the move to WiFi, 0 = not watched
+#define WIFI_SILENT_MS 30000UL
+#define WIFI_PROBE_MS  120000UL
 
 static bool bssidNow(uint8_t out[6])
 {
@@ -1174,7 +1177,7 @@ static void wifiBadTick()
   }
   if (!up) s_wifiBad = false;                 // the mark (RTC) stays for the same access point
   wasUp = up;
-  if (s_wifiBad && !standbyParkedBoot() && (s_wifiProbe || millis() - s_wifiBadAt >= WIFI_BAD_MS)) {
+  if (s_wifiBad && !standbyParkedBoot() && (s_wifiProbe || millis() - s_wifiBadAt >= WIFI_PROBE_MS)) {   // PG240
     s_wifiProbe = false;
     s_wifiLoginFails = 0;
     bool ok = true;                           // without the modem: WiFi is used anyway (2 failed logins mark it again)
@@ -1221,6 +1224,16 @@ static void wifiLoginResult(bool ok)
   wifiMarkBad();
 }
 
+// PG239 (main.cpp wifiTick): the joined network is marked "no internet" / this access point is the marked one
+bool telemetryWifiMarked() { return s_wifiBad && WiFi.status() == WL_CONNECTED; }
+bool telemetryWifiSkip(const uint8_t* b)
+{
+  // WIFI_PROBE_MS, not WIFI_BAD_MS: bench 14.11.2026 21:57 - PG239 left the hotspot Pocof7ultra (no internet) for the
+  // blocked NTLIRIS, the hotspot was then skipped for 30 min although its internet came back at 21:56; the 2-min
+  // probe of PG240 runs only while joined, so the box stayed on the modem. Now it is back in the scan after 2 min.
+  return s_wifiBadSet && b && !memcmp(b, s_wifiBadBssid, 6) && millis() - s_wifiBadAt < WIFI_PROBE_MS;
+}
+
 // WiFi for the data (netTask, OTA, UDP diag): joined and not marked - or marked but the modem is not online
 bool telemetryWifiForData() { return WiFi.status() == WL_CONNECTED && (!s_wifiBad || !s_cellUp || !s_cell.up()); }
 
@@ -1243,7 +1256,6 @@ static void netTask(void*)
       cur = want;
       if (cur == &s_cell) s_cell.makeDefault();   // NAVRH 9: lwIP route + DNS to PPP (WiFi's DHCP had them)
       if (cur == &s_wifi) WifiLink::makeDefault();   // PG96: and back to WiFi's (netlink.cpp)
-      s_wifiWatchAt = cur == &s_wifi && s_cellUp && s_cell.up() ? (millis() | 1) : 0;   // PG228
       linkSince = millis();
       s_client.setLink(cur);
       char m[40];
@@ -1257,13 +1269,11 @@ static void netTask(void*)
       continue;
     }
     if (cur == &s_wifi) WifiLink::restoreDns();   // PG96: PPP coming up overwrites the DNS (netlink.cpp)
-    if (s_wifiWatchAt && cur == &s_wifi) {        // PG228
+    if (cur == &s_wifi && s_cellUp && s_cell.up()) {   // PG228 + PG240
       uint32_t now = millis();
-      uint32_t heard = (int32_t)(s_client.lastSyncTime - s_wifiWatchAt) > 0 ? s_client.lastSyncTime : s_wifiWatchAt;
-      if (now - s_wifiWatchAt >= WIFI_WATCH_MS) s_wifiWatchAt = 0;
-      else if (now - heard >= WIFI_SILENT_MS && txqInflight() > 0 && s_cellUp && s_cell.up()) {
-        s_wifiWatchAt = 0;
-        nbout.printf("[NET] WiFi silent %lu s after the move - back to the modem\n", (unsigned long)((now - heard) / 1000));
+      uint32_t heard = (int32_t)(s_client.lastSyncTime - linkSince) > 0 ? s_client.lastSyncTime : linkSince;
+      if (now - heard >= WIFI_SILENT_MS && txqInflight() > 0) {
+        nbout.printf("[NET] WiFi silent %lu s - back to the modem\n", (unsigned long)((now - heard) / 1000));
         wifiMarkBad();
         continue;                                  // the next pass picks the modem
       }

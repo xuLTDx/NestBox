@@ -1,6 +1,7 @@
 // SIM7600G - see cellmodem.h (sources, NAVRH 9 PPP)
 #include "wdt.h"
 #include "cellmodem.h"
+#include "netlink.h"
 #include "netlog.h"                  // PG101: nbout = Serial + /api/serial
 #include "max7317.h"
 #include "hw.h"
@@ -392,7 +393,7 @@ bool CellLink::open(const char* host, uint16_t port)
 {
   if (!up()) return false;
   IPAddress ip;
-  if (!WiFi.hostByName(host, ip)) return false;   // Arduino 3: NetworkManager::hostByName -> lwip_getaddrinfo
+  if (!nbResolve(host, ip)) return false;    // PG249 (netlink.cpp); Arduino 3 hostByName -> lwip_getaddrinfo
   s_srvIp = ip;
   s_srvPort = port;
   if (!s_udpBegun) s_udpBegun = s_udp.begin(0);

@@ -9,7 +9,19 @@
 
 void carDecode(uint32_t id, bool ext, uint8_t dlc, const uint8_t* data);   // cardecode.cpp
 
+#include <Preferences.h>
 #define SPEED_PROBE_MS 2000
+float read12V();                              // telemetry.cpp
+// PG250 (14.11.2026, Vojtech "Pg250 ano"): the speed the box once heard frames at is kept (NVS "can1"/"kbit") and the
+// box listens on it from the boot; while the bus is silent the speed is not changed. Why: without frames the probe
+// restarted the TWAI driver every 2 s for ever (bench U9K2M3J0 14.11.2026: /api/live can1 frames=0, kbit cycling,
+// ~43000 restarts a day) - and a car that wakes while the box listens on a wrong speed loses its first frames
+// (engine START, rpm) until the probe comes round. Another speed is tried only when (a) the bus shows errors
+// (traffic at another speed - TWAI bus_error_count rises; NEOVERENE that the listen-only controller counts them,
+// the "[CAN1] probe" line shows it in the car) or (b) no speed was ever found and the 12 V says the engine runs
+// (>= 12.8 V, standby.h ENGINE_OFF_VOLTAGE): then the 3 speeds in turn as before.
+static bool s_known;                          // a speed from NVS
+static uint32_t s_probeErr;                   // bus_error_count at the probe start
 static const uint32_t s_speeds[] = {500, 250, 125};
 static int s_speedIdx;
 static bool s_found;
@@ -75,11 +87,19 @@ static void rxTask(void*)
 void can1Begin()
 {
   s_mux = xSemaphoreCreateMutex();
+  {                                           // PG250
+    Preferences p;
+    p.begin("can1", true);
+    int k = p.getInt("kbit", -1);
+    p.end();
+    for (int i = 0; i < 3; i++) if ((int)s_speeds[i] == k) { s_speedIdx = i; s_known = true; }
+  }
   bool ok = start();
   s_probeStart = millis();
   s_probeFrames = 0;
   xTaskCreatePinnedToCore(rxTask, "can1rx", 3072, nullptr, 10, nullptr, 0);
-  nbout.printf("[CAN1] listen-only %s\n", ok ? "started" : "FAILED");
+  nbout.printf("[CAN1] listen-only %s %lu kbit/s%s\n", ok ? "started" : "FAILED", (unsigned long)s_speeds[s_speedIdx],
+               s_known ? " (kept)" : "");
 }
 
 void can1Tick()
@@ -88,9 +108,26 @@ void can1Tick()
   if (s_frames > s_probeFrames) {
     s_found = true;
     nbout.printf("[CAN1] speed %lu kbit/s\n", (unsigned long)s_speeds[s_speedIdx]);
+    if (!s_known) {                           // PG250: kept for the next boots
+      Preferences p;
+      p.begin("can1", false);
+      p.putInt("kbit", (int)s_speeds[s_speedIdx]);
+      p.end();
+      s_known = true;
+    }
     return;
   }
   if (millis() - s_probeStart < SPEED_PROBE_MS) return;
+  {                                           // PG250: change the speed only with a reason
+    twai_status_info_t st = {};
+    uint32_t err = (s_running && twai_get_status_info(&st) == ESP_OK) ? st.bus_error_count : 0;
+    bool errors = err > s_probeErr;
+    bool engine = !s_known && read12V() >= 12.8f;
+    if (errors) nbout.printf("[CAN1] probe: %lu bus errors at %lu kbit/s - next speed\n",
+                             (unsigned long)(err - s_probeErr), (unsigned long)s_speeds[s_speedIdx]);
+    s_probeErr = err;
+    if (!errors && !engine) { s_probeStart = millis(); return; }   // silent: keep listening on this speed
+  }
   xSemaphoreTake(s_mux, portMAX_DELAY);
   s_pause = true;
   for (int i = 0; i < 100 && !s_paused; i++) delay(2);
@@ -98,6 +135,7 @@ void can1Tick()
   s_speedIdx = (s_speedIdx + 1) % 3;
   start();
   s_probeFrames = s_frames;
+  s_probeErr = 0;                             // a new driver counts from 0
   s_probeStart = millis();
   s_pause = false;
   xSemaphoreGive(s_mux);
