@@ -34,15 +34,10 @@ extern const char FW_BUILD_STR[] = __DATE__ " " __TIME__;
 bool webStart();
 void webProcess(int timeoutMs);
 
-// WiFi: the two networks of NestBox_v1F (config.h); passwords from the build
-// secrets (wifi_secrets.py -> WIFI_PASSWORD / WIFI_PASSWORD2), never in the repo
-#ifndef WIFI_PASSWORD
-#define WIFI_PASSWORD ""
-#endif
-#ifndef WIFI_PASSWORD2
-#define WIFI_PASSWORD2 ""
-#endif
-static const char* WIFI_NETS[][2] = {{"NTLIRIS", WIFI_PASSWORD}, {"uLTD_ext", WIFI_PASSWORD2}};
+// WiFi: only the networks of the list from FleetNest (wifiplaces.h). PG230 (14.11.2026, Vojtech "230 ano"): the two
+// networks built into the firmware (NTLIRIS, uLTD_ext of NestBox_v1F, passwords from the build secrets) are gone -
+// they meant nothing for other companies, and the password was readable from every build (no flash encryption,
+// PROJEKT_STAV 6/8). Both passwords are in FleetNest (checked 14.11.2026 against the build secrets, equal).
 #define WIFI_JOIN_MS 15000
 #define WIFI_RETRY_MS 30000
 
@@ -123,13 +118,17 @@ static bool s_wifiOff;
 bool telemetryCell();                          // telemetry.cpp
 bool telemetryEngineOn();
 bool telemetryPosition(float* lat, float* lng);
+bool telemetryLastPosition(float* lat, float* lng);   // PG232
 
 // PG205 + PG208 (13.-14.11.2026, wifiplaces.h - why there): which networks may be searched right now.
 // Agreed with Vojtech 13.11.2026:
 //  - inside the radius of a place with a WiFi name: that place's network only;
 //  - away from all of them: nothing;
-//  - no position (garage, just woken) or no place list yet: all, as before - a car under the depot's roof must
-//    still reach WiFi for the OTA, and a box that never got the list must not lose WiFi;
+//  - no position now (garage, just woken): the last position the box had decides (PG232, kept over sleep and power
+//    loss); all networks of the list only for a box that never had a position - a car under the depot's roof had
+//    its fix when it drove in;
+//  - no list: nothing (PG230, 14.11.2026) - the box gets the list over the modem 60 s after the boot, keeps it in
+//    NVS; a box without modem reaches only its own AP NestBox-<id> (web password) and USB;
 //  - a phone hotspot has no address: all networks for WIFI_START_MS after every engine start (hotspot on, start the
 //    engine - works where the box has neither data nor SMS) and for WIFI_CMD_MS after WIFI=1 (FleetNest or SMS).
 // A network already joined is kept until it is lost (a hotspot leaving with the car).
@@ -156,10 +155,10 @@ static int wifiSearch(const char** why, float* lat, float* lng)
   wasEngine = eng;
   if (s_wifiCmdAt && millis() - s_wifiCmdAt >= WIFI_CMD_MS) s_wifiCmdAt = 0;
   if (s_wifiStartAt && millis() - s_wifiStartAt >= WIFI_START_MS) s_wifiStartAt = 0;
+  if (!wifiPlacesCount()) { *why = "nolist"; return 0; }   // PG230: no list = no network known, also after WIFI=1
   if (s_wifiCmdAt) { *why = "cmd"; return 2; }
   if (s_wifiStartAt) { *why = "start"; return 2; }
-  if (!wifiPlacesCount()) { *why = "nolist"; return 2; }
-  if (!telemetryPosition(lat, lng)) { *why = "nofix"; return 2; }
+  if (!telemetryPosition(lat, lng) && !telemetryLastPosition(lat, lng)) { *why = "neverfix"; return 2; }   // PG232
   WifiPlace p;
   for (int i = 0; wifiPlaceGet(i, &p); i++)
     if (wifiPlaceHolds(p, *lat, *lng)) { *why = "place"; return 1; }
@@ -227,36 +226,18 @@ static void wifiTick()
   idle = false;
   if (s_wifiTry && millis() - s_wifiTry < WIFI_RETRY_MS) return;
   s_wifiTry = millis();
-  // the network in range: scan, then join the strongest allowed one. PG208: the networks of the list; without a
-  // list the 2 built-in ones.
+  // the network in range: scan, then join the strongest network of the list allowed here (PG208)
   static WifiPlace bestNet;                    // static: 112 bytes with a password, not on the loop task's stack twice
   static WifiPlace cand;
   int n = WiFi.scanNetworks();
   int best = -1, bestRssi = -1000;
-  int listed = wifiPlacesCount();
   for (int i = 0; i < n; i++) {
     if (WiFi.RSSI(i) <= bestRssi) continue;
     String ssid = WiFi.SSID(i);
     bool hit = false;
-    if (!listed) {
-      for (int k = 0; k < 2 && !hit; k++) {
-        if (ssid != WIFI_NETS[k][0]) continue;
-        memset(&cand, 0, sizeof(cand));
-        snprintf(cand.ssid, sizeof(cand.ssid), "%s", WIFI_NETS[k][0]);
-        snprintf(cand.pass, sizeof(cand.pass), "%s", WIFI_NETS[k][1]);
-        hit = true;
-      }
-    } else {
-      for (int k = 0; !hit && wifiPlaceGet(k, &cand); k++)
-        hit = ssid == cand.ssid && (nets == 2 || wifiPlaceHolds(cand, lat, lng));
-    }
+    for (int k = 0; !hit && wifiPlaceGet(k, &cand); k++)
+      hit = ssid == cand.ssid && (nets == 2 || wifiPlaceHolds(cand, lat, lng));
     if (!hit) continue;
-    // a listed network without a password (FleetNest has only the name yet - true for both places on 14.11.2026):
-    // the built-in password of the same name, so that the list never takes a working network away
-    if (!cand.pass[0]) {
-      for (int k = 0; k < 2; k++)
-        if (!strcmp(cand.ssid, WIFI_NETS[k][0])) snprintf(cand.pass, sizeof(cand.pass), "%s", WIFI_NETS[k][1]);
-    }
     best = i; bestRssi = WiFi.RSSI(i); bestNet = cand;
   }
   WiFi.scanDelete();

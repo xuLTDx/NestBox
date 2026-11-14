@@ -55,6 +55,7 @@ void txqOnAck(uint32_t packetNo);
 void txqSave(bool force);            // persist the "oldest not confirmed" cursor (NVS)
 void txqSleepSave();                 // PG223: before deep sleep - unconfirmed records into the internal flash
 void txqAckFlush(bool force);        // PG223: confirmed records marked in /DATA/<n>.ACK (net task, before restart)
+int txqInflight();                   // PG228: packets sent, not answered yet
 uint32_t txqPending();               // records not yet confirmed (queue; +1 while SD replay runs)
 uint32_t txqBootId();
 bool txqUsingPsram();

@@ -206,6 +206,7 @@ bool telemetryMuxOn() { return s_cell.muxOn(); }
 void telemetrySetCell(bool on) { s_cellOn = on; nvs_set_u8(nvs, "CELL", on ? 1 : 0); nvs_commit(nvs); }
 bool wifiRequest(bool on);                    // main.cpp (PG65, PG205)
 bool telemetryCell() { return s_cellOn; }
+void telemetryKeepPosition(float lat, float lng);
 // PG205 (main.cpp wifiSearchNets): the position if known. 60 s, not the record's 5 s: a short loss of the fix must
 // not switch the WiFi search on and off.
 bool telemetryPosition(float* lat, float* lng)
@@ -213,6 +214,47 @@ bool telemetryPosition(float* lat, float* lng)
   GnssFix fx = fixGet();
   if (!fx.valid || millis() - fx.at > 60000UL || (!fx.lat && !fx.lng)) return false;
   *lat = fx.lat; *lng = fx.lng;
+  telemetryKeepPosition(*lat, *lng);
+  return true;
+}
+
+// PG232 (14.11.2026, Vojtech "PG232 ano"): the last position the box had, also over deep sleep (RTC) and a power
+// loss (NVS "LASTPOS", written when it moved > 50 m and before every restart / sleep). Why: without a fix the WiFi
+// search tried every network of the list (PG205 "nofix") - a car abroad in a garage or just woken tried the
+// depot's networks for nothing. Now the last position decides; "all networks" only for a box that never had one.
+RTC_DATA_ATTR static float s_lpLat, s_lpLng;
+RTC_DATA_ATTR static bool s_lpHave;
+static float s_lpSavedLat, s_lpSavedLng;
+static bool s_lpLoaded;
+static void lpLoad()
+{
+  if (s_lpLoaded) return;
+  s_lpLoaded = true;
+  float v[2];
+  size_t l = sizeof(v);
+  if (nvs_get_blob(nvs, "LASTPOS", v, &l) == ESP_OK && l == sizeof(v)) {
+    s_lpSavedLat = v[0]; s_lpSavedLng = v[1];
+    if (!s_lpHave) { s_lpLat = v[0]; s_lpLng = v[1]; s_lpHave = true; }
+  }
+}
+static void lpSave()
+{
+  if (!s_lpHave || (s_lpLat == s_lpSavedLat && s_lpLng == s_lpSavedLng)) return;
+  float v[2] = {s_lpLat, s_lpLng};
+  if (nvs_set_blob(nvs, "LASTPOS", v, sizeof(v)) == ESP_OK && nvs_commit(nvs) == ESP_OK) { s_lpSavedLat = v[0]; s_lpSavedLng = v[1]; }
+}
+void telemetryKeepPosition(float lat, float lng)
+{
+  lpLoad();
+  s_lpLat = lat; s_lpLng = lng; s_lpHave = true;
+  float dy = (lat - s_lpSavedLat) * 111320.0f, dx = (lng - s_lpSavedLng) * 111320.0f * cosf(lat * 0.0174533f);
+  if (dx * dx + dy * dy > 50.0f * 50.0f) lpSave();
+}
+bool telemetryLastPosition(float* lat, float* lng)
+{
+  lpLoad();
+  if (!s_lpHave) return false;
+  *lat = s_lpLat; *lng = s_lpLng;
   return true;
 }
 void telemetrySetVehicle(const char* p) { carSetProfile(p); nvs_set_str(nvs, "VEH", carProfile()); nvs_commit(nvs); }
@@ -1097,6 +1139,16 @@ static volatile bool s_wifiBad;               // the mark holds for the access p
 static uint32_t s_wifiBadAt;
 static uint8_t s_wifiLoginFails;
 static bool s_wifiProbe;                      // PG204: a new join with the modem online - ask WiFi at once
+// PG228 (14.11.2026, Vojtech "228 ok"): the first WIFI_WATCH_MS after the data moved to WiFi with the modem online,
+// a WiFi where the server goes silent for WIFI_SILENT_MS while packets wait for their answer is marked at once
+// (data back to the modem), not after 2 failed logins. Why: bench U9K2M3J0 14.11.2026 15:58 (MAC blocked, the
+// router let the box in for ~1 s): the PG204 probe and the login worked, then WiFi went dead; the 2-login rule
+// took 6 min, 334 records arrived up to 350 s late. 20 s = more than 2 ACK timeouts (TXQ_ACK_TIMEOUT_MS 8 s) - a
+// working link answers every packet within ~1 s (bench). Only with packets in flight: a parked box with nothing
+// to send is not "silent".
+#define WIFI_WATCH_MS  120000UL
+#define WIFI_SILENT_MS 20000UL
+static uint32_t s_wifiWatchAt;                // millis() | 1 of the move to WiFi, 0 = not watched
 
 static bool bssidNow(uint8_t out[6])
 {
@@ -1146,14 +1198,8 @@ static void wifiBadTick()
   }
 }
 
-static void wifiLoginResult(bool ok)
+static void wifiMarkBad()
 {
-  if (ok) {
-    s_wifiLoginFails = 0;
-    errOk("NET", "wifi-nointernet", "wifi");  // "OK NET wifi", nothing unless it was marked
-    return;
-  }
-  if (++s_wifiLoginFails < WIFI_BAD_LOGINS || !s_cellUp || !s_cell.up()) return;
   uint8_t b[6];
   if (!bssidNow(b)) return;
   memcpy(s_wifiBadBssid, b, 6);
@@ -1162,6 +1208,17 @@ static void wifiLoginResult(bool ok)
   s_wifiBadAt = millis();
   s_wifiLoginFails = 0;
   errReport("NET", "wifi-nointernet");
+}
+
+static void wifiLoginResult(bool ok)
+{
+  if (ok) {
+    s_wifiLoginFails = 0;
+    errOk("NET", "wifi-nointernet", "wifi");  // "OK NET wifi", nothing unless it was marked
+    return;
+  }
+  if (++s_wifiLoginFails < WIFI_BAD_LOGINS || !s_cellUp || !s_cell.up()) return;
+  wifiMarkBad();
 }
 
 // WiFi for the data (netTask, OTA, UDP diag): joined and not marked - or marked but the modem is not online
@@ -1186,6 +1243,7 @@ static void netTask(void*)
       cur = want;
       if (cur == &s_cell) s_cell.makeDefault();   // NAVRH 9: lwIP route + DNS to PPP (WiFi's DHCP had them)
       if (cur == &s_wifi) WifiLink::makeDefault();   // PG96: and back to WiFi's (netlink.cpp)
+      s_wifiWatchAt = cur == &s_wifi && s_cellUp && s_cell.up() ? (millis() | 1) : 0;   // PG228
       linkSince = millis();
       s_client.setLink(cur);
       char m[40];
@@ -1199,6 +1257,17 @@ static void netTask(void*)
       continue;
     }
     if (cur == &s_wifi) WifiLink::restoreDns();   // PG96: PPP coming up overwrites the DNS (netlink.cpp)
+    if (s_wifiWatchAt && cur == &s_wifi) {        // PG228
+      uint32_t now = millis();
+      uint32_t heard = (int32_t)(s_client.lastSyncTime - s_wifiWatchAt) > 0 ? s_client.lastSyncTime : s_wifiWatchAt;
+      if (now - s_wifiWatchAt >= WIFI_WATCH_MS) s_wifiWatchAt = 0;
+      else if (now - heard >= WIFI_SILENT_MS && txqInflight() > 0 && s_cellUp && s_cell.up()) {
+        s_wifiWatchAt = 0;
+        nbout.printf("[NET] WiFi silent %lu s after the move - back to the modem\n", (unsigned long)((now - heard) / 1000));
+        wifiMarkBad();
+        continue;                                  // the next pass picks the modem
+      }
+    }
     // PG164 + PG197: while the modem is the link, PPP is made lwIP's default route again every 10 s. Why: our PPP is a
     // raw lwIP pcb (pppapi_set_default), not an esp_netif - every esp_netif event of the WiFi station (it keeps trying
     // to join every 30 s) lets ESP-IDF pick the default interface anew among its own (esp_netif_lwip.c 334-345), and a
@@ -1298,8 +1367,10 @@ void telemetryBegin(uint32_t bootId, bool sdOk)
   xTaskCreatePinnedToCore(cellTask, "cell", 6144, nullptr, 2, nullptr, 1);
 }
 
+void telemetryKeepPosition(float lat, float lng);
 void telemetryBeforeRestart()
 {
+  lpSave();                                    // PG232
   char st[220];
   txqStatus(st, sizeof(st));
   s_log.logEvent(st);

@@ -579,6 +579,8 @@ static int flightsUsed()
   for (auto& f : s_flight) if (f.used) n++;
   return n;
 }
+// PG228: packets sent and not answered yet (telemetry.cpp: is anything waiting for the server right now)
+int txqInflight() { lock(); int n = flightsUsed(); unlock(); return n; }
 static Flight* newFlight()
 {
   for (auto& f : s_flight) {

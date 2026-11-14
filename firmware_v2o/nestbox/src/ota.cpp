@@ -308,7 +308,7 @@ static void placesFetch(bool force, bool clock, time_t now)
   if (clock) { nvs_set_u32(nvs, "WIFI_PL_T", (uint32_t)now); nvs_commit(nvs); }
   if (changed || force) {
     char m[56];
-    snprintf(m, sizeof(m), "WIFI PLACES %d of %d stored%s", usable, total, usable ? "" : " - built-in networks");
+    snprintf(m, sizeof(m), "WIFI PLACES %d of %d stored%s", usable, total, usable ? "" : " - no WiFi");
     otaLog(m);
   }
 }

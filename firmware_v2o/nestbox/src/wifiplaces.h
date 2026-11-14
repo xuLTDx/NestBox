@@ -27,6 +27,6 @@ struct WifiPlace {
 void wifiPlacesBegin();                        // load from NVS
 // the downloaded list; false = not the list (kept as it was). *total = lines, *usable = stored
 bool wifiPlacesStore(const String& body, bool* changed, int* total, int* usable);
-int wifiPlacesCount();                         // 0 = no list: the built-in networks, searched everywhere, as before
+int wifiPlacesCount();                         // 0 = no list: no WiFi is searched (PG230, 14.11.2026: no built-in networks)
 bool wifiPlaceGet(int i, WifiPlace* out);
 bool wifiPlaceHolds(const WifiPlace& p, float lat, float lng);   // the position is inside its radius
