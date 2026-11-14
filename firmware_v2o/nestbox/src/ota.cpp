@@ -6,7 +6,8 @@
 #include "laststep.h"
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
-#include <Update.h>
+#include <esp_ota_ops.h>
+#include <esp_partition.h>
 #include "otaverify.h"
 #include <nvs.h>
 #include <mbedtls/sha256.h>
@@ -59,7 +60,7 @@ static volatile bool s_busy;                 // a check / download runs (standby
 bool otaBusy() { return s_busy; }
 static uint8_t s_retries;                    // p74: a broken download is tried again after 60 s,
 static uint32_t s_retryAt;                   // resumed from the partial file, at most 10 times
-static volatile bool s_staged;               // a verified image waits on SD for the engine to stop
+static volatile bool s_staged;               // a verified image waits in the other partition for the engine to stop
 static uint8_t s_buf[OTA_CHUNK];
 
 // -------------------------------------------------------------- status ---
@@ -313,34 +314,63 @@ static void placesFetch(bool force, bool clock, time_t now)
 }
 
 // -------------------------------------------------------------- check ---
-static bool fileHasMark(const char* path)
+// PG191 (14.11.2026, Vojtech "191 ano"): the download goes straight into the other app partition - no SD card
+// needed. Why: an update must not depend on the card (Peugeot 12.11.: SD state unknown, OTA went through SD;
+// U9K4M3G6 9.11.: pull-OTA failed because its SD died 72-80 s after boot). The running image is never touched;
+// the box switches to the new one only after the partition was read back and its sha256 equals the server's,
+// with the engine off, and the PG147 rule (login in 15 min or back) stays as it was.
+// NVS (namespace of telemetry.cpp): the target of the download in progress (size + sha256), how far it got
+// (saved every OTAD_SAVE bytes - a resume after a restart or a power loss continues from there) and "verified,
+// waits for the engine to stop".
+#define KEY_D_SIZE "OTAD_SIZE"
+#define KEY_D_SHA  "OTAD_SHA"
+#define KEY_D_OFF  "OTAD_OFF"
+#define KEY_D_OK   "OTAD_OK"
+#define OTAD_SAVE  0x10000U                   // 64 KB: 21 NVS writes per 1.3 MB image
+#define OTAD_SECTOR 4096U
+
+static void dlClear()
+{
+  nvs_erase_key(nvs, KEY_D_SIZE);
+  nvs_erase_key(nvs, KEY_D_SHA);
+  nvs_erase_key(nvs, KEY_D_OFF);
+  nvs_erase_key(nvs, KEY_D_OK);
+  nvs_commit(nvs);
+}
+
+// the partition read back: sha256 of its first <size> bytes equals <sha>, and the NestBox_v2O marker is in it
+// (*mark). Chunks overlap by the marker length, so a marker across two chunks is found.
+static bool partVerify(const esp_partition_t* part, size_t size, const char* sha, bool* mark)
 {
   const int ml = strlen(NESTBOX_IMAGE_MARK);
-  sdLock();
-  File f = SD.open(path, FILE_READ);
-  sdUnlock();
-  if (!f) return false;
-  bool found = false;
-  // read in chunks with an overlap of the marker length, so a marker across two chunks is found
-  static uint8_t win[OTA_CHUNK + 64];
+  static uint8_t win[OTA_CHUNK + 40];
   int keep = 0;
-  for (;;) {
-    sdLock();
-    int n = f.read(win + keep, OTA_CHUNK);
-    sdUnlock();
-    if (n <= 0) break;
+  bool found = false;
+  mbedtls_sha256_context ctx;
+  mbedtls_sha256_init(&ctx);
+  mbedtls_sha256_starts(&ctx, 0);
+  size_t done = 0;
+  while (done < size) {
+    int n = size - done < OTA_CHUNK ? size - done : OTA_CHUNK;
+    if (esp_partition_read(part, done, win + keep, n) != ESP_OK) break;
+    mbedtls_sha256_update(&ctx, win + keep, n);
     int tot = keep + n;
-    for (int i = 0; i + ml <= tot; i++) {
-      if (win[i] == (uint8_t)NESTBOX_IMAGE_MARK[0] && !memcmp(win + i, NESTBOX_IMAGE_MARK, ml)) { found = true; break; }
-    }
-    if (found) break;
+    if (!found)
+      for (int i = 0; i + ml <= tot; i++)
+        if (win[i] == (uint8_t)NESTBOX_IMAGE_MARK[0] && !memcmp(win + i, NESTBOX_IMAGE_MARK, ml)) { found = true; break; }
     keep = ml - 1 < tot ? ml - 1 : tot;
     memmove(win, win + tot - keep, keep);
+    done += n;
+    if ((done & 0xFFFF) == 0) vTaskDelay(1);
   }
-  sdLock();
-  f.close();
-  sdUnlock();
-  return found;
+  uint8_t dig[32];
+  mbedtls_sha256_finish(&ctx, dig);
+  mbedtls_sha256_free(&ctx);
+  if (mark) *mark = found;
+  if (done != size) return false;
+  char hex[65];
+  for (int i = 0; i < 32; i++) sprintf(hex + 2 * i, "%02x", dig[i]);
+  return strcasecmp(hex, sha) == 0;
 }
 
 static void check()
@@ -394,40 +424,26 @@ static void check()
   snprintf(m, sizeof(m), "OTA-PULL START SIZE=%u", (unsigned)size);
   otaLog(m);
 
-  // resume: the partial file belongs to this target when size and sha256 match /ota_resume.txt
+  const esp_partition_t* part = esp_ota_get_next_update_partition(nullptr);
+  if (!part || size > part->size) { otaLog("OTA-PULL ERR=PARTITION"); return; }
+  // resume: the bytes already in the partition belong to this target when size and sha256 match the NVS note
   size_t from = 0;
-  sdLock();
-  if (SD.exists(OTA_RESUME_PATH) && SD.exists(OTA_PENDING_PATH)) {
-    File rf = SD.open(OTA_RESUME_PATH, FILE_READ);
-    String sl = rf.readStringUntil('\n'), hl = rf.readStringUntil('\n');
-    rf.close();
-    hl.trim();
-    if ((size_t)sl.toInt() == size && hl == sha) {
-      File pf = SD.open(OTA_PENDING_PATH, FILE_READ);
-      size_t ex = pf.size();
-      pf.close();
-      if (ex > 0 && ex < size) from = ex;
-    }
+  {
+    uint32_t ds = 0, off = 0;
+    char dsha[65] = "";
+    size_t l = sizeof(dsha);
+    if (nvs_get_u32(nvs, KEY_D_SIZE, &ds) == ESP_OK && nvs_get_str(nvs, KEY_D_SHA, dsha, &l) == ESP_OK &&
+        ds == size && sha.equalsIgnoreCase(dsha) && nvs_get_u32(nvs, KEY_D_OFF, &off) == ESP_OK &&
+        off > 0 && off < size && off % OTAD_SAVE == 0)
+      from = off;
   }
-  if (SD.exists(OTA_META_PATH)) SD.remove(OTA_META_PATH);
   if (!from) {
-    SD.remove(OTA_PENDING_PATH);
-    File rf = SD.open(OTA_RESUME_PATH, FILE_WRITE);
-    if (rf) { rf.printf("%u\n%s\n", (unsigned)size, sha.c_str()); rf.close(); }
-  }
-  File out = SD.open(OTA_PENDING_PATH, from ? FILE_APPEND : FILE_WRITE);
-  sdUnlock();
-  if (!out) { otaLog("OTA-PULL ERR=SD_OPEN"); return; }
-  mbedtls_sha256_context ctx;
-  mbedtls_sha256_init(&ctx);
-  mbedtls_sha256_starts(&ctx, 0);
-  if (from) {                                 // the bytes already on SD
-    sdLock();
-    File rf = SD.open(OTA_PENDING_PATH, FILE_READ);
-    int n;
-    while (rf && (n = rf.read(s_buf, OTA_CHUNK)) > 0) mbedtls_sha256_update(&ctx, s_buf, n);
-    if (rf) rf.close();
-    sdUnlock();
+    dlClear();
+    nvs_set_u32(nvs, KEY_D_SIZE, (uint32_t)size);
+    nvs_set_str(nvs, KEY_D_SHA, sha.c_str());
+    nvs_set_u32(nvs, KEY_D_OFF, 0);
+    nvs_commit(nvs);
+  } else {
     snprintf(m, sizeof(m), "OTA-PULL RESUME from %u", (unsigned)from);
     otaLog(m);
   }
@@ -436,11 +452,8 @@ static void check()
   code = httpGet(c, path, from, &len);
   size_t written = from;
   uint32_t t0 = millis();
-  if (code == 200 && from) {                  // no Range support: start over
-    sdLock(); out.close(); out = SD.open(OTA_PENDING_PATH, FILE_WRITE); sdUnlock();
-    mbedtls_sha256_free(&ctx); mbedtls_sha256_init(&ctx); mbedtls_sha256_starts(&ctx, 0);
-    written = 0;
-  }
+  if (code == 200 && from) written = 0;       // no Range support: start over
+  bool flashErr = false;
   if (code == 200 || code == 206) {
     while (written < size) {
       int want = size - written < OTA_CHUNK ? size - written : OTA_CHUNK;
@@ -451,53 +464,54 @@ static void check()
         netlogLine(d);
         break;
       }
-      sdLock();
-      bool ok = out.write(s_buf, n) == (size_t)n;
-      int e = errno;
-      sdUnlock();
-      if (!ok) {                              // ... or the SD card
+      // every 4 KB sector is erased right before its first byte is written (one sector at a time: the flash is
+      // busy for tens of ms, not for the seconds a whole-partition erase takes)
+      esp_err_t e = ESP_OK;
+      for (size_t sec = (written + OTAD_SECTOR - 1) & ~(size_t)(OTAD_SECTOR - 1); sec < written + n && e == ESP_OK;
+           sec += OTAD_SECTOR)
+        e = esp_partition_erase_range(part, sec, OTAD_SECTOR);
+      if (e == ESP_OK) e = esp_partition_write(part, written, s_buf, n);
+      if (e != ESP_OK) {                      // ... or the flash
         char d[80];
-        snprintf(d, sizeof(d), "OTA download: SD write %d bytes failed errno=%d at %u", n, e, (unsigned)written);
+        snprintf(d, sizeof(d), "OTA download: flash write %d bytes failed err=0x%x at %u", n, (unsigned)e, (unsigned)written);
         netlogLine(d);
+        flashErr = true;
         break;
       }
-      mbedtls_sha256_update(&ctx, s_buf, n);
+      size_t before = written;
       written += n;
+      if (written / OTAD_SAVE != before / OTAD_SAVE) {   // the resume point, a multiple of 64 KB
+        nvs_set_u32(nvs, KEY_D_OFF, (uint32_t)(written / OTAD_SAVE * OTAD_SAVE));
+        nvs_commit(nvs);
+      }
       lastStep("OTA download %u/%u", (unsigned)written, (unsigned)size);
     }
   }
   c.stop();
-  sdLock(); out.close(); sdUnlock();
   lastStep("OTA download end %u/%u", (unsigned)written, (unsigned)size);
   if (written != size) {
-    mbedtls_sha256_free(&ctx);
-    snprintf(m, sizeof(m), "OTA-PULL ERR=RECV %u/%u http=%d in %ums", (unsigned)written, (unsigned)size, code,
-             (unsigned)(millis() - t0));
-    otaLog(m);                                // the partial file stays: the next check resumes
+    snprintf(m, sizeof(m), "OTA-PULL ERR=%s %u/%u http=%d in %ums", flashErr ? "FLASH_WR" : "RECV", (unsigned)written,
+             (unsigned)size, code, (unsigned)(millis() - t0));
+    otaLog(m);                                // the partial image stays: the next check resumes
     if (s_retries < 10) { s_retries++; s_retryAt = millis(); }   // p74
     return;
   }
-  uint8_t dig[32];
-  mbedtls_sha256_finish(&ctx, dig);
-  mbedtls_sha256_free(&ctx);
-  char hex[65];
-  for (int i = 0; i < 32; i++) sprintf(hex + 2 * i, "%02x", dig[i]);
-  if (sha.equalsIgnoreCase(hex) == false) {
+  bool mark = false;
+  if (!partVerify(part, size, sha.c_str(), &mark)) {
     otaLog("OTA-PULL ERR=SHA256");
-    sdLock(); SD.remove(OTA_PENDING_PATH); SD.remove(OTA_RESUME_PATH); sdUnlock();
+    dlClear();
     return;
   }
-  if (!fileHasMark(OTA_PENDING_PATH)) {
+  if (!mark) {
     otaLog("OTA-PULL ERR=NOT_V2O_IMAGE (no NestBox_v2O marker) - not flashed");
-    sdLock(); SD.remove(OTA_PENDING_PATH); SD.remove(OTA_RESUME_PATH); sdUnlock();
+    dlClear();
     return;
   }
-  sdLock();
-  File mf = SD.open(OTA_META_PATH, FILE_WRITE);
-  if (mf) { mf.printf("%u\n%s\n", (unsigned)size, hex); mf.close(); }   // PG147: + sha256 for otaVerifyFlashed()
-  sdUnlock();
+  nvs_set_u32(nvs, KEY_D_OFF, (uint32_t)size);
+  nvs_set_u8(nvs, KEY_D_OK, 1);
+  nvs_commit(nvs);
   snprintf(path, sizeof(path), "/api/nestbox/ota/%s/ota_confirm?size=%u&sha256=%.16s", s_token,
-           (unsigned)size, hex);
+           (unsigned)size, sha.c_str());
   if (httpGet(c, path, 0, &len) == 200) otaLog("OTA-PULL CONFIRMED");
   c.stop();
   s_staged = true;
@@ -505,48 +519,32 @@ static void check()
   s_retries = 0;
 }
 
-// flash from SD (v1F performPullOtaFlash), then restart
+// the verified image in the other app partition becomes the boot image, then restart. The partition is read
+// back once more: between the download and the engine stopping there may be hours, a restart or a local
+// /api/ota push into the same partition.
 static void flashStaged()
 {
-  sdLock();
-  File mf = SD.open(OTA_META_PATH, FILE_READ);
-  size_t size = mf ? (size_t)mf.readStringUntil('\n').toInt() : 0;
-  String fsha = mf ? mf.readStringUntil('\n') : String();   // PG147: empty in a meta file of an older build
-  fsha.trim();
-  if (mf) mf.close();
-  File f = SD.open(OTA_PENDING_PATH, FILE_READ);
-  size_t actual = f ? f.size() : 0;
-  sdUnlock();
-  if (!f || size < OTA_MIN_SIZE || actual != size) {
-    otaLog("OTA-PULL ERR=SD_SIZE");
-    sdLock(); if (f) f.close(); SD.remove(OTA_PENDING_PATH); SD.remove(OTA_META_PATH); sdUnlock();
-    s_staged = false;
-    return;
-  }
+  uint32_t ds = 0;
+  char fsha[65] = "";
+  size_t l = sizeof(fsha);
+  nvs_get_u32(nvs, KEY_D_SIZE, &ds);
+  nvs_get_str(nvs, KEY_D_SHA, fsha, &l);
+  size_t size = ds;
+  const esp_partition_t* part = esp_ota_get_next_update_partition(nullptr);
   char m[48];
   snprintf(m, sizeof(m), "OTA-PULL FLASH START SIZE=%u", (unsigned)size);
   otaLog(m);
-  if (!Update.begin(size)) { otaLog("OTA-PULL ERR=UPD_BEGIN"); sdLock(); f.close(); sdUnlock(); return; }
-  size_t done = 0;
-  while (done < size) {
-    sdLock();
-    int n = f.read(s_buf, size - done < OTA_CHUNK ? size - done : OTA_CHUNK);
-    sdUnlock();
-    if (n <= 0 || Update.write(s_buf, n) != (size_t)n) break;
-    done += n;
-    lastStep("OTA flash %u/%u", (unsigned)done, (unsigned)size);
-  }
-  sdLock(); f.close(); sdUnlock();
-  if (done != size || !Update.end()) {
-    Update.abort();
+  bool mark = false;
+  if (!part || size < OTA_MIN_SIZE || !partVerify(part, size, fsha, &mark) || !mark ||
+      esp_ota_set_boot_partition(part) != ESP_OK) {
     otaLog("OTA-PULL ERR=FLASH");
     s_staged = false;
-    sdLock(); SD.remove(OTA_PENDING_PATH); SD.remove(OTA_META_PATH); sdUnlock();
+    dlClear();
     return;
   }
-  sdLock(); SD.remove(OTA_PENDING_PATH); SD.remove(OTA_META_PATH); SD.remove(OTA_RESUME_PATH); sdUnlock();
+  dlClear();
   otaLog("OTA-PULL FLASH OK - restart");
-  otaVerifyFlashed(fsha.c_str());             // PG147
+  otaVerifyFlashed(fsha);                     // PG147
   // p79: the modem off first, as before the sleep (AT+CPOF; fully off after 25-26 s per the SIM7600G
   // Hardware Design table 9) - the new firmware then finds it off and its start() step 1 powers it on
   telemetryCellOff();
@@ -771,9 +769,14 @@ void otaBegin()
   nvs_get_str(nvs, "OTA_HOST", s_host, &l);
   uint16_t p = 0;
   if (nvs_get_u16(nvs, "OTA_PORT", &p) == ESP_OK && p) s_port = p;
-  // a verified image left on SD by the last boot (download done, not flashed yet)
+  // a verified image left in the other partition by the last boot (download done, engine was running)
+  uint8_t ok = 0;
+  s_staged = nvs_get_u8(nvs, KEY_D_OK, &ok) == ESP_OK && ok == 1;
+  // PG191: the files of the SD path (builds up to Nov 14 2026 10:22:20) are not used any more
   sdLock();
-  s_staged = SD.exists(OTA_META_PATH) && SD.exists(OTA_PENDING_PATH);
+  if (SD.exists(OTA_PENDING_PATH)) SD.remove(OTA_PENDING_PATH);
+  if (SD.exists(OTA_META_PATH)) SD.remove(OTA_META_PATH);
+  if (SD.exists(OTA_RESUME_PATH)) SD.remove(OTA_RESUME_PATH);
   sdUnlock();
   xTaskCreatePinnedToCore(otaTask, "ota", 8192, nullptr, 1, nullptr, 1);
 }
