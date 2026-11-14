@@ -137,6 +137,17 @@ bool telemetryPosition(float* lat, float* lng);
 #define WIFI_CMD_MS   (30UL * 60UL * 1000UL)
 static uint32_t s_wifiCmdAt, s_wifiStartAt;    // millis() | 1, 0 = not running
 // the networks that may be searched now: 0 none, 1 only the places holding the position, 2 all
+// PG219 (14.11.2026): why a join failed. Bench U9K2M3J0 boot 36: 40 min of "[WIFI] join timeout" every 30 s with
+// NTLIRIS at -65 dBm and nothing saying why (the router had the MAC blocked - known only after asking Vojtech).
+// The driver's last disconnect reason (wifi_err_reason_t: 2 auth expired, 15 4-way handshake timeout = wrong
+// password, 201 no AP found, 202 auth fail, ...) goes into the debug log and once into "ERR WIFI join <net> r=<n>";
+// repeats are counted, the next join that works sends "ERR WIFI join x<n>" + "OK WIFI join" (errreport.h).
+static volatile uint8_t s_wifiReason;         // 0 = the driver reported none during this join
+static void wifiReasonEvent(arduino_event_id_t, arduino_event_info_t info)
+{
+  s_wifiReason = info.wifi_sta_disconnected.reason;
+}
+
 static int wifiSearch(const char** why, float* lat, float* lng)
 {
   static bool wasEngine;
@@ -255,6 +266,9 @@ static void wifiTick()
   }
   s_knownAt = millis();
   nbout.printf("[WIFI] joining %s (%d dBm)\n", bestNet.ssid, bestRssi);
+  static bool reasonHooked;
+  if (!reasonHooked) { WiFi.onEvent(wifiReasonEvent, ARDUINO_EVENT_WIFI_STA_DISCONNECTED); reasonHooked = true; }
+  s_wifiReason = 0;
   WiFi.begin(bestNet.ssid, bestNet.pass);
   for (uint32_t t = millis(); millis() - t < WIFI_JOIN_MS && WiFi.status() != WL_CONNECTED;) delay(100);
   if (WiFi.status() == WL_CONNECTED) {
@@ -264,8 +278,13 @@ static void wifiTick()
     snprintf(ln, sizeof(ln), "WIFI %s IP %s", bestNet.ssid, WiFi.localIP().toString().c_str());
     statusLine(ln);
     configTime(0, 0, "pool.ntp.org");        // the sniff file's clock line
+    errOk("WIFI", "join");
   } else {
-    nbout.println("[WIFI] join timeout");
+    int r = s_wifiReason;                     // PG219
+    nbout.printf("[WIFI] join timeout reason=%d\n", r);
+    char d[48];
+    snprintf(d, sizeof(d), "%.24s r=%d", bestNet.ssid, r);
+    errReport("WIFI", "join", d);
   }
 }
 
