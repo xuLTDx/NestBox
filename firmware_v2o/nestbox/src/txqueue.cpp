@@ -7,7 +7,9 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <time.h>
-#include <SPIFFS.h>
+#include <LittleFS.h>   // PG223: the internal flash file system (was SPIFFS) - survives a power loss mid-write
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <stdarg.h>
 #include "sddigest.h"
@@ -21,6 +23,7 @@ extern "C" void esp_psram_extram_writeback_cache(void);
 #include "soc/soc.h"        // SOC_EXTRAM_DATA_LOW
 
 extern nvs_handle_t nvs;
+void statusLine(const char* text);   // ota.cpp
 void sdLock();    // telestore.cpp - the SD card is shared with the logger
 void sdUnlock();
 
@@ -70,6 +73,7 @@ struct SdCursor {  // NVS blob TXQ_CUR: the oldest record not confirmed yet
 };
 
 static SemaphoreHandle_t s_mux;
+static SemaphoreHandle_t s_ackMux;   // PG223: the .ACK marks (below)
 static uint8_t* s_mem;
 static uint32_t s_cap;
 static bool s_psram;
@@ -122,11 +126,24 @@ static SdCursor s_saved;
 // is also appended to a small file in the internal flash (SPIFFS partition,
 // 128 KB); the file is deleted once the server has confirmed every standby
 // record, and replayed with the records' own identity after a lost reserve.
+// PG223 (14.11.2026, Vojtech "PG223 ano"): the same file now also takes EVERY record the server has not
+// confirmed when the box goes to deep sleep (txqSleepSave). Why: the PSRAM reserve is lost in every deep sleep
+// (bench U9K2M3J0 12.11.: "0 records kept (reserve lost)"), the unconfirmed records were left on the SD card
+// only and came back through an SD replay (Peugeot 12.11. boots 226-228: records the server already had were
+// sent again after each wake, live data one record per ~19 s meanwhile; without a card they were lost).
+// After the wake they go straight back into the queue with their own identity - no card needed, no replay.
+// The file system is LittleFS (was SPIFFS) on the same "spiffs" partition, mounted at /spiffs as before;
+// nothing was kept there in a3 (the web pages are in the firmware), so the one-time format loses nothing.
 #define SB_PATH "/spiffs/txq_sb.bin"
-#define SB_MAX_BYTES (96 * 1024)
-#define SB_MAGIC 0x53425251  // "QRBS"
-struct SbHdr { uint32_t magic, boot, ts; uint16_t len, pad; };
+#define SB_TMP  "/spiffs/txq_sb.new"
+#define SB_MAX_BYTES (1536 * 1024)   // the whole 1 MB reserve + headers
+#define SB_MAGIC 0x32425251  // "QRB2" (PG223: + file, flags; "QRBS" files of older builds are not read)
+struct SbHdr { uint32_t magic, boot, ts, file; uint16_t len; uint8_t flags, pad; };
 static bool s_sbMounted, s_sbFile;
+// the result of the last txqSleepSave(), reported by the wake ("TXQ sleep ..."): RTC memory survives deep sleep,
+// the debug log and the queue do not (the log is closed before, the queue is what is being saved)
+RTC_DATA_ATTR static uint32_t s_slN, s_slBytes, s_slMs;
+RTC_DATA_ATTR static uint8_t s_slState;       // 0 no sleep save before this boot, 1 ok, 2 failed
 static uint32_t s_sbSaved, s_sbNotSaved, s_sbRestored;
 static void sbCheckDone();
 static void sbRestore();
@@ -192,6 +209,7 @@ static void resetRing()
 void txqEarlyInit()
 {
   s_mux = xSemaphoreCreateRecursiveMutex();
+  s_ackMux = xSemaphoreCreateMutex();
   s_mem = (uint8_t*)heap_caps_malloc(TXQ_RESERVE_BYTES, MALLOC_CAP_SPIRAM);
   s_psram = s_mem != nullptr;
   s_cap = TXQ_RESERVE_BYTES;
@@ -242,9 +260,9 @@ void txqBegin(uint32_t bootId)
   if (!kept) resetRing();
   // the internal flash file system for the standby records (also the httpd's
   // static files); /live.html, an old diagnostic page, removed (user, 2026-10-12)
-  s_sbMounted = SPIFFS.begin(true);
-  if (s_sbMounted && SPIFFS.exists("/live.html")) SPIFFS.remove("/live.html");
-  if (s_sbMounted && SPIFFS.exists("/txq_sb.bin")) {
+  s_sbMounted = LittleFS.begin(true, "/spiffs", 10, "spiffs");   // true: formatted once after SPIFFS
+  if (s_sbMounted && LittleFS.exists("/txq_sb.new")) LittleFS.remove("/txq_sb.new");   // a save cut off by a power loss
+  if (s_sbMounted && LittleFS.exists("/txq_sb.bin")) {
     s_sbFile = true;
     if (kept) sbCheckDone();  // the records are still in the reserve, or all confirmed
     else sbRestore();
@@ -266,7 +284,18 @@ void txqBegin(uint32_t bootId)
       s_psram ? "PSRAM" : "internal RAM", (unsigned)(s_cap >> 10), (unsigned)H->count,
       kept ? "" : " (reserve lost)", s_sdActive ? "from saved cursor" : "off", (unsigned)s_sbRestored);
   persist();
+  uint32_t restored = s_sbRestored;
   unlock();
+  char m[57];
+  if (s_slState && esp_reset_reason() == ESP_RST_DEEPSLEEP) {   // PG223: what the sleep saved, what came back
+    snprintf(m, sizeof(m), "TXQ sleep n=%u %uB %ums %s back=%u", (unsigned)s_slN, (unsigned)s_slBytes,
+             (unsigned)s_slMs, s_slState == 1 ? "ok" : "FAILED", (unsigned)restored);
+    statusLine(m);
+  } else if (restored) {                       // after a power loss: an older save
+    snprintf(m, sizeof(m), "TXQ %u records back from flash (power loss)", (unsigned)restored);
+    statusLine(m);
+  }
+  s_slState = 0;
 }
 
 void txqSetFile(uint32_t fileId)
@@ -419,7 +448,7 @@ static void sbAppend(const QEnt* e)
   if (!f) { s_sbNotSaved++; return; }
   bool ok = fseek(f, 0, SEEK_END) == 0 && ftell(f) + sizeof(SbHdr) + e->len + 4 <= SB_MAX_BYTES;
   if (ok) {
-    SbHdr h = {SB_MAGIC, e->boot, e->ts, e->len, 0};
+    SbHdr h = {SB_MAGIC, e->boot, e->ts, e->file, e->len, (uint8_t)(e->flags & F_SD), 0};
     uint32_t crc = crc32b(crc32b(0, (const uint8_t*)&h, sizeof(h)), (const uint8_t*)(e + 1), e->len);
     ok = fwrite(&h, sizeof(h), 1, f) == 1 && fwrite(e + 1, 1, e->len, f) == e->len &&
          fwrite(&crc, 4, 1, f) == 1 && fflush(f) == 0 && fsync(fileno(f)) == 0;
@@ -456,7 +485,7 @@ static void sbRestore()
     uint32_t crc;
     if (fread(rec, 1, h.len, f) != h.len || fread(&crc, 4, 1, f) != 1) break;
     if (crc != crc32b(crc32b(0, (const uint8_t*)&h, sizeof(h)), (const uint8_t*)rec, h.len)) break;
-    if (pushLocked(h.boot, h.ts, rec, h.len, 0, F_SB)) s_sbRestored++;
+    if (pushLocked(h.boot, h.ts, rec, h.len, h.file, F_SB | (h.flags & F_SD))) s_sbRestored++;
   }
   fclose(f);
   s_sbFile = true;
@@ -619,9 +648,128 @@ static int tailer(char* out, int n, int cap)
   return n + snprintf(out + n, cap - n, "*%X", sum);
 }
 
+// ---- PG223: /DATA/<n>.ACK - which records of /DATA/<n>.CSV the server has confirmed ----
+// Why: the NVS cursor is one position ("everything before it is confirmed"). With the newest record and the
+// queue going out before the SD replay, the confirmed records are no longer one block: after a long outage the
+// fresh ones are confirmed while the middle is still being replayed. A power loss then restarted the replay at
+// the cursor and sent everything behind it again (Peugeot 12.11.: records the server already had, sent again
+// after each wake). The .ACK file marks every confirmed record by its ts (4 bytes, append only); the replay
+// leaves those out. A mark not written yet (ACK_FLUSH_MS, power loss) only means that record is sent once
+// more - the server drops it by its identity. RESEND= from the server ignores the marks (the server says it
+// does NOT have the records).
+#define ACK_PEND      512
+#define ACK_FLUSH_MS  5000
+#define ACK_CACHE_MAX 131072         // ts of one file kept in PSRAM (512 KB = 36 h at 1 record/s)
+#define SD_SCAN_LINES 4000           // lines read per call while nothing is sent: the SD lock is given back
+struct AckPend { uint32_t file, ts; };
+static AckPend s_ackPend[ACK_PEND], s_ackOut[ACK_PEND];
+static int s_ackN;
+static volatile bool s_ackFlushing;
+static uint32_t s_ackFlushAt, s_ackWritten, s_ackErr, s_ackDropped;
+static uint32_t* s_ackC;             // cache of one file's marks: [0, sorted) sorted, the rest as it came
+static uint32_t s_ackCFile, s_ackCN, s_ackCSorted;
+static bool s_sdIgnoreAck;           // a RESEND replay
+static uint32_t s_replayAcked;
+
+static bool ackTake(TickType_t t) { return s_ackMux && xSemaphoreTake(s_ackMux, t) == pdTRUE; }
+static void ackGive() { xSemaphoreGive(s_ackMux); }
+
+// called holding the queue lock: never waits (a mark that does not fit is only a record sent once more)
+static void ackNote(uint32_t file, uint32_t ts)
+{
+  if (!file) return;
+  if (!ackTake(0)) { s_ackDropped++; return; }
+  if (s_ackN < ACK_PEND) s_ackPend[s_ackN++] = {file, ts};
+  else s_ackDropped++;
+  ackGive();
+}
+
+static int ackCmp(const void* a, const void* b)
+{
+  uint32_t x = *(const uint32_t*)a, y = *(const uint32_t*)b;
+  return x < y ? -1 : x > y ? 1 : 0;
+}
+
+// the marks waiting in RAM go to the card; called from the net task and before a restart / sleep
+void txqAckFlush(bool force)
+{
+  if (!s_ackMux) return;
+  if (!force && millis() - s_ackFlushAt < ACK_FLUSH_MS && s_ackN < ACK_PEND / 2) return;
+  if (!ackTake(pdMS_TO_TICKS(200))) return;
+  if (s_ackFlushing || !s_ackN) { ackGive(); s_ackFlushAt = millis(); return; }
+  s_ackFlushing = true;
+  int n = s_ackN;
+  memcpy(s_ackOut, s_ackPend, n * sizeof(AckPend));
+  s_ackN = 0;
+  ackGive();
+  s_ackFlushAt = millis();
+  if (s_maxFile) {                   // a card this boot (else: dropped, the records are resent after a replay)
+    int i = 0;
+    while (i < n) {
+      uint32_t file = s_ackOut[i].file;
+      static uint32_t ts[ACK_PEND];
+      int k = 0;
+      for (int j = i; j < n; j++)
+        if (s_ackOut[j].file == file) ts[k++] = s_ackOut[j].ts;
+      char path[32];
+      snprintf(path, sizeof(path), "/sd/DATA/%u.ACK", (unsigned)file);
+      sdLock();
+      int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+      bool ok = fd >= 0 && write(fd, ts, k * 4) == k * 4 && fsync(fd) == 0;
+      if (fd >= 0) close(fd);
+      sdUnlock();
+      if (ok) s_ackWritten += k; else s_ackErr++;
+      if (ok && ackTake(pdMS_TO_TICKS(200))) {     // the cache of the file being replayed follows
+        if (s_ackC && s_ackCFile == file)
+          for (int j = 0; j < k && s_ackCN < ACK_CACHE_MAX; j++) s_ackC[s_ackCN++] = ts[j];
+        ackGive();
+      }
+      while (i < n && s_ackOut[i].file == file) i++;   // the batch is grouped by file in practice
+      for (int j = i; j < n; j++)                       // the same file further on: done above
+        if (s_ackOut[j].file == file) s_ackOut[j].file = 0;
+      while (i < n && !s_ackOut[i].file) i++;
+    }
+  }
+  s_ackFlushing = false;
+}
+
+// SD replay (net task, holding the SD lock): has the server confirmed this record of this file?
+static bool ackHas(uint32_t file, uint32_t ts)
+{
+  if (!ackTake(pdMS_TO_TICKS(500))) return false;
+  if (s_ackCFile != file) {          // the marks of this file from the card, once per file
+    if (!s_ackC) s_ackC = (uint32_t*)heap_caps_malloc(ACK_CACHE_MAX * 4, MALLOC_CAP_SPIRAM);
+    s_ackCFile = file;
+    s_ackCN = s_ackCSorted = 0;
+    if (s_ackC) {
+      char path[32];
+      snprintf(path, sizeof(path), "/sd/DATA/%u.ACK", (unsigned)file);
+      int fd = open(path, O_RDONLY);
+      if (fd >= 0) {
+        int got;
+        while (s_ackCN < ACK_CACHE_MAX &&
+               (got = read(fd, s_ackC + s_ackCN, (ACK_CACHE_MAX - s_ackCN) * 4 > 16384 ? 16384 : (ACK_CACHE_MAX - s_ackCN) * 4)) >= 4)
+          s_ackCN += got / 4;
+        close(fd);
+      }
+    }
+  }
+  if (s_ackC && s_ackCN - s_ackCSorted > 0 && (s_ackCSorted == 0 || s_ackCN - s_ackCSorted > 1024)) {
+    qsort(s_ackC, s_ackCN, 4, ackCmp);
+    s_ackCSorted = s_ackCN;
+  }
+  bool has = false;
+  if (s_ackC) {
+    has = s_ackCSorted && bsearch(&ts, s_ackC, s_ackCSorted, 4, ackCmp) != nullptr;
+    for (uint32_t i = s_ackCSorted; !has && i < s_ackCN; i++) has = s_ackC[i] == ts;
+  }
+  for (int i = 0; !has && i < s_ackN; i++) has = s_ackPend[i].file == file && s_ackPend[i].ts == ts;
+  ackGive();
+  return has;
+}
+
 // ---- SD replay: read records back from /DATA/<file>.CSV ----
 // PG-p14: how a replay ends goes to FleetNest as a status line (before: only in TEST_TXQ builds)
-void statusLine(const char* text);   // ota.cpp
 static uint32_t s_replayRecs, s_replaySkip;   // records put into replay packets / skipped (no boot id)
 static void replayEnd(const char* why)
 {
@@ -629,8 +777,14 @@ static void replayEnd(const char* why)
   snprintf(m, sizeof(m), "REPLAY end file=%u sent=%u skip=%u %s", (unsigned)s_sdFile, (unsigned)s_replayRecs,
            (unsigned)s_replaySkip, why);
   statusLine(m);
+  if (s_replayAcked) {                 // PG223: left out, the server has them (.ACK)
+    snprintf(m, sizeof(m), "REPLAY acked=%u not sent again", (unsigned)s_replayAcked);
+    statusLine(m);
+  }
   s_replayRecs = 0;
   s_replaySkip = 0;
+  s_replayAcked = 0;
+  s_sdIgnoreAck = false;
 }
 // stop where the queue takes over (its oldest record that has an SD copy). PG-p19: taken as a copy under
 // the lock before the card is read. It only moves forward (records leave the queue at its tail), so a read
@@ -667,11 +821,15 @@ struct SdRead {
   // in: the cursor and what the read needs from the queue
   uint32_t file, boot, ts, pos, curFile, myBoot;
   SdStop stop;
+  bool ignoreAck;
   // out
-  bool opened, eof, done;
-  uint32_t nextTs, nextPos, skip;
+  bool opened, eof, done, partial;
+  uint32_t nextTs, nextPos, skip, acked;
   int recLen, nrec;
+  uint32_t tsl[64];                  // PG223: ts of the records in the packet (for their .ACK marks)
 };
+static uint32_t s_sdPktFile, s_sdPktTs[64];   // PG223: the records of the SD packet in flight (one at a time)
+static int s_sdPktN;
 static char s_recBuf[TXQ_PACKET_MAX + 700];  // a record is never cut: start one only below TXQ_PACKET_MAX
 static uint32_t s_sdGen;                      // +1 when a RESEND sets the cursor anew
 
@@ -697,8 +855,10 @@ static void sdReadPacket(SdRead& r)
   bool eof = false, done = false;
   uint32_t nextTs = 0, nextPos = 0;
   int nrec = 0;           // PG-p14: records in this packet
+  uint32_t lines = 0;
   while (true) {
     uint32_t linePos = file.position();
+    lines++;
     int n = file.available() ? file.readBytesUntil('\n', line, sizeof(line) - 1) : -1;
     if (n < 0) {
       eof = true;
@@ -736,11 +896,16 @@ static void sdReadPacket(SdRead& r)
         recLen += timeFields(recBuf + recLen, sizeof(s_recBuf) - recLen, curTs);
       cur = -1;  // the previous record (if any) is complete
       if (!r.boot) { r.skip++; continue; }  // file without a boot id (old firmware): not replayable
+      // PG223: a long stretch with nothing to send (already confirmed / before the cursor) is read in parts -
+      // the SD writer must get the card in between (it calls the card dead after 30 s without a write)
+      if (!recLen && lines > SD_SCAN_LINES) { r.partial = true; nextTs = r.ts; nextPos = linePos; break; }
       if (ts < r.ts) continue;
       if (sdStopKey(r.stop, r.file, ts)) { done = true; nextTs = ts; nextPos = linePos; break; }
+      if (!r.ignoreAck && ackHas(r.file, ts)) { r.acked++; continue; }
       if (recLen >= TXQ_PACKET_MAX) { nextTs = ts; nextPos = linePos; break; }
       cur = recLen;
       nrec++;
+      if (nrec >= 1 && nrec <= 64) r.tsl[nrec - 1] = ts;
       curHasData = false;
       curHasTime = false;
       if (recLen) recBuf[recLen++] = ',';
@@ -779,6 +944,7 @@ static int buildSdPacket(char* out, int cap, const char* devid, Flight* f)
   SdRead r = {};
   r.file = s_sdFile; r.boot = s_sdBoot; r.ts = s_sdTs; r.pos = s_sdPos;
   r.curFile = s_file; r.myBoot = s_boot;
+  r.ignoreAck = s_sdIgnoreAck;
   r.stop = sdStopNow();
   uint32_t gen = s_sdGen;
   unlock();
@@ -788,6 +954,7 @@ static int buildSdPacket(char* out, int cap, const char* devid, Flight* f)
   if (gen != s_sdGen || !s_sdActive || s_sdFile != r.file || s_sdPos != r.pos || s_sdTs != r.ts) return 0;
   s_sdBoot = r.boot;
   s_replaySkip += r.skip;
+  s_replayAcked += r.acked;
   if (!r.opened) {
     if (!s_maxFile) {
       // no SD file this boot (no card / card gone): keep the cursor in NVS
@@ -811,6 +978,7 @@ static int buildSdPacket(char* out, int cap, const char* devid, Flight* f)
     return 0;
   }
   if (!r.recLen) {
+    if (r.partial) { s_sdPos = r.nextPos; return 0; }   // PG223: go on from here at the next call
     if (r.done || (r.eof && s_sdFile >= s_maxFile)) {
       ev("REPLAY end file=%u ts=%u done=%d eof=%d stop=%u", (unsigned)s_sdFile, (unsigned)s_sdTs, r.done, r.eof,
          (unsigned)r.nextTs);
@@ -832,6 +1000,9 @@ static int buildSdPacket(char* out, int cap, const char* devid, Flight* f)
   f->sdDone = r.done;
   f->sdNextTs = r.nextTs;
   f->sdNextPos = r.nextPos;
+  s_sdPktFile = s_sdFile;
+  s_sdPktN = r.nrec < 0 ? 0 : r.nrec > 64 ? 64 : r.nrec;
+  memcpy(s_sdPktTs, r.tsl, s_sdPktN * 4);
   int o = header(out, cap, devid, s_sdBoot, f->no);
   out[o++] = ',';
   memcpy(out + o, s_recBuf, r.recLen);
@@ -843,8 +1014,15 @@ static int buildSdPacket(char* out, int cap, const char* devid, Flight* f)
 volatile bool g_txqTestPause = false;  // bench: an outage without touching the server
 #endif
 
+#ifdef TEST_SLEEP_BACKLOG
+volatile bool g_txqTestHold = false;   // bench build only (standby.cpp): nothing is sent before the test sleep
+#endif
+
 int txqNextPacket(char* out, int cap, const char* devid)
 {
+#ifdef TEST_SLEEP_BACKLOG
+  if (g_txqTestHold) return 0;
+#endif
 #ifdef TEST_TXQ
   if (g_txqTestPause) return 0;
 #endif
@@ -880,16 +1058,7 @@ int txqNextPacket(char* out, int cap, const char* devid)
       last->packet = f->no;
     }
   }
-  // 2. SD replay (older than anything in the queue), one packet at a time
-  if (!n && s_sdActive) {
-    bool sdBusy = false;
-    for (auto& g : s_flight) if (g.used && g.sd) sdBusy = true;
-    if (!sdBusy) n = buildSdPacket(out, cap, devid, f);
-    if (n) { s_lastBuiltNo = f->no; unlock(); return n; }
-    if (!f->sd && s_sdActive && sdBusy) { f->used = false; unlock(); return 0; }
-    if (s_sdActive) { f->used = false; unlock(); return 0; }  // wait for its ACK / next file
-  }
-  // 3. queued records, oldest first, same boot in one packet
+  // 2. queued records, oldest first, same boot in one packet
   if (!n) {
     uint32_t pos = H->tail, boot = 0;
     for (uint32_t i = 0; i < H->count; i++) {
@@ -914,6 +1083,16 @@ int txqNextPacket(char* out, int cap, const char* devid)
       }
       pos = nextPos(pos);
     }
+  }
+  // 3. SD replay (older than anything in the queue) in the background: one packet at a time, and only when
+  //    the queue has nothing to send right now. PG223 (Vojtech 14.11.2026 "nove data prve"): before, the
+  //    replay came first and the queue stood still until it ended - Peugeot 12.11. drive 18:30-19:27 got one
+  //    live record per ~19 s; and an error in the old data must not keep the new data from getting through.
+  if (!n && s_sdActive) {
+    bool sdBusy = false;
+    for (auto& g : s_flight) if (g.used && g.sd) sdBusy = true;
+    if (!sdBusy) n = buildSdPacket(out, cap, devid, f);
+    if (n) { s_lastBuiltNo = f->no; unlock(); return n; }
   }
   if (!n) { f->used = false; s_packetNo--; unlock(); return 0; }
 #ifdef TEST_TXQ
@@ -953,6 +1132,8 @@ void txqOnAck(uint32_t packetNo)
     f.used = false;
     if (f.sd) {
       ev("ACK sd pkt=%u done=%d eof=%d next=%u", (unsigned)packetNo, f.sdDone, f.sdEof, (unsigned)f.sdNextTs);
+      for (int k = 0; k < s_sdPktN; k++) ackNote(s_sdPktFile, s_sdPktTs[k]);   // PG223
+      s_sdPktN = 0;
       if (f.sdDone || (f.sdEof && s_sdFile >= s_maxFile)) {
         // not "done" yet (2026-10-13): while this packet was out, the full
         // queue may have dropped more records relying on this replay - go on
@@ -971,7 +1152,10 @@ void txqOnAck(uint32_t packetNo)
       for (uint32_t i = 0; i < H->count; i++) {
         pos = norm(pos);
         QEnt* e = ent(pos);
-        if (e->state == ST_INFLIGHT && e->packet == packetNo) e->state = ST_ACKED;
+        if (e->state == ST_INFLIGHT && e->packet == packetNo) {
+          e->state = ST_ACKED;
+          if (e->flags & F_SD) ackNote(e->file, e->ts);   // PG223: marked in /DATA/<file>.ACK
+        }
         pos = nextPos(pos);
       }
       releaseAcked();
@@ -1024,6 +1208,64 @@ void txqSave(bool force)
   }
 }
 
+// PG223: before deep sleep (standby.cpp, after prepareRestart) - every record the server has not confirmed
+// goes into the internal flash; txqBegin() of the wake puts them back (sbRestore). Written to a new file and
+// renamed, so a power loss in the middle leaves the previous file. When it worked and no SD replay is running,
+// the NVS cursor points behind the last record of the open file: the wake has nothing to replay. When it failed (no file
+// system, full) the cursor stays as txqSave() left it and the wake replays from the card, as before.
+void txqSleepSave()
+{
+  lock();
+  uint32_t t0 = millis(), n = 0, bytes = 0;
+  bool ok = s_sbMounted;
+  FILE* f = ok ? fopen(SB_TMP, "wb") : nullptr;
+  if (!f) ok = false;
+  uint32_t pos = H->tail;
+  for (uint32_t i = 0; i < H->count && ok; i++) {
+    pos = norm(pos);
+    QEnt* e = ent(pos);
+    if (e->state != ST_ACKED) {
+      SbHdr h = {SB_MAGIC, e->boot, e->ts, e->file, e->len, (uint8_t)(e->flags & F_SD), 0};
+      uint32_t crc = crc32b(crc32b(0, (const uint8_t*)&h, sizeof(h)), (const uint8_t*)(e + 1), e->len);
+      ok = bytes + sizeof(h) + e->len + 4 <= SB_MAX_BYTES && fwrite(&h, sizeof(h), 1, f) == 1 &&
+           fwrite(e + 1, 1, e->len, f) == e->len && fwrite(&crc, 4, 1, f) == 1;
+      if (ok) { n++; bytes += sizeof(h) + e->len + 4; }
+    }
+    pos = nextPos(pos);
+  }
+  if (f) {
+    if (ok) ok = fflush(f) == 0 && fsync(fileno(f)) == 0;
+    fclose(f);
+  }
+  if (ok && n) ok = rename(SB_TMP, SB_PATH) == 0;
+  else if (ok) remove(SB_PATH);               // nothing waits: no file
+  if (!ok || !n) remove(SB_TMP);
+  if (ok) {
+    s_sbFile = n > 0;
+    if (!s_sdActive) {
+      // "after the last record of the open file": a record made between here and the sleep itself is on the
+      // card only and is still found (pos = the file's size now, so the wake does not read the file through)
+      SdCursor c = {Q_MAGIC, 0, 0, 0, 0, 0};
+      if (s_file) {
+        char path[32];
+        snprintf(path, sizeof(path), "/sd/DATA/%u.CSV", (unsigned)s_file);
+        struct stat st;
+        sdLock();
+        bool have = stat(path, &st) == 0;
+        sdUnlock();
+        c = {Q_MAGIC, s_file, s_boot, s_lastTs + 1, have ? (uint32_t)st.st_size : 0, 0};
+      }
+      s_saved = c;
+      nvs_set_blob(nvs, "TXQ_CUR", &c, sizeof(c));
+      nvs_commit(nvs);
+    }
+  }
+  s_slN = n; s_slBytes = bytes; s_slMs = millis() - t0; s_slState = ok ? 1 : 2;
+  nbout.printf("[TXQ] sleep save: %u records, %u bytes in %u ms - %s\n", (unsigned)n, (unsigned)bytes,
+               (unsigned)(millis() - t0), ok ? "ok" : "FAILED (SD replay after the wake)");
+  unlock();
+}
+
 #ifdef TEST_TXQ
 void txqTestLoseReserve()
 {
@@ -1040,6 +1282,7 @@ void txqResendFrom(uint32_t fileId)
   s_sdActive = fileId != 0;
   s_sdGen++;     // PG-p19: a replay read running now (without the lock) is dropped, not applied
   s_sdFile = fileId;
+  s_sdIgnoreAck = fileId != 0;   // PG223: the server says it does not have them - the .ACK marks do not count
   s_sdBoot = 0;  // read from the file's BOOTID line
   s_replayRecs = 0;
   s_replaySkip = 0;
@@ -1081,11 +1324,12 @@ void txqStatus(char* buf, int size)
     pos = nextPos(pos);
   }
   uint32_t newestBoot = H->count ? ent(H->lastPos)->boot : 0, newestTs = H->count ? ent(H->lastPos)->ts : 0;
-  snprintf(buf, size, "TXQ %s used=%u%% records=%u pending=%u inflight=%d sd=%s%u/%u lost=%u sdwait=%u sb=%u/%u/%u/%d replay_deferred=%d replay_abandoned=%u newest=%u:%u",
+  snprintf(buf, size, "TXQ %s used=%u%% records=%u pending=%u inflight=%d sd=%s%u/%u lost=%u sdwait=%u sb=%u/%u/%u/%d replay_deferred=%d replay_abandoned=%u newest=%u:%u ack=%u/%u/%u",
       s_psram ? "psram" : "ram", (unsigned)(usedBytes() * 100 / (s_cap - DSTART)), (unsigned)H->count,
       (unsigned)txqPending(), flightsUsed(), s_sdActive ? "on:" : "off:", (unsigned)s_sdFile, (unsigned)s_sdTs,
       (unsigned)s_lost, (unsigned)sdWait, (unsigned)s_sbSaved, (unsigned)s_sbNotSaved, (unsigned)s_sbRestored,
-      s_sbFile ? 1 : 0, s_replayDeferred ? 1 : 0, (unsigned)s_replayAbandoned, (unsigned)newestBoot, (unsigned)newestTs);
+      s_sbFile ? 1 : 0, s_replayDeferred ? 1 : 0, (unsigned)s_replayAbandoned, (unsigned)newestBoot, (unsigned)newestTs,
+      (unsigned)s_ackWritten, (unsigned)s_ackErr, (unsigned)s_ackDropped);
   unlock();
 }
 

@@ -13,6 +13,9 @@
 #include <driver/rtc_io.h>
 #include "canbus1.h"
 #include "txqueue.h"
+#ifdef TEST_SLEEP_BACKLOG
+extern volatile bool g_txqTestHold;   // txqueue.cpp
+#endif
 #include "ota.h"
 #include "laststep.h"
 
@@ -316,6 +319,7 @@ static void goStandby()
   logNetEvent(m);
   telemetryCellOff();
   prepareRestart("STANDBY");          // sniff file closed, queue saved, SD log synced
+  txqSleepSave();                     // PG223: unconfirmed records into the internal flash
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
   sleepNow(true);
@@ -382,7 +386,15 @@ static void remoteTick()
 void standbyTick()
 {
   remoteTick();
+#ifdef TEST_SLEEP_BACKLOG
+  // bench build only (PG223, 14.11.2026): the sleep test waits 28 s and nothing is sent for the last 25 s, so the
+  // box falls asleep with ~25 unconfirmed records - on the bench the modem delivers everything before the sleep
+  // and txqSleepSave() had nothing to save ("TXQ sleep n=0", boots 41 and 43)
+  if (s_testS) g_txqTestHold = millis() - s_testAt > 3000;
+  if (s_testS && millis() - s_testAt > 28000) standbyTestNow(s_testS, s_testUlp);
+#else
   if (s_testS && millis() - s_testAt > 2000) standbyTestNow(s_testS, s_testUlp);   // the HTTP answer went out first
+#endif
   if (!STANDBY_AUTO) return;          // 21.10.2026: the ULP did not wake at the engine start - off until tested
   static uint32_t lastCheck;
   if (millis() - lastCheck < 1000) return;
@@ -442,6 +454,7 @@ static void standbyTestNow(uint32_t seconds, bool ulp)
   if (s_nextReport < time(nullptr) + (time_t)seconds + 60) s_nextReport = time(nullptr) + STANDBY_REPORT_S;
   telemetryCellOff();
   prepareRestart("SLEEP_TEST");
+  txqSleepSave();                     // PG223
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
   s_ulpTest = ulp ? 1 : 0;

@@ -1240,6 +1240,7 @@ static void netTask(void*)
     for (int i = 0; i < 4; i++) s_client.inbound();
     wdtFeed(WDT_NET, "save");
     txqSave(false);
+    txqAckFlush(false);                        // PG223
     // nothing heard for 2 min (no ACK, no reply): log in again (v1F "Poor connection")
     if (millis() - s_client.lastSyncTime > 120000UL) {
       wdtFeed(WDT_NET, "ping");
@@ -1302,6 +1303,7 @@ void telemetryBeforeRestart()
   char st[220];
   txqStatus(st, sizeof(st));
   s_log.logEvent(st);
+  txqAckFlush(true);                           // PG223: the marks in RAM to the card
   s_log.sync(3000);
   txqSave(true);
 }
