@@ -31,4 +31,7 @@ public:
   static void saveDns();             // right after the WiFi join (DHCP has just set its DNS)
   static void makeDefault();         // route + DNS: when WiFi becomes the link in use, before OTA/LOG over WiFi
   static void restoreDns();          // DNS only, if PPP overwrote them (netTask, every pass on WiFi)
+  // PG204: one packet to the server through WiFi while the modem stays the link in use; returns the bytes of the
+  // server's answer in rx (0 = no answer)
+  static int probe(const char* host, uint16_t port, const char* pkt, int len, char* rx, int cap);
 };

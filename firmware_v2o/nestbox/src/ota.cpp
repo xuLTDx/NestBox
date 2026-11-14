@@ -17,6 +17,8 @@
 #include <errno.h>
 
 extern const char FW_BUILD_STR[];
+#include "wifiplaces.h"
+#include "standby.h"
 extern nvs_handle_t nvs;
 void logNetEvent(const char* text);
 void prepareRestart(const char* why);
@@ -115,9 +117,16 @@ int otaStatus(char* buf, int size)
                   s_staged ? 1 : 0, s_last);
 }
 
+const char* otaTokenForHmac() { return s_token; }   // PG214 (telemetry.cpp telemetrySmsCfgReport): the HMAC key only
+void telemetrySmsCfgReport(int what);
 bool otaSet(const char* key, const char* value)
 {
-  if (!strcmp(key, "OTA_TOKEN")) { snprintf(s_token, sizeof(s_token), "%s", value); nvs_set_str(nvs, "OTA_TOKEN", s_token); }
+  if (!strcmp(key, "OTA_TOKEN")) {
+    snprintf(s_token, sizeof(s_token), "%s", value); nvs_set_str(nvs, "OTA_TOKEN", s_token);
+    nvs_commit(nvs);
+    telemetrySmsCfgReport(2);                  // PG214: the PIN's fingerprint is keyed by the token
+    return true;
+  }
   else if (!strcmp(key, "OTA_HOST")) { snprintf(s_host, sizeof(s_host), "%s", value); nvs_set_str(nvs, "OTA_HOST", s_host); }
   else if (!strcmp(key, "OTA_PORT")) { s_port = (uint16_t)atoi(value); nvs_set_u16(nvs, "OTA_PORT", s_port); }
   else return false;
@@ -239,6 +248,68 @@ static String urlBuild()
   String s;
   for (const char* p = FW_BUILD_STR; *p; p++) s += *p == ' ' ? String("%20") : String(*p);
   return s;
+}
+
+// PG205 + PG208 (wifiplaces.h): the WiFi networks of the company's places (name, password, position), from the OTA
+// server. The answer is never logged (passwords).
+// When (Vojtech 14.11.2026: "nejde o ota ale o zoznam WiFi kazde 2 hod, ota nech zostane ako je"): on its own, not
+// tied to the OTA check - every PLACES_EVERY_S while the box is up, counted from NVS (survives sleep), first 60 s
+// after a boot (otaTask's start delay). Why 2 h: FleetNest sends at most 16 networks, the nearest to the box's last
+// position first (FN165) - a car that drove far needs the list of where it is now. Not in the 3-hour parked report
+// boot (the car has not moved; 8 fetches a day over the modem for nothing). A requested OTA check (OTA_READY / SMS
+// OTA) fetches it at once. After a failed try the next one PLACES_RETRY_MS later (the list it has stays).
+#define PLACES_EVERY_S 7200
+#define PLACES_RETRY_MS 600000UL
+static void placesFetch(bool force, bool clock, time_t now);
+static void placesSync(bool force)
+{
+  if (!s_token[0]) return;
+  time_t now = time(nullptr);
+  uint32_t last = 0;
+  nvs_get_u32(nvs, "WIFI_PL_T", &last);
+  bool clock = now > 1735689600;
+  static uint32_t triedAt;
+  if (!force) {
+    if (standbyParkedBoot()) return;
+    if (last && (!clock || (uint32_t)now - last < PLACES_EVERY_S)) return;
+    if (triedAt && millis() - triedAt < PLACES_RETRY_MS) return;
+  }
+  triedAt = millis() | 1;
+  bool wasBusy = s_busy;                      // the box does not fall asleep in the middle of the fetch
+  s_busy = true;
+  placesFetch(force, clock, now);
+  s_busy = wasBusy;
+}
+
+static void placesFetch(bool force, bool clock, time_t now)
+{
+  CellLink* cell = telemetryWifiForData() ? nullptr : telemetryCellLink();
+  if (!telemetryWifiForData() && !cell) return;
+  char path[200];
+  snprintf(path, sizeof(path), "/api/nestbox/ota/%s/wifi.txt", s_token);
+  if (cell) cell->makeDefault();
+  else WifiLink::makeDefault();
+  OtaConn& c = s_wc;
+  long len = 0;
+  int code = httpGet(c, path, 0, &len);
+  if (code != 200) {
+    char m[48];
+    snprintf(m, sizeof(m), "WIFI PLACES ERR http=%d", code);
+    otaLog(m);
+    c.stop();
+    return;
+  }
+  String body = readAll(c);
+  c.stop();
+  bool changed = false;
+  int total = 0, usable = 0;
+  if (!wifiPlacesStore(body, &changed, &total, &usable)) { otaLog("WIFI PLACES ERR bad list"); return; }
+  if (clock) { nvs_set_u32(nvs, "WIFI_PL_T", (uint32_t)now); nvs_commit(nvs); }
+  if (changed || force) {
+    char m[56];
+    snprintf(m, sizeof(m), "WIFI PLACES %d of %d stored%s", usable, total, usable ? "" : " - built-in networks");
+    otaLog(m);
+  }
 }
 
 // -------------------------------------------------------------- check ---
@@ -673,9 +744,11 @@ static void otaTask(void*)
         otaLog(req ? "OTA-PULL REQ" : "OTA-PULL CHECK periodic");
         s_busy = true;
         check();
+        if (req && !s_retryAt) placesSync(true);   // PG205: a requested check = fetch the WiFi list now
         s_busy = false;
       }
     }
+    if (!s_retryAt && !s_staged) placesSync(false);   // PG205: the WiFi list on its own clock; not during a firmware download
     if (!s_staged || !flashAllowed()) logTick();   // PG49
     CellLink* cell = telemetryCellLink();     // p71
     if (cell && !cell->udpDiag) cell->udpDiag = udpDiagNote;

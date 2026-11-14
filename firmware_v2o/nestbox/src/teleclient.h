@@ -41,7 +41,9 @@ public:
   bool connect(bool quick = false);
   bool transmit(const char* packet, unsigned int size);
   bool ping();
+  int eventPacket(uint8_t event, char* out, int cap);   // PG204: the packet only (WifiLink::probe)
   void inbound();
+  void inboundData(char* data, int len);
   void onMessage(char* msg, UdpRx* rx);
   void shutdown();
   NetLink* link = nullptr;

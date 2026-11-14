@@ -88,3 +88,42 @@ void WifiLink::close()
   if (s_begun) s_udp.stop();
   s_begun = false;
 }
+
+// PG204 (13.11.2026): is there internet behind this WiFi - asked without touching the link in use.
+// Why: bench U9K2M3J0 13.11.2026 boot 35, MAC blocked on the router, data on the modem: every 30 min (PG164's new
+// try, 21:33 and 22:05) netTask moved the data to WiFi, needed 2 failed logins to learn it is still dead and went
+// back - ~2 min 20 s without live data each time ("ERR NET udp timeout", "ERR NET connect WIFI", records late).
+// Now the try is this packet: a UDP socket of its own, bound to WiFi's address - ESP-IDF's lwIP routes a packet with
+// a bound source address out of the interface that owns it (LWIP_HOOK_IP4_ROUTE_SRC = ip4_route_src_hook,
+// lwipopts.h), whatever the default route is (PPP here). The server's name is resolved over the link in use.
+// 2 packets, 2 s each for the answer; an answer counts only from the server's address.
+#include <lwip/sockets.h>
+int WifiLink::probe(const char* host, uint16_t port, const char* pkt, int len, char* rx, int cap)
+{
+  if (WiFi.status() != WL_CONNECTED || len <= 0) return 0;
+  IPAddress srv;
+  if (!WiFi.hostByName(host, srv)) return 0;
+  int fd = lwip_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if (fd < 0) return 0;
+  struct sockaddr_in me = {};
+  me.sin_family = AF_INET;
+  me.sin_addr.s_addr = (uint32_t)WiFi.localIP();
+  struct sockaddr_in to = {};
+  to.sin_family = AF_INET;
+  to.sin_port = htons(port);
+  to.sin_addr.s_addr = (uint32_t)srv;
+  struct timeval tv = {2, 0};
+  int got = 0;
+  if (lwip_bind(fd, (struct sockaddr*)&me, sizeof(me)) == 0 &&
+      lwip_setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0) {
+    for (int i = 0; i < 2 && !got; i++) {
+      if (lwip_sendto(fd, pkt, len, 0, (struct sockaddr*)&to, sizeof(to)) != len) break;
+      struct sockaddr_in from = {};
+      socklen_t fl = sizeof(from);
+      int n = lwip_recvfrom(fd, rx, cap, 0, (struct sockaddr*)&from, &fl);
+      if (n > 0 && from.sin_addr.s_addr == to.sin_addr.s_addr) got = n;
+    }
+  }
+  lwip_close(fd);
+  return got;
+}

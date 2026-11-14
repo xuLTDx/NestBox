@@ -204,7 +204,17 @@ void telemetryApnCommand(const char* arg) { nbApnCommand(nvs, arg, "internet"); 
 // NAVRH 9: CMUX always (PPP needs it) - CELL_MUX=0 is not possible any more, the stored value is ignored
 bool telemetryMuxOn() { return s_cell.muxOn(); }
 void telemetrySetCell(bool on) { s_cellOn = on; nvs_set_u8(nvs, "CELL", on ? 1 : 0); nvs_commit(nvs); }
+bool wifiRequest(bool on);                    // main.cpp (PG65, PG205)
 bool telemetryCell() { return s_cellOn; }
+// PG205 (main.cpp wifiSearchNets): the position if known. 60 s, not the record's 5 s: a short loss of the fix must
+// not switch the WiFi search on and off.
+bool telemetryPosition(float* lat, float* lng)
+{
+  GnssFix fx = fixGet();
+  if (!fx.valid || millis() - fx.at > 60000UL || (!fx.lat && !fx.lng)) return false;
+  *lat = fx.lat; *lng = fx.lng;
+  return true;
+}
 void telemetrySetVehicle(const char* p) { carSetProfile(p); nvs_set_str(nvs, "VEH", carProfile()); nvs_commit(nvs); }
 void telemetrySetApn(const char* apn) { nvs_set_str(nvs, "CELL_APN", apn); nvs_commit(nvs); loadApn(); s_cell.setApn(s_apn); }
 void otaReadyRequested() { s_otaReq = true; otaRequest(); }   // server OTA_READY -> pull-OTA (ota.cpp)
@@ -682,6 +692,45 @@ static void smsLoad()
   if (nvs_get_str(nvs, "SMS_PIN", s_smsPin, &l) != ESP_OK) s_smsPin[0] = 0;
 }
 
+// PG214 (14.11.2026, FleetNest FN168, Vojtech "214 ano"): the box reports its own SMS settings. Why: FleetNest knew
+// the allowed numbers and the PIN only from its own last command; they can be changed on the box's web page too, and
+// the NestApp (FN166: SMS command from the admin's phone) would then send a wrong PIN - the box stays silent.
+// Two status lines (one would not fit the 56 characters of statusLine()), each after every boot / wake and after
+// every change of its value, from wherever:
+//   SMS CFG allow=<n1>,<n2>,<n3> | - (none) | ? (does not fit - never cut: a cut number would look allowed)
+//   SMS CFG pin=<16 hex> | set (PIN set, the box has no OTA token) | - (no PIN)
+// The PIN itself is never sent or logged: 16 hex = the first 8 bytes of HMAC-SHA256, key = the OTA token (ASCII),
+// message "SMSPIN:" + PIN. Check value (FleetNest test): token 32 x 'o', PIN "Ab12" -> 075eb417723fd232.
+#include <mbedtls/md.h>
+const char* otaTokenForHmac();                 // ota.cpp - used here only, never printed
+#define SMSCFG_ALLOW 1
+#define SMSCFG_PIN   2
+void telemetrySmsCfgReport(int what)
+{
+  char m[57];
+  if (what & SMSCFG_ALLOW) {
+    int n = snprintf(m, sizeof(m), "SMS CFG allow=%s", s_smsAllow[0] ? s_smsAllow : "-");
+    if (n >= (int)sizeof(m)) snprintf(m, sizeof(m), "SMS CFG allow=?");
+    statusLine(m);
+  }
+  if (what & SMSCFG_PIN) {
+    const char* tok = otaTokenForHmac();
+    if (!s_smsPin[0]) snprintf(m, sizeof(m), "SMS CFG pin=-");
+    else if (!tok[0]) snprintf(m, sizeof(m), "SMS CFG pin=set");
+    else {
+      char msg[24];
+      int ml = snprintf(msg, sizeof(msg), "SMSPIN:%s", s_smsPin);
+      uint8_t h[32] = {};
+      bool ok = mbedtls_md_hmac(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), (const uint8_t*)tok, strlen(tok),
+                                (const uint8_t*)msg, ml, h) == 0;
+      memset(msg, 0, sizeof(msg));
+      if (!ok) snprintf(m, sizeof(m), "SMS CFG pin=set");
+      else snprintf(m, sizeof(m), "SMS CFG pin=%02x%02x%02x%02x%02x%02x%02x%02x", h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
+    }
+    statusLine(m);
+  }
+}
+
 static bool smsNumberOk(const char* n)        // digits, a leading '+', 3-20 chars
 {
   int len = strlen(n);
@@ -722,6 +771,7 @@ void telemetrySmsSetting(const char* cmd, char* out, int cap)
     nvs_set_str(nvs, "SMS_ALLOW", list); nvs_commit(nvs);
     smsLoad();
     snprintf(out, cap, "CMD SMS_ALLOW OK n=%d", n);
+    telemetrySmsCfgReport(SMSCFG_ALLOW);
   } else if (!strncmp(cmd, "SMS_PIN=", 8)) {
     const char* p = cmd + 8;
     int len = strlen(p);
@@ -731,6 +781,7 @@ void telemetrySmsSetting(const char* cmd, char* out, int cap)
     nvs_set_str(nvs, "SMS_PIN", p); nvs_commit(nvs);
     smsLoad();
     snprintf(out, cap, len ? "CMD SMS_PIN OK" : "CMD SMS_PIN OFF");   // never echoed
+    telemetrySmsCfgReport(SMSCFG_PIN);
   } else if (!strncmp(cmd, "SMS=", 4)) {
     const char* c = strchr(cmd + 4, ',');
     char num[24];
@@ -832,6 +883,9 @@ static void smsHandle(const char* from, const char* text)
   } else if (!strncasecmp(c, "OTA", 3)) {
     otaRequest();
     snprintf(reply, sizeof(reply), "%s OTA check ok", devid);
+  } else if (!strncasecmp(c, "WIFI", 4)) {      // PG205: a phone hotspot away from the known places
+    wifiRequest(true);
+    snprintf(reply, sizeof(reply), "%s WIFI search 30 min", devid);
   } else if (!strncasecmp(c, "SMS ", 4)) {
     char num[24];
     const char* sp = strchr(c + 4, ' ');
@@ -846,7 +900,7 @@ static void smsHandle(const char* from, const char* text)
       snprintf(reply, sizeof(reply), "%s SMS to %s sent, answers to the server 15 min", devid, num);
     }
   } else {
-    snprintf(reply, sizeof(reply), "%s ? STAV | CELL RESTART | RESTART | OTA | SMS <cislo> <text>", devid);
+    snprintf(reply, sizeof(reply), "%s ? STAV | CELL RESTART | RESTART | OTA | WIFI | SMS <cislo> <text>", devid);
   }
   smsStatusLine("SMS ANS", from, reply);
   if (bySms) smsSendLogged(from, reply);
@@ -1029,6 +1083,10 @@ static void cellTask(void*)
 //    report boot on the same access point: the report has 60 s for its delivery (STANDBY_REPORT_SEND_S), the 2 logins
 //    take ~1 min - so the mark lives in RTC memory over the deep sleep;
 //  - without the modem online the WiFi is used anyway (nothing better).
+//  PG204 (13.11.2026): with the modem online the new try is not a move of the data any more but one test packet
+//  through WiFi (WifiLink::probe, netlink.cpp - why there): the data stays on the modem until the server answered
+//  over WiFi. The same on a new join while the modem is online (arriving at a depot on the modem): WiFi takes the
+//  data only after the answer. No answer = marked for the next 30 min, "ERR NET wifi-nointernet" as before.
 //  a3: the modem data is PPP (lwIP), the route + DNS follow lwIP's default netif - netTask makes PPP the default on the
 //  switch (CellLink::makeDefault) and keeps it so while it uses the modem with WiFi still joined (see netTask).
 #define WIFI_BAD_MS     (30UL * 60UL * 1000UL)
@@ -1038,6 +1096,7 @@ RTC_DATA_ATTR static bool s_wifiBadSet;
 static volatile bool s_wifiBad;               // the mark holds for the access point joined now
 static uint32_t s_wifiBadAt;
 static uint8_t s_wifiLoginFails;
+static bool s_wifiProbe;                      // PG204: a new join with the modem online - ask WiFi at once
 
 static bool bssidNow(uint8_t out[6])
 {
@@ -1058,14 +1117,32 @@ static void wifiBadTick()
     s_wifiLoginFails = 0;
     bool same = s_wifiBadSet && !memcmp(b, s_wifiBadBssid, 6);
     if (same && standbyParkedBoot()) { s_wifiBad = true; s_wifiBadAt = millis(); }
+    else if (s_cellUp && s_cell.up()) { s_wifiBad = true; s_wifiBadSet = false; s_wifiProbe = true; }   // PG204
     else { s_wifiBad = false; s_wifiBadSet = false; }
   }
   if (!up) s_wifiBad = false;                 // the mark (RTC) stays for the same access point
   wasUp = up;
-  if (s_wifiBad && !standbyParkedBoot() && millis() - s_wifiBadAt >= WIFI_BAD_MS) {
-    s_wifiBad = false;                        // one new try on WiFi (2 failed logins mark it again)
-    s_wifiBadSet = false;
+  if (s_wifiBad && !standbyParkedBoot() && (s_wifiProbe || millis() - s_wifiBadAt >= WIFI_BAD_MS)) {
+    s_wifiProbe = false;
     s_wifiLoginFails = 0;
+    bool ok = true;                           // without the modem: WiFi is used anyway (2 failed logins mark it again)
+    if (s_cellUp && s_cell.up()) {            // PG204: the data stays on the modem while WiFi is asked
+      char pkt[160];
+      static char ans[RECV_BUF_SIZE];
+      int n = s_client.eventPacket(EVENT_PING, pkt, sizeof(pkt));
+      int got = WifiLink::probe(SERVER_HOST, SERVER_PORT, pkt, n, ans, sizeof(ans) - 1);
+      ok = got > 0;
+      if (ok) s_client.inboundData(ans, got);   // the answer may carry a waiting command
+    }
+    if (ok) {
+      s_wifiBad = false;
+      s_wifiBadSet = false;
+    } else if (up) {
+      memcpy(s_wifiBadBssid, b, 6);
+      s_wifiBadSet = true;
+      s_wifiBadAt = millis();
+      errReport("NET", "wifi-nointernet");
+    }
   }
 }
 

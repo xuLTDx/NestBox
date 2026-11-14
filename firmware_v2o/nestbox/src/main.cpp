@@ -27,6 +27,7 @@
 void sdPinsLine(const char* when);            // sdwriter.cpp (PG102)
 #include "netlink.h"                           // PG96: WifiLink::saveDns
 #include "standby.h"
+#include "wifiplaces.h"                        // PG205
 
 extern const char FW_BUILD_STR[] = __DATE__ " " __TIME__;
 
@@ -64,6 +65,7 @@ uint32_t bootId() { return s_bootId; }
 void telemetryEarly();
 void telemetryBegin(uint32_t bootId, bool sdOk);
 void telemetryBeforeRestart();
+void telemetrySmsCfgReport(int what);
 void readTick();
 
 // before every deliberate restart: the sniff file ends properly (v1F prepareRestart)
@@ -89,7 +91,6 @@ static bool sdMount()
   return false;
 }
 
-static int s_wifiNet = -1;
 static uint32_t s_wifiTry;
 
 // K12 (NAVRH 8, 27.10.2026, only when AP=1 from FleetNest, default off): no known network for 2 min -> the box's own access point
@@ -120,6 +121,40 @@ static void apOff()
 static volatile int8_t s_wifiReq = -1;         // -1 nothing, 0 off, 1 on
 static bool s_wifiOff;
 bool telemetryCell();                          // telemetry.cpp
+bool telemetryEngineOn();
+bool telemetryPosition(float* lat, float* lng);
+
+// PG205 + PG208 (13.-14.11.2026, wifiplaces.h - why there): which networks may be searched right now.
+// Agreed with Vojtech 13.11.2026:
+//  - inside the radius of a place with a WiFi name: that place's network only;
+//  - away from all of them: nothing;
+//  - no position (garage, just woken) or no place list yet: all, as before - a car under the depot's roof must
+//    still reach WiFi for the OTA, and a box that never got the list must not lose WiFi;
+//  - a phone hotspot has no address: all networks for WIFI_START_MS after every engine start (hotspot on, start the
+//    engine - works where the box has neither data nor SMS) and for WIFI_CMD_MS after WIFI=1 (FleetNest or SMS).
+// A network already joined is kept until it is lost (a hotspot leaving with the car).
+#define WIFI_START_MS (3UL * 60UL * 1000UL)
+#define WIFI_CMD_MS   (30UL * 60UL * 1000UL)
+static uint32_t s_wifiCmdAt, s_wifiStartAt;    // millis() | 1, 0 = not running
+// the networks that may be searched now: 0 none, 1 only the places holding the position, 2 all
+static int wifiSearch(const char** why, float* lat, float* lng)
+{
+  static bool wasEngine;
+  bool eng = telemetryEngineOn();
+  if (eng && !wasEngine) s_wifiStartAt = millis() | 1;
+  wasEngine = eng;
+  if (s_wifiCmdAt && millis() - s_wifiCmdAt >= WIFI_CMD_MS) s_wifiCmdAt = 0;
+  if (s_wifiStartAt && millis() - s_wifiStartAt >= WIFI_START_MS) s_wifiStartAt = 0;
+  if (s_wifiCmdAt) { *why = "cmd"; return 2; }
+  if (s_wifiStartAt) { *why = "start"; return 2; }
+  if (!wifiPlacesCount()) { *why = "nolist"; return 2; }
+  if (!telemetryPosition(lat, lng)) { *why = "nofix"; return 2; }
+  WifiPlace p;
+  for (int i = 0; wifiPlaceGet(i, &p); i++)
+    if (wifiPlaceHolds(p, *lat, *lng)) { *why = "place"; return 1; }
+  *why = "away";
+  return 0;
+}
 bool wifiRequest(bool on)
 {
   if (!on && !telemetryCell()) return false;
@@ -145,6 +180,11 @@ static void wifiTick()
       s_knownAt = millis();
       statusLine("WIFI on (WIFI=1)");
     }
+    if (req == 1) {                            // PG205: and all networks are searched, wherever the box is
+      s_wifiCmdAt = millis() | 1;
+      s_wifiTry = 0;
+      statusLine("WIFI search 30 min (WIFI=1)");
+    }
   }
   if (s_wifiOff) return;
   if (WiFi.status() == WL_CONNECTED) { s_knownAt = millis(); apOff(); return; }
@@ -158,15 +198,55 @@ static void wifiTick()
     snprintf(ln, sizeof(ln), "WIFI AP %s %s %s", ssid, s_apOn ? "on" : "ERR", WiFi.softAPIP().toString().c_str());
     statusLine(ln);
   }
+  // PG205: where no known network can be, nothing is searched
+  static const char* lastWhy = "";
+  static bool idle;
+  const char* why = "";
+  float lat = 0, lng = 0;
+  int nets = wifiSearch(&why, &lat, &lng);
+  if (why != lastWhy) {                        // into the serial / debug log only (it may change often)
+    nbout.printf("[WIFI] search %s (%s)\n", nets ? "on" : "off", why);
+    lastWhy = why;
+    if (nets) s_wifiTry = 0;                   // entering a place: scan now
+  }
+  if (!nets) {
+    if (!idle) { WiFi.disconnect(); idle = true; }   // the station stops retrying the network it lost
+    return;
+  }
+  idle = false;
   if (s_wifiTry && millis() - s_wifiTry < WIFI_RETRY_MS) return;
   s_wifiTry = millis();
-  // the network in range: scan, then join the strongest known one
+  // the network in range: scan, then join the strongest allowed one. PG208: the networks of the list; without a
+  // list the 2 built-in ones.
+  static WifiPlace bestNet;                    // static: 112 bytes with a password, not on the loop task's stack twice
+  static WifiPlace cand;
   int n = WiFi.scanNetworks();
   int best = -1, bestRssi = -1000;
+  int listed = wifiPlacesCount();
   for (int i = 0; i < n; i++) {
-    for (int k = 0; k < 2; k++) {
-      if (WiFi.SSID(i) == WIFI_NETS[k][0] && WiFi.RSSI(i) > bestRssi) { best = k; bestRssi = WiFi.RSSI(i); }
+    if (WiFi.RSSI(i) <= bestRssi) continue;
+    String ssid = WiFi.SSID(i);
+    bool hit = false;
+    if (!listed) {
+      for (int k = 0; k < 2 && !hit; k++) {
+        if (ssid != WIFI_NETS[k][0]) continue;
+        memset(&cand, 0, sizeof(cand));
+        snprintf(cand.ssid, sizeof(cand.ssid), "%s", WIFI_NETS[k][0]);
+        snprintf(cand.pass, sizeof(cand.pass), "%s", WIFI_NETS[k][1]);
+        hit = true;
+      }
+    } else {
+      for (int k = 0; !hit && wifiPlaceGet(k, &cand); k++)
+        hit = ssid == cand.ssid && (nets == 2 || wifiPlaceHolds(cand, lat, lng));
     }
+    if (!hit) continue;
+    // a listed network without a password (FleetNest has only the name yet - true for both places on 14.11.2026):
+    // the built-in password of the same name, so that the list never takes a working network away
+    if (!cand.pass[0]) {
+      for (int k = 0; k < 2; k++)
+        if (!strcmp(cand.ssid, WIFI_NETS[k][0])) snprintf(cand.pass, sizeof(cand.pass), "%s", WIFI_NETS[k][1]);
+    }
+    best = i; bestRssi = WiFi.RSSI(i); bestNet = cand;
   }
   WiFi.scanDelete();
   if (best < 0) {
@@ -174,15 +254,14 @@ static void wifiTick()
     return;
   }
   s_knownAt = millis();
-  s_wifiNet = best;
-  nbout.printf("[WIFI] joining %s (%d dBm)\n", WIFI_NETS[best][0], bestRssi);
-  WiFi.begin(WIFI_NETS[best][0], WIFI_NETS[best][1]);
+  nbout.printf("[WIFI] joining %s (%d dBm)\n", bestNet.ssid, bestRssi);
+  WiFi.begin(bestNet.ssid, bestNet.pass);
   for (uint32_t t = millis(); millis() - t < WIFI_JOIN_MS && WiFi.status() != WL_CONNECTED;) delay(100);
   if (WiFi.status() == WL_CONNECTED) {
     WifiLink::saveDns();                      // PG96: DHCP has just set WiFi's DNS - kept (netlink.cpp)
-    nbout.printf("[WIFI] %s IP %s\n", WIFI_NETS[best][0], WiFi.localIP().toString().c_str());
+    nbout.printf("[WIFI] %s IP %s\n", bestNet.ssid, WiFi.localIP().toString().c_str());
     char ln[64];                              // p58: the box's address on a phone hotspot, seen in FleetNest
-    snprintf(ln, sizeof(ln), "WIFI %s IP %s", WIFI_NETS[best][0], WiFi.localIP().toString().c_str());
+    snprintf(ln, sizeof(ln), "WIFI %s IP %s", bestNet.ssid, WiFi.localIP().toString().c_str());
     statusLine(ln);
     configTime(0, 0, "pool.ntp.org");        // the sniff file's clock line
   } else {
@@ -238,7 +317,9 @@ void setup()
   partBootReport();                           // PG177: "PART OK coredump ..." once after the table change
   crashCoreDumpReport(s_bootId);              // PG198: "COREDUMP <bytes> boot=<n>" while a core dump waits in flash
   dbglogBegin(s_bootId, s_sdOk);              // PG175: debug log to SD (DEBUG=1), the crash log of the boot before
+  wifiPlacesBegin();                         // PG205: the stored place list (NVS)
   otaBegin();                                // pull-OTA (needs the NVS handle opened by telemetryBegin)
+  telemetrySmsCfgReport(3);                  // PG214: the SMS settings after every boot / wake (needs the OTA token)
 #ifdef TEST_OTA_CRASH
   // PG147 bench only: this build crashes 20 s after start, before any server login - the bootloader must boot
   // the previous build and that one must report 'OTA ROLLBACK crash-or-reset' (otaverify.cpp; bench 11.11.2026: OK)

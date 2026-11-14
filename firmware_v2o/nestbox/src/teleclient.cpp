@@ -118,6 +118,24 @@ bool TeleClientUDP::notify(uint8_t event, const char* payload)
   return false;
 }
 
+// PG204: an event packet as notify() builds it, not sent - for the WiFi test beside the modem (WifiLink::probe)
+int TeleClientUDP::eventPacket(uint8_t event, char* out, int cap)
+{
+  char buf[48];
+  char cache[160];
+  CStorageRAM netbuf;
+  netbuf.init(cache, sizeof(cache));
+  netbuf.header(devid);
+  netbuf.dispatch(buf, sprintf(buf, "EV=%X", (unsigned)event));
+  netbuf.dispatch(buf, sprintf(buf, "TS=%lu", (unsigned long)millis()));
+  netbuf.dispatch(buf, sprintf(buf, "ID=%s", devid));
+  netbuf.tailer();
+  int n = netbuf.length();
+  if (n <= 0 || n > cap) return 0;
+  memcpy(out, netbuf.buffer(), n);
+  return n;
+}
+
 bool TeleClientUDP::connect(bool quick)
 {
   if (!link || !link->up()) return false;
@@ -312,14 +330,21 @@ void TeleClientUDP::inbound()
   if (!link) return;
   int len = link->receive(m_rx, sizeof(m_rx) - 1, 10);
   if (len <= 0) return;
-  m_rx[len] = 0;
-  nbout.printf("[UDP] %s\n", m_rx);
+  inboundData(m_rx, len);
+}
+
+// one received packet; data[len] must be writable. Also for the answer to the PG204 WiFi test packet (netTask):
+// the server may put a waiting command into any answer, it must not be thrown away.
+void TeleClientUDP::inboundData(char* data, int len)
+{
+  data[len] = 0;
+  nbout.printf("[UDP] %s\n", data);
   rxBytes += len;
   UdpRx rx;
   rx.self = this;
   rx.want = 0;
   int bad = 0;
-  int n = udpSplit(m_rx, len, udpOnMessage, &rx, &bad);
+  int n = udpSplit(data, len, udpOnMessage, &rx, &bad);
   if (bad) logNetEvent("NET INBOUND_CHECKSUM_MISMATCH");
   if (n) lastSyncTime = millis();
 }
