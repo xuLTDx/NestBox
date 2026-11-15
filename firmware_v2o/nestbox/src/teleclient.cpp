@@ -295,8 +295,11 @@ void TeleClientUDP::onMessage(char* msg, UdpRx* rx)
       uint32_t base = cmdp[8] == 'D' ? 1000000UL : cmdp[8] == 'C' ? 2000000UL : cmdp[8] == 'K' ? 3000000UL : 0;
       uint32_t f = base + (uint32_t)strtoul(cmdp + 8 + (base ? 1 : 0), &e, 10);
       uint32_t from = (e && *e == ',') ? (uint32_t)strtoul(e + 1, nullptr, 10) : 0;
-      char m[48];
-      snprintf(m, sizeof(m), "CMD LOG=%u %s", (unsigned)f, otaLogRequest(f, from) ? "start" : "running");
+      // PG256 (15.11.2026, Vojtech "1 2 ano"): the command comes back whole. Why: FleetNest marks a command done only
+      // when the line repeats its text (commands.py on_status_lines) - "LOG=1000057,2761942" got "CMD LOG=1000057
+      // start", stayed open and was sent again every 60 s (9x, command 550), each time a new upload of the rest.
+      char m[64];
+      snprintf(m, sizeof(m), "CMD %.40s %s", cmdp + 4, otaLogRequest(f, from) ? "start" : "running");
       statusLine(m);
     }
     if (cmdp && !strncmp(cmdp + 4, "RESEND=", 7)) {

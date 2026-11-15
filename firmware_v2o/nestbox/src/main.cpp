@@ -227,6 +227,22 @@ static WifiPlace s_wsNet;                      // the network being joined (with
 #define WIFI_SCAN_MAX_MS 10000UL
 static void wifiScanDone(int n);
 static void wifiJoinEnd(bool ok);
+static bool s_joinSeen;                        // PG255: this connection was reported (IP line, OK WIFI join)
+
+// PG255: a network was joined - by wifiJoinEnd() or by the driver itself (wifiTick)
+static void wifiJoined(const char* ssid)
+{
+  s_joinSeen = true;
+  WifiLink::saveDns();                        // PG96: DHCP has just set WiFi's DNS - kept (netlink.cpp)
+  nbout.printf("[WIFI] %s IP %s\n", ssid, WiFi.localIP().toString().c_str());
+  char ln[64];                                // p58: the box's address on a phone hotspot, seen in FleetNest
+  snprintf(ln, sizeof(ln), "WIFI %.32s IP %s", ssid, WiFi.localIP().toString().c_str());
+  statusLine(ln);
+  configTime(0, 0, "pool.ntp.org");          // the sniff file's clock line
+  errOk("WIFI", "join");
+  WifiFail* f = wifiFail(ssid, false);        // PG241
+  if (f) memset(f, 0, sizeof(*f));
+}
 
 static void wifiTick()
 {
@@ -267,7 +283,13 @@ static void wifiTick()
     return;
   }
   bool alt = false;                            // PG239: looking for another network while joined to a marked one
+  if (WiFi.status() != WL_CONNECTED) s_joinSeen = false;
   if (WiFi.status() == WL_CONNECTED) {
+    // PG255 (15.11.2026, Vojtech "pg255 ano"): a join the WiFi driver made by itself (setAutoReconnect) is handled
+    // like ours. Why: bench U9K2M3J0 boot 57, 12:04:19 - MAC unblocked, the driver rejoined NTLIRIS while our 5 min
+    // skip (PG241) still ran; no "WIFI <net> IP" line, no "OK WIFI join", the fail count stayed and at 12:11:01
+    // "ERR WIFI join x2" reached FleetNest with the box on the network.
+    if (!s_joinSeen) wifiJoined(WiFi.SSID().c_str());
     s_knownAt = millis();
     apOff();
     if (!telemetryWifiMarked() || millis() - s_altTry < WIFI_ALT_MS) return;
@@ -372,15 +394,7 @@ static void wifiJoinEnd(bool ok)
   WifiPlace& bestNet = s_wsNet;
   s_ws = WS_IDLE;
   if (ok) {
-    WifiLink::saveDns();                      // PG96: DHCP has just set WiFi's DNS - kept (netlink.cpp)
-    nbout.printf("[WIFI] %s IP %s\n", bestNet.ssid, WiFi.localIP().toString().c_str());
-    char ln[64];                              // p58: the box's address on a phone hotspot, seen in FleetNest
-    snprintf(ln, sizeof(ln), "WIFI %s IP %s", bestNet.ssid, WiFi.localIP().toString().c_str());
-    statusLine(ln);
-    configTime(0, 0, "pool.ntp.org");        // the sniff file's clock line
-    errOk("WIFI", "join");
-    WifiFail* f = wifiFail(bestNet.ssid, false);   // PG241
-    if (f) memset(f, 0, sizeof(*f));
+    wifiJoined(bestNet.ssid);
   } else {
     int r = s_wifiReason;                     // PG219
     nbout.printf("[WIFI] join timeout reason=%d\n", r);
