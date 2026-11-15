@@ -391,7 +391,19 @@ void standbyTick()
   // box falls asleep with ~25 unconfirmed records - on the bench the modem delivers everything before the sleep
   // and txqSleepSave() had nothing to save ("TXQ sleep n=0", boots 41 and 43)
   if (s_testS) g_txqTestHold = millis() - s_testAt > 3000;
+#ifdef TEST_FULLQ
+  // bench build only (15.11.2026, Vojtech "1 mozes" + "Ok"): the sleep save of a FULL 1 MB queue - never measured,
+  // the estimate was <= 26 s. Nothing is sent until the queue is >= 95 % used (max 3 h), then the test sleep. The
+  // progress goes to the debug log only: status lines are records and wait in the held queue too.
+  if (s_testS) {
+    static uint32_t lastTen = 0xFF;
+    uint32_t p = txqUsedPercent();
+    if (p / 10 != lastTen) { lastTen = p / 10; nbout.printf("[TEST] FULLQ %u%% after %lus\n", (unsigned)p, (unsigned long)((millis() - s_testAt) / 1000)); }
+    if (p >= 95 || millis() - s_testAt > 3UL * 3600UL * 1000UL) standbyTestNow(s_testS, s_testUlp);
+  }
+#else
   if (s_testS && millis() - s_testAt > 28000) standbyTestNow(s_testS, s_testUlp);
+#endif
 #else
   if (s_testS && millis() - s_testAt > 2000) standbyTestNow(s_testS, s_testUlp);   // the HTTP answer went out first
 #endif
