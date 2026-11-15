@@ -464,6 +464,15 @@ static void makeRecord(int event = 0, time_t when = 0)
   if (s_cellOn && s_cell.gnssPushed(&g) == 1) { fixSet(g); ttffCheck(); }   // PG-p19: memory only, no AT
   GnssFix fx = fixGet();         // the NMEA fix above, or the AT reading of cellTask
   bool fresh = fx.valid && millis() - fx.at < 5000;
+  // PG258 (15.11.2026, Vojtech "pg258 áno"): one GNSS reading goes into ONE regular record only. Why: J0 15.11.
+  // around both OTAs (14:17:21 boot 59, 17:03:05 + 17:03:28 boot 61 UTC) the modem paused NMEA (cause NEOVERENÉ)
+  // and 5 records in a row carried the same old fix with its old time (still "fresh" < 5 s) - 5 records with one
+  // time and a car "standing" at the last position (tunnel entry, any NMEA gap). Now a reading already used gives a
+  // record with the clock's time and no position at once (the same as before after 5 s). Event records only borrow
+  // the position (their time is the event's), so they do not use the reading up.
+  static uint32_t usedAt;
+  if (fresh && !event && fx.at == usedAt) fresh = false;
+  if (fresh && !event) usedAt = fx.at;
   if (fresh && event) {          // an event record carries the event's time (above), the position only
     r.f(PID_GPS_LATITUDE, fx.lat, "%f");
     r.f(PID_GPS_LONGITUDE, fx.lng, "%f");
