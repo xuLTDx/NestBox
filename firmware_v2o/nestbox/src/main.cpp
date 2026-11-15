@@ -350,6 +350,11 @@ static void wifiScanDone(int n)
       hit = ssid == cand.ssid && (nets == 2 || wifiPlaceHolds(cand, lat, lng));
     if (!hit) continue;
     bool skip = telemetryWifiSkip(WiFi.BSSID(i)) || wifiSkipped(cand.ssid);   // PG239 / PG241
+    // PG257 (15.11.2026, Vojtech "257 ano"): never "another" network = the access point the box is on. Why: bench
+    // U9K2M3J0 boot 58 13:44:02 - a new join is "no internet" until the PG204 check; the PG239 scan started then
+    // and ended 2 s after the check passed: "WIFI NTLIRIS no internet - trying NTLIRIS", left and rejoined the same
+    // access point, 1.7 s on the modem. Also the scan result is dropped when the mark is gone (below).
+    if (alt && WiFi.status() == WL_CONNECTED && WiFi.BSSID() && !memcmp(WiFi.BSSID(i), WiFi.BSSID(), 6)) skip = true;
     if (sl < (int)sizeof(seen) - 48)
       sl += snprintf(seen + sl, sizeof(seen) - sl, " %s(%d)%s", cand.ssid, (int)WiFi.RSSI(i), skip ? "-skip" : "");
     if (skip || WiFi.RSSI(i) <= bestRssi) continue;
@@ -371,6 +376,7 @@ static void wifiScanDone(int n)
   }
   if (alt) {                                   // PG239
     if (WiFi.status() != WL_CONNECTED) alt = false;   // lost meanwhile: a plain join
+    else if (!telemetryWifiMarked()) return;   // PG257: the internet check passed while the scan ran - stay
     else {
       char ln[57];
       snprintf(ln, sizeof(ln), "WIFI %.16s no internet - trying %.16s", WiFi.SSID().c_str(), bestNet.ssid);
