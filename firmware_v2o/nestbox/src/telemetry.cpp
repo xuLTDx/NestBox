@@ -737,6 +737,8 @@ static char s_smsAllow[64], s_smsPin[12];
 // PG260 (16.11.2026, Vojtech on the 20:41 test SMS "pise sa box cislo, treba SPZ"): the car's name in the SMS
 // to the owner. The box knows only its own id; FleetNest sends SMS_NAME=<plate> (NVS, survives sleep + restart).
 static char s_smsName[17];
+// Vojtech 16.11. "Lepsie vzdy znacka": every SMS of the box starts with the plate (the box id until SMS_NAME is set)
+#define SMS_WHO (s_smsName[0] ? s_smsName : devid)
 static char s_smsReqNum[24], s_smsReqText[120];
 static volatile bool s_smsReq;
 static char s_fwdFrom[24], s_fwdTo[24];       // forward SMS from s_fwdFrom to s_fwdTo until s_fwdUntil
@@ -937,39 +939,39 @@ static void smsHandle(const char* from, const char* text)
     bySms = true;
     char net[40];
     s_cell.netInfo(net, sizeof(net));
-    snprintf(reply, sizeof(reply), "%s fw %s %s rssi=%d data=%s q=%lu gps=%.5f,%.5f %s", devid, FW_BUILD_STR, net,
+    snprintf(reply, sizeof(reply), "%s fw %s %s rssi=%d data=%s q=%lu gps=%.5f,%.5f %s", SMS_WHO, FW_BUILD_STR, net,
              s_cell.rssi(), s_cell.up() ? "up" : "DOWN", (unsigned long)txqPending(), fixGet().lat, fixGet().lng,
              s_engineOn ? "engine" : "off");
   } else if (!strncasecmp(c, "CELL RESTART", 12)) {
     strcpy(s_cellRestartWhy, "SMS");
     s_cellRestartReq = true;
-    snprintf(reply, sizeof(reply), "%s CELL RESTART ok", devid);
+    snprintf(reply, sizeof(reply), "%s CELL RESTART ok", SMS_WHO);
   } else if (!strncasecmp(c, "RESTART", 7)) {   // PG155: the whole box (CELL RESTART = the modem only)
     s_smsRestartAt = millis() + SMS_RESTART_DELAY_MS;
     if (!s_smsRestartAt) s_smsRestartAt = 1;
     statusLine("SMS RESTART in 10 s");
-    snprintf(reply, sizeof(reply), "%s RESTART in 10 s", devid);
+    snprintf(reply, sizeof(reply), "%s RESTART in 10 s", SMS_WHO);
   } else if (!strncasecmp(c, "OTA", 3)) {
     otaRequest();
-    snprintf(reply, sizeof(reply), "%s OTA check ok", devid);
+    snprintf(reply, sizeof(reply), "%s OTA check ok", SMS_WHO);
   } else if (!strncasecmp(c, "WIFI", 4)) {      // PG205: a phone hotspot away from the known places
     wifiRequest(true);
-    snprintf(reply, sizeof(reply), "%s WIFI search 30 min", devid);
+    snprintf(reply, sizeof(reply), "%s WIFI search 30 min", SMS_WHO);
   } else if (!strncasecmp(c, "SMS ", 4)) {
     char num[24];
     const char* sp = strchr(c + 4, ' ');
     snprintf(num, sizeof(num), "%.*s", sp ? (int)(sp - c - 4) : 0, c + 4);
     if (!sp || !smsNumberOk(num) || !sp[1]) {
-      snprintf(reply, sizeof(reply), "%s SMS ERR: <PIN> SMS <cislo> <text>", devid);
+      snprintf(reply, sizeof(reply), "%s SMS ERR: <PIN> SMS <cislo> <text>", SMS_WHO);
     } else {
       smsSendLogged(num, sp + 1);
       snprintf(s_fwdFrom, sizeof(s_fwdFrom), "%s", num);
       snprintf(s_fwdTo, sizeof(s_fwdTo), "%s", from);
       s_fwdUntil = millis() + SMS_FWD_MS;
-      snprintf(reply, sizeof(reply), "%s SMS to %s sent, answers to the server 15 min", devid, num);
+      snprintf(reply, sizeof(reply), "%s SMS to %s sent, answers to the server 15 min", SMS_WHO, num);
     }
   } else {
-    snprintf(reply, sizeof(reply), "%s ? STAV | CELL RESTART | RESTART | OTA | WIFI | SMS <cislo> <text>", devid);
+    snprintf(reply, sizeof(reply), "%s ? STAV | CELL RESTART | RESTART | OTA | WIFI | SMS <cislo> <text>", SMS_WHO);
   }
   smsStatusLine("SMS ANS", from, reply);
   if (bySms) smsSendLogged(from, reply);
@@ -990,7 +992,7 @@ static void smsTick()
   // PG260: low battery at the parked report -> the owner (first SMS_ALLOW number); standby waits for this
   static uint32_t battTry;
   char bsms[160];
-  if (standbyBattPending(bsms, sizeof(bsms), s_smsName[0] ? s_smsName : devid) && millis() - battTry >= 5000) {
+  if (standbyBattPending(bsms, sizeof(bsms), SMS_WHO) && millis() - battTry >= 5000) {
     battTry = millis();
     if (!s_smsAllow[0]) standbyBattSmsDone();      // no owner number: the status line only
     else {
@@ -1020,7 +1022,7 @@ static void smsTick()
       lastAlert = millis();
       char owner[24], m[160];
       snprintf(owner, sizeof(owner), "%.*s", (int)strcspn(s_smsAllow, ","), s_smsAllow);
-      snprintf(m, sizeof(m), "%s BEZ DAT %lu min: %s rssi=%d data=%s q=%lu gps=%.5f,%.5f fw %s", devid,
+      snprintf(m, sizeof(m), "%s BEZ DAT %lu min: %s rssi=%d data=%s q=%lu gps=%.5f,%.5f fw %s", SMS_WHO,
                (unsigned long)((millis() - ref) / 60000), net, s_cell.rssi(), s_cell.up() ? "up" : "DOWN",
                (unsigned long)txqPending(), fixGet().lat, fixGet().lng, FW_BUILD_STR);
       statusLine("SMS ALERT no data 30 min");
