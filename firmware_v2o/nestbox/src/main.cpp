@@ -10,6 +10,7 @@
 // never restarted during the tests and the OTA over the modem (that runs in the ota task).
 #define WDT_LOOP_MS (180UL * 1000UL)
 #include "errreport.h"
+#include "clocktrust.h"                // PG259
 #include <Arduino.h>
 #include <WiFi.h>
 #include <SD_MMC.h>
@@ -421,6 +422,7 @@ static void wifiJoinEnd(bool ok)
 void setup()
 {
   telemetryEarly();                           // first: the delivery queue's PSRAM reserve (txqueue.h)
+  clockTrustBegin();                          // PG259: after a deep-sleep wake the clock waits for login / GNSS / NTP
   if (g_lastStep.magic == LASTSTEP_MAGIC && esp_reset_reason() != ESP_RST_POWERON) {
     memcpy(s_prevStep, g_lastStep.text, sizeof(s_prevStep));
     s_prevStep[sizeof(s_prevStep) - 1] = 0;

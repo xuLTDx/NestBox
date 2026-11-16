@@ -34,6 +34,7 @@
 #include "otaverify.h"
 #include "standby.h"
 #include "laststep.h"
+#include "clocktrust.h"                // PG259
 
 const char* bootResetInfo(char* buf, int cap);   // main.cpp
 #include "nbread.h"
@@ -452,7 +453,7 @@ static void makeRecord(int event = 0, time_t when = 0)
   r.begin(ts);
   if (event) {
     r.u32(PID_ENGINE_EVENT, event);
-    if (when > 1735689600) {
+    if (clockTrusted() && when > 1735689600) {   // PG259: not with the fast clock after a sleep
       r.u32(PID_ENGINE_EVENT_TIME, (uint32_t)when);
       struct tm u;
       gmtime_r(&when, &u);
@@ -482,7 +483,8 @@ static void makeRecord(int event = 0, time_t when = 0)
     t.tm_mday = fx.date / 10000; t.tm_mon = (fx.date / 100) % 100 - 1; t.tm_year = fx.date % 100 + 100;
     t.tm_hour = fx.time / 1000000; t.tm_min = (fx.time / 10000) % 100; t.tm_sec = (fx.time / 100) % 100;
     time_t gnow = mktime(&t), now0 = time(nullptr);
-    if (gnow > 1735689600 && (now0 > gnow + 2 || now0 < gnow - 2)) { struct timeval tv = {gnow, 0}; settimeofday(&tv, nullptr); }
+    (void)now0;
+    clockSetFrom(gnow, "gnss");   // PG259: sets when off > 2 s, the clock is trusted from now
     r.u32(0x10, fx.time);
     r.u32(0x11, fx.date);
     r.f(PID_GPS_LATITUDE, fx.lat, "%f");
@@ -494,7 +496,7 @@ static void makeRecord(int event = 0, time_t when = 0)
     if (fx.hdop > 0) r.u32(PID_GPS_HDOP, (uint32_t)(fx.hdop + 0.5f));
   }
   time_t now = time(nullptr);
-  if (!fresh && !event && now > 1735689600) {   // no fix: date and time from the clock as v1F addTimeOf()
+  if (!fresh && !event && clockTrusted()) {   // no fix: date and time from the clock as v1F addTimeOf() (PG259: trusted)
     struct tm u;
     gmtime_r(&now, &u);
     r.u32(0x10, (uint32_t)u.tm_hour * 1000000 + u.tm_min * 10000 + u.tm_sec * 100);
@@ -558,6 +560,8 @@ static void makeRecord(int event = 0, time_t when = 0)
   uint8_t ap[64];                  // APN trial outcome (nbapn.h), once
   int an = nbApnTakeStatus(ap, sizeof(ap));
   if (an) { r.wire.log(PID_APN_STATUS, ap, an); s_log.log(PID_APN_STATUS, ap, an); }
+  char cl[57];                     // PG259: the clock drift corrected after a sleep, once per wake
+  if (clockTakeLine(cl, sizeof(cl))) statusLine(cl);
   uint8_t ota[64];                 // one pending OTA step line per record (v1F PID 0x399)
   int on = otaTakeStatus(ota, sizeof(ota));
   if (on) { r.wire.log(0x399, ota, on); s_log.log(0x399, ota, on); }

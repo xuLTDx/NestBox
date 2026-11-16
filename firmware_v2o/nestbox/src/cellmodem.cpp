@@ -5,6 +5,7 @@
 #include "netlog.h"                  // PG101: nbout = Serial + /api/serial
 #include "max7317.h"
 #include "hw.h"
+#include "clocktrust.h"                // PG259
 #include <sys/time.h>
 #include <time.h>
 #include <WiFi.h>
@@ -966,11 +967,7 @@ void CellLink::nmeaLine(const char* line)
       t.tm_mday = c.date / 10000; t.tm_mon = (c.date / 100) % 100 - 1; t.tm_year = c.date % 100 + 100;
       t.tm_hour = c.time / 1000000; t.tm_min = (c.time / 10000) % 100; t.tm_sec = (c.time / 100) % 100;
       time_t g = mktime(&t);                       // TZ is UTC (configTime(0, 0, ...) / default)
-      time_t now = time(nullptr);
-      if (g > 1735689600 && (now < 1735689600 || labs((long)(now - g)) > 2)) {
-        struct timeval tv = {g, 0};
-        settimeofday(&tv, nullptr);
-      }
+      clockSetFrom(g, "gnss");                     // PG259: sets when off > 2 s, the clock is trusted from now
       m_timeSetAt = millis();
     }
   } else if (!strcmp(type, "GNS") && nt >= 10) {

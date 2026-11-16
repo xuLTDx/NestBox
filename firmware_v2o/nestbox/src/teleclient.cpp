@@ -13,6 +13,7 @@
 #include "standby.h"
 #include "cardecode.h"
 #include "ota.h"
+#include "clocktrust.h"                // PG259
 #include <sys/time.h>
 
 void telemetrySetVehicle(const char* p);   // telemetry.cpp
@@ -100,10 +101,7 @@ bool TeleClientUDP::notify(uint8_t event, const char* payload)
     char* data = rx.reply;
     if (event == EVENT_LOGIN) {
       char* p = strstr(data, "TM=");            // the server's clock
-      if (p) {
-        struct timeval tv = {(time_t)atol(p + 3), 0};
-        settimeofday(&tv, NULL);
-      }
+      if (p) clockSetFrom((time_t)atol(p + 3), "login");   // PG259: also marks the clock trusted
       p = strstr(data, "SN=");
       if (p) {
         char* q = strchr(p, ',');

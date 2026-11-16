@@ -2,6 +2,7 @@
 // (firmware_v5/telelogger) - only the SD include differs (nb_sd.h).
 #include <Arduino.h>
 #include "nb_sd.h"     // v2O: SD = SD_MMC
+#include "clocktrust.h"     // PG259
 #include <nvs.h>
 #include <esp_heap_caps.h>
 #include <freertos/FreeRTOS.h>
@@ -614,7 +615,7 @@ static void expire()
 // evening before). They wait in the queue until the clock is valid, then get
 // their time computed from their ms timestamp: t = now - (millis() - ts).
 #define TXQ_UNTIMED_HOLD_MS 600000  // after 10 min without a clock: sent as they are
-static bool clockValid() { return time(nullptr) > 1735689600; }  // 2025-01-01
+static bool clockValid() { return clockTrusted(); }  // > 2025, PG259: and set since a deep-sleep wake
 static bool recHasTime(const char* rec, int len)
 {
   for (int i = 0; i + 4 <= len; i++) {
