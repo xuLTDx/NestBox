@@ -19,6 +19,7 @@ bool WifiLink::up() { return WiFi.status() == WL_CONNECTED; }
 // and put back whenever WiFi is used.
 #include <esp_netif.h>
 #include <lwip/dns.h>
+#include <lwip/tcpip.h>
 static uint32_t s_wifiDns[2];
 
 void WifiLink::saveDns()
@@ -49,7 +50,9 @@ void WifiLink::restoreDns()
     ip_addr_t a;
     IP_ADDR4(&a, 0, 0, 0, 0);
     ip_2_ip4(&a)->addr = s_wifiDns[i];
+    LOCK_TCPIP_CORE();                        // PG263 (cellmodem.cpp CellLink::makeDefault)
     dns_setserver(i, &a);
+    UNLOCK_TCPIP_CORE();
   }
 }
 

@@ -18,7 +18,16 @@
 // 11.11.2026 U9K2M3J0 on a steady 13.5 V supply: single read12V() values 12.33-12.58 V (6x in 2 h); at 18:07:40
 // one of them (12.35 V) with CAN quiet sent the box to sleep (boot 11 -> 12, wake=VOLTAGE 8 s later).
 #define STANDBY_LOW_MS         10000UL
-#define STANDBY_REPORT_S       10800      // parked report every 3 h
+#ifndef STANDBY_REPORT_S
+#define STANDBY_REPORT_S       10800      // parked report every 3 h (a bench build may set it shorter, never a car box)
+#endif
+// PG260 (16.11.2026, Vojtech "260 áno"): low car battery warning. Why: a parked car with the box draws ~0.5 Ah/day
+// from the box alone (19 mA sleep, MERANIA.md) plus the car's own quiescent draw - the Toyota (70 Ah) could be
+// flat after weeks and nobody would know. The resting voltage is measured at the 3 h report wake, before the
+// modem starts. The levels are the usual lead-acid resting values (~50 % / ~25 %), NEOVERENE for these batteries.
+#define BATT_LOW_V             12.2f      // under: "ERR BATT low" + SMS to the owner
+#define BATT_CRIT_V            11.9f      // under: "ERR BATT critical" + SMS, then no more 3 h reports (sleep only)
+#define BATT_REPEAT_S          86400      // the same level again at most once per 24 h
 #define STANDBY_REPORT_GPS_S   150        // max wait for a fix in the parked report
 #define STANDBY_REPORT_SEND_S  60         // max wait for the delivery after the record
 #define STANDBY_OTA_WAIT_MS    180000UL   // a running OTA download delays the sleep at most this
@@ -36,3 +45,6 @@ void standbyTest(uint32_t seconds, bool ulp);   // /api/control SLEEP_TEST=<s> (
 int standbyUlpRead(char* buf, int cap);         // /api/control ULP_READ
 void standbyRemote(const char* cmd);            // p59: CMD=ULP_READ | STANDBY? | SLEEP_ULP=<s> from FleetNest
 int standbyStatus(char* buf, int cap);
+// PG260: an alert of this report wake waiting for its SMS: 1 low / 2 critical (0 = none); the text into sms
+uint8_t standbyBattPending(char* sms, int cap, const char* devid);
+void standbyBattSmsDone();                      // the SMS was tried (or no owner number): the box may sleep

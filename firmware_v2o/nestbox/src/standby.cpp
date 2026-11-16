@@ -76,6 +76,16 @@ RTC_DATA_ATTR static time_t s_canWinAt;
 RTC_DATA_ATTR static uint8_t s_canWakeOff;
 RTC_DATA_ATTR static uint8_t s_canArmed;      // ext1 was on for this sleep (for the STANDBY / test lines)
 
+// PG260 (standby.h): the worst battery level since the last engine run / charger, the last alert, parked since
+RTC_DATA_ATTR static uint8_t s_battLvl;       // 0 ok, 1 low, 2 critical
+RTC_DATA_ATTR static time_t s_battAlertAt;
+RTC_DATA_ATTR static time_t s_parkSince;      // first sleep after a run (0 = not known: power-on)
+static volatile uint8_t s_battPend;           // this wake: an alert to send (status line + SMS)
+static volatile bool s_battSmsWait;           // the SMS not tried yet - the report waits (max BATT_SMS_WAIT_MS)
+static bool s_battLine;
+static float s_battV;
+#define BATT_SMS_WAIT_MS 120000UL             // registration for the SMS; the modem starts with the report
+
 static char s_wake[48] = "-";
 static char s_ulpStats[56];                   // p62: the last sleep's ULP counters ("" = no ULP sleep)
 static bool s_parked;
@@ -217,7 +227,10 @@ static void sleepNow(bool ulp, uint32_t forceSeconds = 0)
   if (!s_canWakeOff && gpio_get_level((gpio_num_t)CAN_WAKE_GPIO) == 1 &&
       esp_sleep_enable_ext1_wakeup(1ULL << CAN_WAKE_GPIO, ESP_EXT1_WAKEUP_ALL_LOW) == ESP_OK)
     s_canArmed = 1;
-  esp_sleep_enable_timer_wakeup((uint64_t)secs * 1000000ULL);
+  // PG260: critical battery - no 3 h report any more, only the ULP (engine / charger >= 12.8 V) or CAN wakes it.
+  // Not without a running ULP (PG50 10 min checks stay) and not for a forced test sleep.
+  if (s_battLvl >= 2 && s_ulpArmed && !forceSeconds) secs = 0;
+  if (secs) esp_sleep_enable_timer_wakeup((uint64_t)secs * 1000000ULL);
   lastStep("deep sleep %lus", (unsigned long)secs);
   nbout.printf("[STANDBY] deep sleep %lu s%s%s\n", (unsigned long)secs, ulp ? " + ULP 12 V" : "",
                 s_canArmed ? " + CAN1" : "");
@@ -296,6 +309,12 @@ static void standbyEarlyWake()
     }
     s_parked = true;
     s_canWakeOff = 0; s_canWakes = 0;  // PG-p23: the 3 h report gives the CAN wake a new chance
+    // PG260: the resting voltage now - nothing started yet (modem, WiFi off)
+    s_battV = read12V();
+    uint8_t lvl = s_battV < BATT_CRIT_V ? 2 : s_battV < BATT_LOW_V ? 1 : 0;
+    time_t now = time(nullptr);
+    if (lvl && (lvl > s_battLvl || now - s_battAlertAt >= BATT_REPEAT_S)) { s_battPend = lvl; s_battSmsWait = true; }
+    if (lvl > s_battLvl) s_battLvl = lvl;
     snprintf(s_wake, sizeof(s_wake), "REPORT");
   }
 }
@@ -312,6 +331,7 @@ static void goStandby()
   char m[160];                        // PG-p23: wake text (<= 47) + canwake
   float v = read12V();
   s_nextReport = time(nullptr) + STANDBY_REPORT_S;
+  if (!s_parkSince) s_parkSince = time(nullptr);   // PG260: "parked since" for the battery alert
   snprintf(m, sizeof(m), "STANDBY v=%.2f low=%.2f-%.2f/%lus quiet=%lus wake=%s next_report=%ds canwake=%s", v,
            s_lowMin, s_lowMax, (unsigned long)((millis() - s_lowSince) / 1000),
            (unsigned long)(canQuietMs() / 1000), s_wake, STANDBY_REPORT_S,
@@ -416,6 +436,23 @@ void standbyTick()
     s_parked = false;                 // driven off during the parked report: a normal boot now
     s_canWakeOff = 0; s_canWakes = 0; // PG-p23: an engine run = the CAN wakes were real
   }
+  if (v >= 7.0f && (telemetryEngineOn() || v >= ENGINE_OFF_VOLTAGE)) {   // PG260: engine / charger = battery OK again
+    s_parkSince = 0;
+    if (s_battLvl) {
+      char m[40];
+      snprintf(m, sizeof(m), "OK BATT %s v=%.2f", s_battLvl >= 2 ? "critical" : "low", v);
+      statusLine(m);
+      s_battLvl = 0; s_battAlertAt = 0; s_battPend = 0; s_battSmsWait = false;
+    }
+  }
+  if (s_battPend && !s_battLine) {    // PG260: the line once per alert wake (loop context, the queue is up)
+    s_battLine = true;
+    s_battAlertAt = time(nullptr);
+    char m[57];
+    snprintf(m, sizeof(m), "ERR BATT %s %.2fV parked %luh", s_battPend >= 2 ? "critical" : "low", s_battV,
+             s_parkSince ? (unsigned long)((time(nullptr) - s_parkSince) / 3600) : 0UL);
+    statusLine(m);
+  }
   if (v < 7.0f || telemetryEngineOn() || v >= ENGINE_OFF_VOLTAGE) {   // bench / engine / charging
     s_lowOn = false;                  // PG148: one reading at or above = the 10 s start again
     return;
@@ -448,6 +485,7 @@ void standbyTick()
   // PG147: no deep sleep while a new build waits for its server login - the wake would boot the previous build
   // (bootloader: reset in PENDING_VERIFY = ABORTED); otaverify.cpp goes back by itself after 15 min
   if (otaVerifyPending()) return;
+  if (s_battSmsWait && s_parked && millis() - s_reportAt < BATT_SMS_WAIT_MS) return;   // PG260: the SMS first
   if (otaBusy()) {
     if (!s_otaWaitSince) s_otaWaitSince = millis();
     if (millis() - s_otaWaitSince < STANDBY_OTA_WAIT_MS) return;
@@ -510,3 +548,23 @@ int standbyStatus(char* buf, int cap)
                   s_nextReport ? (long)(s_nextReport - time(nullptr)) : -1L, (unsigned)s_falseWakes,
                   (unsigned)s_thrRaise, (unsigned)(RTC_SLOW_MEM[ULP_LAST] & 0xFFFF));
 }
+
+// PG260 (standby.h)
+uint8_t standbyBattPending(char* sms, int cap, const char* devid)
+{
+  if (!s_battSmsWait || !s_battPend) return 0;
+  unsigned long h = s_parkSince ? (unsigned long)((time(nullptr) - s_parkSince) / 3600) : 0;
+  char park[24];
+  if (!s_parkSince) snprintf(park, sizeof(park), "?");
+  else if (h >= 48) snprintf(park, sizeof(park), "%lu dni", h / 24);
+  else snprintf(park, sizeof(park), "%lu h", h);
+  // GSM 7-bit only (no diacritics): one SMS, any phone
+  if (s_battPend >= 2)
+    snprintf(sms, cap, "NestBox %s: KRITICKA bateria %.1f V, auto stoji %s. Box prestava hlasit polohu. Nastartujte.",
+             devid, s_battV, park);
+  else
+    snprintf(sms, cap, "NestBox %s: slaba bateria %.1f V, auto stoji %s. Nastartujte.", devid, s_battV, park);
+  return s_battPend;
+}
+
+void standbyBattSmsDone() { s_battSmsWait = false; }

@@ -12,6 +12,7 @@
 #include <WiFiUdp.h>
 #include <lwip/netif.h>
 #include <lwip/dns.h>
+#include <lwip/tcpip.h>                 // PG263: LOCK_TCPIP_CORE
 #include <lwip/ip_addr.h>
 #include <netif/ppp/pppapi.h>
 #include <netif/ppp/pppos.h>
@@ -371,6 +372,10 @@ bool CellLink::netRecover()
   return ok;
 }
 
+// PG263 (16.11.2026): dns_setserver() only with the lwIP core lock. Why: J0 boot 85 (build 21:45:37, 21:47)
+// panic in task "net": dns_setserver -> dns_clear_cache -> pending SNTP lookup callback -> sntp_retry ->
+// sys_untimeout -> "Required to lock TCPIP core" assert (CONFIG_LWIP_CHECK_THREAD_SAFETY 1 in Arduino 3.3);
+// the modem dropped (CELL REG LOST) while SNTP waited for DNS.
 // netTask chose the modem: lwIP's default route and DNS back to PPP (WiFi's DHCP may have changed both)
 void CellLink::makeDefault()
 {
@@ -382,7 +387,9 @@ void CellLink::makeDefault()
     ip_addr_t a;
     IP_ADDR4(&a, 0, 0, 0, 0);
     ip_2_ip4(&a)->addr = m_dns[i];
+    LOCK_TCPIP_CORE();
     dns_setserver(i, &a);
+    UNLOCK_TCPIP_CORE();
   }
 }
 
@@ -489,7 +496,11 @@ bool CellLink::smsTake(char* from, int fcap, char* text, int tcap)
   from[0] = text[0] = 0;
   lock();
   bool got = false;
-  if (at("AT+CMGF=1\r") && at("AT+CSCS=\"IRA\"\r") && at("AT+CMGL=\"ALL\"\r", 5000)) {
+  // PG262 (16.11.2026): the modem had AT+CNMI=1,2 - a received SMS goes out once as a +CMT URC and is NOT stored
+  // (J0: +CPMS "SM",0,30; no box ever logged "SMS IN" since 1.11, Vojtech's STAV 0:43 / 12:01 / 20:30 unanswered).
+  // <mt>=1 stores it on the SIM (SIM7600 AT manual V1.10 ch. 7.9), CMGL below takes it. Not saved by the modem
+  // over a power-off, so sent before every read like CMGF.
+  if (at("AT+CMGF=1\r") && at("AT+CSCS=\"IRA\"\r") && at("AT+CNMI=2,1,0,0,0\r") && at("AT+CMGL=\"ALL\"\r", 5000)) {
     // +CMGL: <index>,"<stat>","<from>",,"<time>"\r\n<text>\r\n ... OK
     char* p = strstr(m_buf, "+CMGL: ");
     if (p) {

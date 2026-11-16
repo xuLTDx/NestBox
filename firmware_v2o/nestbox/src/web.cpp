@@ -187,7 +187,8 @@ static int handlerControl(UrlHandlerParam* param)
     n = probeStatus(buf, bufsize);
   } else if (!strcmp(cmd, "OTA?")) {
     n = otaStatus(buf, bufsize);
-  } else if (!strncmp(cmd, "SMS_ALLOW=", 10) || !strncmp(cmd, "SMS_PIN=", 8) || !strncmp(cmd, "SMS=", 4)) {   // PG-p8
+  } else if (!strncmp(cmd, "SMS_ALLOW=", 10) || !strncmp(cmd, "SMS_PIN=", 8) || !strncmp(cmd, "SMS=", 4) ||
+             !strncmp(cmd, "SMS_NAME=", 9)) {     // PG-p8, PG260
     telemetrySmsSetting(cmd, buf, bufsize);
     n = strlen(buf);
   } else if (!strcmp(cmd, "OTA_CHECK")) {           // pull-OTA check now (as the server's OTA_READY)

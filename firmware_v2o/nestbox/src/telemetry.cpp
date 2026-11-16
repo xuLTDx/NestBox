@@ -734,6 +734,9 @@ static bool netCheck()
 #define SMS_FWD_MS  900000UL
 #define SMS_OUTAGE_MS 1800000UL
 static char s_smsAllow[64], s_smsPin[12];
+// PG260 (16.11.2026, Vojtech on the 20:41 test SMS "pise sa box cislo, treba SPZ"): the car's name in the SMS
+// to the owner. The box knows only its own id; FleetNest sends SMS_NAME=<plate> (NVS, survives sleep + restart).
+static char s_smsName[17];
 static char s_smsReqNum[24], s_smsReqText[120];
 static volatile bool s_smsReq;
 static char s_fwdFrom[24], s_fwdTo[24];       // forward SMS from s_fwdFrom to s_fwdTo until s_fwdUntil
@@ -745,6 +748,8 @@ static void smsLoad()
   if (nvs_get_str(nvs, "SMS_ALLOW", s_smsAllow, &l) != ESP_OK) s_smsAllow[0] = 0;
   l = sizeof(s_smsPin);
   if (nvs_get_str(nvs, "SMS_PIN", s_smsPin, &l) != ESP_OK) s_smsPin[0] = 0;
+  l = sizeof(s_smsName);
+  if (nvs_get_str(nvs, "SMS_NAME", s_smsName, &l) != ESP_OK) s_smsName[0] = 0;
 }
 
 // PG214 (14.11.2026, FleetNest FN168, Vojtech "214 ano"): the box reports its own SMS settings. Why: FleetNest knew
@@ -827,6 +832,15 @@ void telemetrySmsSetting(const char* cmd, char* out, int cap)
     smsLoad();
     snprintf(out, cap, "CMD SMS_ALLOW OK n=%d", n);
     telemetrySmsCfgReport(SMSCFG_ALLOW);
+  } else if (!strncmp(cmd, "SMS_NAME=", 9)) {     // PG260: <plate>, A-Z a-z 0-9 space -, up to 16; empty = the box id
+    const char* p = cmd + 9;
+    int len = strlen(p);
+    bool ok = len <= 16;                        // 16: the SMS text must stay one 160-char GSM message
+    for (int i = 0; ok && i < len; i++) ok = isalnum((unsigned char)p[i]) || p[i] == ' ' || p[i] == '-';
+    if (!ok) { snprintf(out, cap, "CMD SMS_NAME ERR A-Z 0-9 - max 16"); return; }
+    nvs_set_str(nvs, "SMS_NAME", p); nvs_commit(nvs);
+    smsLoad();
+    snprintf(out, cap, "CMD SMS_NAME OK %s", len ? s_smsName : "-");
   } else if (!strncmp(cmd, "SMS_PIN=", 8)) {
     const char* p = cmd + 8;
     int len = strlen(p);
@@ -972,6 +986,23 @@ static void smsTick()
     s_fwdUntil = millis() + SMS_FWD_MS;
     s_smsReq = false;
     lastPoll = 0;
+  }
+  // PG260: low battery at the parked report -> the owner (first SMS_ALLOW number); standby waits for this
+  static uint32_t battTry;
+  char bsms[160];
+  if (standbyBattPending(bsms, sizeof(bsms), s_smsName[0] ? s_smsName : devid) && millis() - battTry >= 5000) {
+    battTry = millis();
+    if (!s_smsAllow[0]) standbyBattSmsDone();      // no owner number: the status line only
+    else {
+      char net[40];
+      s_cell.netInfo(net, sizeof(net));
+      if (strstr(net, " home") || strstr(net, " roam")) {   // SMS needs the registration
+        char owner[24];
+        snprintf(owner, sizeof(owner), "%.*s", (int)strcspn(s_smsAllow, ","), s_smsAllow);
+        smsSendLogged(owner, bsms);
+        standbyBattSmsDone();
+      }
+    }
   }
   if (lastPoll && millis() - lastPoll < SMS_POLL_MS) return;
   lastPoll = millis();
