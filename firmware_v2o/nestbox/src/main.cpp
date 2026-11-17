@@ -327,7 +327,20 @@ static void wifiTick()
   s_wifiTry = millis();
   // PG248: the scan runs in the WiFi driver; wifiScanDone() picks the network when it is finished
   s_wsNets = nets; s_wsLat = lat; s_wsLng = lng; s_wsAlt = alt;
-  if (WiFi.scanNetworks(true) == WIFI_SCAN_FAILED) return;
+  // PG264 (17.11.2026, Vojtech "264 ano"): a refused scan stops the driver's own reconnect, the next try (30 s)
+  // scans. Why: bench U9K2M3J0 boot 91, 11:39:42 - the hotspot Pocof7ultra was switched off, the last scan saw 0
+  // networks, then 30+ min no scan and no join (D91.LOG), also after SMS WIFI at 11:51, NTLIRIS in range. The
+  // Arduino STA reconnects to the lost network by itself (STA.cpp DoReconnect) and the driver refuses a scan while
+  // it is connecting (esp_wifi.h: ESP_ERR_WIFI_STATE "wifi still connecting"). disconnect() = reason ASSOC_LEAVE,
+  // which Arduino never reconnects. Not when alt: then the box is joined and the data may still use that network.
+  static bool refusedSaid;
+  if (WiFi.scanNetworks(true) == WIFI_SCAN_FAILED) {
+    nbout.printf("[WIFI] scan refused (status %d)%s\n", (int)WiFi.status(), alt ? "" : " - driver reconnect stopped");
+    if (!refusedSaid) { statusLine(alt ? "WIFI scan refused" : "WIFI scan refused - reconnect stopped"); refusedSaid = true; }
+    if (!alt) WiFi.disconnect();
+    return;
+  }
+  refusedSaid = false;
   s_ws = WS_SCAN;
   s_wsAt = millis();
 }
