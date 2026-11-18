@@ -29,6 +29,7 @@ void sdPinsLine(const char* when);            // sdwriter.cpp (PG102)
 #include "netlink.h"                           // PG96: WifiLink::saveDns
 #include "standby.h"
 #include "wifiplaces.h"                        // PG205
+#include "install.h"                           // PG233
 
 extern const char FW_BUILD_STR[] = __DATE__ " " __TIME__;
 
@@ -99,9 +100,27 @@ bool webApAllowed();
 static uint32_t s_knownAt;
 static bool s_apOn;
 
+// PG274 (18.11.2026): mbedTLS (HTTPS: OTA, WiFi list, LOG upload) takes its memory from PSRAM, internal RAM only if
+// PSRAM is out. Why: the Arduino 3.3.11 libraries are built with CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC=y (sdkconfig), so
+// each HTTPS connection borrowed ~45 KB of the ~80 KB free internal RAM (2Z 18.11. 18:12:31: 82 -> 37 KB, largest
+// block 2 KB) and failed once something else held 5-15 KB more (first web request -4.3 KB for good, the own WiFi in
+// install mode: 2Z 'META_HTTP-1' at <= 74 KB, J0 and 2Z fine at >= 78 KB) - while ~2.9 MB of PSRAM lay unused.
+// OVMS3 on the same board does the same by config (support/sdkconfig.default.hw31: CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y).
+// Done at run time (mbedtls_platform_set_calloc_free, MBEDTLS_PLATFORM_MEMORY is on in esp_config.h:130) - changing the
+// sdkconfig would need the libraries rebuilt. heap_caps_free() frees from either heap, so blocks taken before the
+// switch are freed correctly.
+#include <mbedtls/platform.h>
+static void* tlsCalloc(size_t n, size_t size)
+{
+  void* p = heap_caps_calloc(n, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  return p ? p : heap_caps_calloc(n, size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+}
+static void tlsMemToPsram() { mbedtls_platform_set_calloc_free(tlsCalloc, heap_caps_free); }
+
 static void apOff()
 {
   if (!s_apOn) return;
+  dbgMem("AP off before");                    // PG273 (after: the "WIFI AP off" line)
   WiFi.softAPdisconnect(true);
   WiFi.mode(WIFI_STA);
   s_apOn = false;
@@ -197,6 +216,7 @@ static int wifiSearch(const char** why, float* lat, float* lng)
   if (s_wifiCmdAt && (int32_t)(millis() - s_wifiCmdAt) >= (int32_t)WIFI_CMD_MS) s_wifiCmdAt = 0;
   if (s_wifiStartAt && (int32_t)(millis() - s_wifiStartAt) >= (int32_t)WIFI_START_MS) s_wifiStartAt = 0;
   if (!wifiPlacesCount()) { *why = "nolist"; return 0; }   // PG230: no list = no network known, also after WIFI=1
+  if (instActive()) { *why = "install"; return 2; }        // PG233: being set up - every known network, anywhere
   if (s_wifiCmdAt) { *why = "cmd"; return 2; }
   if (s_wifiStartAt) { *why = "start"; return 2; }
   if (!telemetryPosition(lat, lng) && !telemetryLastPosition(lat, lng)) { *why = "neverfix"; return 2; }   // PG232
@@ -229,6 +249,91 @@ static WifiPlace s_wsNet;                      // the network being joined (with
 static void wifiScanDone(int n);
 static void wifiJoinEnd(bool ok);
 static bool s_joinSeen;                        // PG255: this connection was reported (IP line, OK WIFI join)
+
+// PG233 (install.h): what the mini page shows - the networks of the last scan and how the join of the chosen one went
+#define PAGE_NETS 20
+struct PageNet { char ssid[33]; int8_t rssi; bool open; };
+static PageNet s_pageNets[PAGE_NETS];
+static int s_pageN = -1;                       // -1 = no scan yet
+static uint32_t s_pageAt;
+static volatile bool s_pageScanReq;
+static bool s_wsPage;                          // the running scan was asked for by the page
+static bool s_preferUser;                      // the network was just chosen: join it even when another is stronger
+static char s_pjSsid[33];                      // the last join: network, state 0 none / 1 joining / 2 ok / 3 failed, reason
+static uint8_t s_pjState, s_pjReason;
+
+static void pageCopy(int n)
+{
+  int k = 0;
+  for (int i = 0; i < n && k < PAGE_NETS; i++) {
+    String s = WiFi.SSID(i);
+    if (!s.length()) continue;                 // a hidden network cannot be chosen by name
+    bool dup = false;
+    for (int j = 0; j < k && !dup; j++) dup = s == s_pageNets[j].ssid;
+    if (dup) continue;                         // one line per name (the strongest comes first from the driver)
+    snprintf(s_pageNets[k].ssid, sizeof(s_pageNets[k].ssid), "%s", s.c_str());
+    s_pageNets[k].rssi = (int8_t)WiFi.RSSI(i);
+    s_pageNets[k].open = WiFi.encryptionType(i) == WIFI_AUTH_OPEN;
+    k++;
+  }
+  s_pageN = k;
+  s_pageAt = millis();
+}
+
+static int jsonStr(char* out, int cap, const char* s)   // a JSON string, quotes and control characters escaped
+{
+  int n = 0;
+  if (cap < 3) return 0;
+  out[n++] = '"';
+  for (; *s && n < cap - 3; s++) {
+    unsigned char c = (unsigned char)*s;
+    if (c == '"' || c == '\\') { out[n++] = '\\'; out[n++] = c; }
+    else if (c < 32) out[n++] = ' ';
+    else out[n++] = c;
+  }
+  out[n++] = '"';
+  out[n] = 0;
+  return n;
+}
+
+void wifiPageScan() { s_pageScanReq = true; }  // web.cpp (the loop task, as wifiTick)
+
+// web.cpp: a network chosen on the page - stored and joined next (a joined other network is left for it)
+bool wifiPageSave(const char* ssid, const char* pass)
+{
+  if (!wifiUserSet(ssid, pass)) return false;
+  s_preferUser = true;
+  s_wifiTry = 0;
+  s_pjState = 0;
+  char ln[64];
+  snprintf(ln, sizeof(ln), "WIFI %.32s chosen on the page", ssid);   // the name only, never the password
+  statusLine(ln);
+  if (WiFi.status() == WL_CONNECTED && WiFi.SSID() != ssid) WiFi.disconnect();
+  return true;
+}
+
+int wifiPageJson(char* out, int cap)
+{
+  int n = snprintf(out, cap, "\"scan_s\":%ld,\"nets\":[", s_pageN < 0 ? -1L : (long)((millis() - s_pageAt) / 1000));
+  for (int i = 0; i < s_pageN && n < cap - 80; i++) {
+    n += snprintf(out + n, cap - n, "%s{\"s\":", i ? "," : "");
+    n += jsonStr(out + n, cap - n, s_pageNets[i].ssid);
+    n += snprintf(out + n, cap - n, ",\"r\":%d,\"o\":%d}", s_pageNets[i].rssi, s_pageNets[i].open ? 1 : 0);
+  }
+  static const char* const st[] = {"", "joining", "ok", "failed"};
+  n += snprintf(out + n, cap - n, "],\"join\":{\"ssid\":");
+  n += jsonStr(out + n, cap - n, s_pjSsid);
+  n += snprintf(out + n, cap - n, ",\"st\":\"%s\",\"r\":%u},\"wifi\":{\"ssid\":", st[s_pjState & 3], (unsigned)s_pjReason);
+  bool up = WiFi.status() == WL_CONNECTED;
+  n += jsonStr(out + n, cap - n, up ? WiFi.SSID().c_str() : "");
+  n += snprintf(out + n, cap - n, ",\"ip\":\"%s\",\"rssi\":%d},\"chosen\":",
+                up ? WiFi.localIP().toString().c_str() : "", up ? (int)WiFi.RSSI() : 0);
+  WifiPlace u;
+  bool has = wifiUserGet(&u);
+  memset(u.pass, 0, sizeof(u.pass));
+  n += jsonStr(out + n, cap - n, has ? u.ssid : "");
+  return n;
+}
 
 // PG255: a network was joined - by wifiJoinEnd() or by the driver itself (wifiTick)
 static void wifiJoined(const char* ssid)
@@ -270,11 +375,26 @@ static void wifiTick()
     }
   }
   if (s_wifiOff) { if (s_ws == WS_SCAN) WiFi.scanDelete(); s_ws = WS_IDLE; return; }
+  // PG233: install mode - the own WiFi from the start and kept while joined (install.h)
+  if (instActive() && !s_apOn) {
+    char ssid[24];
+    snprintf(ssid, sizeof(ssid), "NestBox-%s", devid);
+    dbgMem("AP on before");                   // PG273 (after: the "WIFI AP ... on" line)
+    WiFi.mode(WIFI_AP_STA);
+    s_apOn = WiFi.softAP(ssid, instPassword());
+    char ln[64];
+    snprintf(ln, sizeof(ln), "WIFI AP %s %s %s (install)", ssid, s_apOn ? "on" : "ERR", WiFi.softAPIP().toString().c_str());
+    statusLine(ln);
+  }
   if (s_ws == WS_SCAN) {                       // PG248
     int n = WiFi.scanComplete();
     if (n == WIFI_SCAN_RUNNING && millis() - s_wsAt < WIFI_SCAN_MAX_MS) return;
     s_ws = WS_IDLE;
-    if (n < 0) { WiFi.scanDelete(); return; }
+    bool page = s_wsPage;
+    s_wsPage = false;
+    if (n < 0) { WiFi.scanDelete(); if (page) s_pageN = 0; return; }
+    pageCopy(n);                               // PG233: every scan refreshes the page's list
+    if (page && !s_wsNets) { WiFi.scanDelete(); return; }   // asked for by the page only: nothing to join
     wifiScanDone(n);
     return;
   }
@@ -283,24 +403,45 @@ static void wifiTick()
     else if (millis() - s_wsAt >= WIFI_JOIN_MS) wifiJoinEnd(false);
     return;
   }
+  if (s_pageScanReq) {                         // PG233: the page's "search" - in the driver, as every scan (PG248)
+    s_pageScanReq = false;
+    if (WiFi.scanNetworks(true) != WIFI_SCAN_FAILED) {
+      s_ws = WS_SCAN; s_wsAt = millis(); s_wsPage = true; s_wsNets = 0;
+      return;
+    }
+    nbout.printf("[WIFI] page scan refused (status %d)\n", (int)WiFi.status());
+  }
   bool alt = false;                            // PG239: looking for another network while joined to a marked one
   if (WiFi.status() != WL_CONNECTED) s_joinSeen = false;
   if (WiFi.status() == WL_CONNECTED) {
+    static uint32_t learnAt;                   // PG233: the chosen network gets its place (200 m) on the first fix
+    if (millis() - learnAt > 10000) {
+      learnAt = millis();
+      WifiPlace u;
+      float la, ln;
+      if (wifiUserGet(&u) && WiFi.SSID() == u.ssid && telemetryPosition(&la, &ln) && wifiUserLearn(la, ln)) {
+        char m[72];
+        snprintf(m, sizeof(m), "WIFI %.32s place kept (%.0f m)", u.ssid, WIFI_USER_RADIUS_M);
+        statusLine(m);
+      }
+      memset(u.pass, 0, sizeof(u.pass));
+    }
     // PG255 (15.11.2026, Vojtech "pg255 ano"): a join the WiFi driver made by itself (setAutoReconnect) is handled
     // like ours. Why: bench U9K2M3J0 boot 57, 12:04:19 - MAC unblocked, the driver rejoined NTLIRIS while our 5 min
     // skip (PG241) still ran; no "WIFI <net> IP" line, no "OK WIFI join", the fail count stayed and at 12:11:01
     // "ERR WIFI join x2" reached FleetNest with the box on the network.
     if (!s_joinSeen) wifiJoined(WiFi.SSID().c_str());
     s_knownAt = millis();
-    apOff();
+    if (!instActive()) apOff();                // PG233: in install mode the page stays reachable
     if (!telemetryWifiMarked() || millis() - s_altTry < WIFI_ALT_MS) return;
     s_altTry = millis();
     alt = true;
   }
-  if (s_apOn && !webApAllowed()) apOff();
+  if (s_apOn && !webApAllowed() && !instActive()) apOff();
   if (!s_apOn && webApAllowed() && millis() - s_knownAt > WIFI_AP_AFTER_MS && strlen(webPassword()) >= 8) {
     char ssid[24];
     snprintf(ssid, sizeof(ssid), "NestBox-%s", devid);
+    dbgMem("AP on before");                   // PG273
     WiFi.mode(WIFI_AP_STA);
     s_apOn = WiFi.softAP(ssid, webPassword());
     char ln[56];
@@ -353,10 +494,16 @@ static void wifiScanDone(int n)
   bool alt = s_wsAlt;
   static WifiPlace cand;
   WifiPlace& bestNet = s_wsNet;
-  int best = -1, bestRssi = -1000;
+  int best = -1, bestRssi = -1000, bestScore = -1000;
   char seen[160];                              // PG241: the listed networks in range, into the debug log
   int sl = 0;
   seen[0] = 0;
+  char user[33] = "";                          // PG233: the network just chosen on the page wins over a stronger one
+  if (s_preferUser) {
+    WifiPlace u;
+    if (wifiUserGet(&u)) snprintf(user, sizeof(user), "%s", u.ssid);
+    memset(u.pass, 0, sizeof(u.pass));
+  }
   for (int i = 0; i < n; i++) {
     String ssid = WiFi.SSID(i);
     bool hit = false;
@@ -371,8 +518,9 @@ static void wifiScanDone(int n)
     if (alt && WiFi.status() == WL_CONNECTED && WiFi.BSSID() && !memcmp(WiFi.BSSID(i), WiFi.BSSID(), 6)) skip = true;
     if (sl < (int)sizeof(seen) - 48)
       sl += snprintf(seen + sl, sizeof(seen) - sl, " %s(%d)%s", cand.ssid, (int)WiFi.RSSI(i), skip ? "-skip" : "");
-    if (skip || WiFi.RSSI(i) <= bestRssi) continue;
-    best = i; bestRssi = WiFi.RSSI(i); bestNet = cand;
+    int score = WiFi.RSSI(i) + (user[0] && ssid == user ? 200 : 0);   // PG233: the chosen network first
+    if (skip || score <= bestScore) continue;
+    best = i; bestRssi = WiFi.RSSI(i); bestScore = score; bestNet = cand;
   }
   if (sl) nbout.printf("[WIFI] listed in range:%s\n", seen);
   {                                            // PG243 (14.11.2026, Vojtech "pg243 ano"): every network the scan saw -
@@ -403,6 +551,8 @@ static void wifiScanDone(int n)
   static bool reasonHooked;
   if (!reasonHooked) { WiFi.onEvent(wifiReasonEvent, ARDUINO_EVENT_WIFI_STA_DISCONNECTED); reasonHooked = true; }
   s_wifiReason = 0;
+  snprintf(s_pjSsid, sizeof(s_pjSsid), "%s", bestNet.ssid);   // PG233: the page shows the join
+  s_pjState = 1; s_pjReason = 0;
   WiFi.begin(bestNet.ssid, bestNet.pass);
   s_ws = WS_JOIN;                              // PG248: wifiJoinTick() watches it
   s_wsAt = millis();
@@ -413,6 +563,13 @@ static void wifiJoinEnd(bool ok)
 {
   WifiPlace& bestNet = s_wsNet;
   s_ws = WS_IDLE;
+  s_pjState = ok ? 2 : 3;                      // PG233
+  s_pjReason = s_wifiReason;
+  if (s_preferUser) {                          // the chosen network tried once; then the strongest as always
+    WifiPlace u;
+    if (wifiUserGet(&u) && !strcmp(u.ssid, bestNet.ssid)) s_preferUser = false;
+    memset(u.pass, 0, sizeof(u.pass));
+  }
   if (ok) {
     wifiJoined(bestNet.ssid);
   } else {
@@ -444,6 +601,7 @@ void setup()
   standbyEarly();                             // a deep-sleep wake: confirmed, or asleep again here
   Serial.begin(115200);
   netlogBegin();                              // PG99: ESP-IDF log copied into RAM for /api/serial
+  tlsMemToPsram();                            // PG274: mbedTLS buffers from PSRAM (after netlogBegin: fixed PSRAM order)
   delay(100);
   nbout.printf("\nNestBox_v2O %s reset=%d step=%s\n", FW_BUILD_STR, (int)esp_reset_reason(), s_prevStep);
   wdtBegin();                                 // PG155: core-1 idle WDT + the task check (wdt.h)
@@ -461,7 +619,7 @@ void setup()
   mx7317Out(MX_CAN1_RS, 1);                   // CAN1 transmitter off from the start
 
   s_sdOk = sdMount();
-  sdPinsLine(s_sdOk ? "after-mount" : "mount-failed");   // PG102 (sdwriter.cpp)
+  if (!s_sdOk) sdPinsLine("mount-failed");    // PG102 (sdwriter.cpp); an error: always. "after-mount": PG270 below
   if (s_sdOk) {
     nbout.printf("[SD] %llu MB, %llu MB used\n", SD_MMC.totalBytes() >> 20, SD_MMC.usedBytes() >> 20);
     sdwStart();
@@ -481,7 +639,9 @@ void setup()
   partBootReport();                           // PG177: "PART OK coredump ..." once after the table change
   crashCoreDumpReport(s_bootId);              // PG198: "COREDUMP <bytes> boot=<n>" while a core dump waits in flash
   dbglogBegin(s_bootId, s_sdOk);              // PG175: debug log to SD (DEBUG=1), the crash log of the boot before
+  if (s_sdOk && dbglogOn()) sdPinsLine("after-mount");   // PG270: a detail line, only with DEBUG=1 (dbglog.h)
   wifiPlacesBegin();                         // PG205: the stored place list (NVS)
+  instBegin();                               // PG233: install mode (install.h)
   otaBegin();                                // pull-OTA (needs the NVS handle opened by telemetryBegin)
   telemetrySmsCfgReport(3);                  // PG214: the SMS settings after every boot / wake (needs the OTA token)
 #ifdef TEST_OTA_CRASH
@@ -515,6 +675,7 @@ void loop()
   int ev = sniffTick();
   if (ev == SNIFF_EV_STARTED) nbout.println("[SNIFF] started");
   wifiTick();
+  instTick();                                 // PG233
   standbyTick();
   errTick();                                  // PG149: error summaries + SD / CAN1 counters to the server
   partTick();                                 // PG177: the one-time partition table change when armed (part.h)

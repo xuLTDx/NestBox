@@ -5,6 +5,7 @@
 #include "nb_sd.h"
 #include "netlog.h"
 #include "wdt.h"
+#include <esp_heap_caps.h>
 
 extern nvs_handle_t nvs;                     // telemetry.cpp
 void sdLock();
@@ -32,8 +33,31 @@ static bool appendFile(const char* path, const char* data, size_t n)
   return ok;
 }
 
+// PG270: detail output only with DEBUG=1 (dbglog.h)
+DbgOut dbgout;
+size_t DbgOut::write(uint8_t c) { return s_on ? nbout.write(c) : 1; }
+size_t DbgOut::write(const uint8_t* b, size_t n) { return s_on ? nbout.write(b, n) : n; }
+void dbgLine(const char* text) { if (s_on) netlogLine(text); }
+void dbgMem(const char* where)
+{
+  if (!s_on) return;
+  nbout.printf("[MEM] %s heap=%u min=%u dma_max=%u\n", where, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+               (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+               (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+}
+
+#define DBG_MEM_MS 60000UL                   // PG270: the [MEM] line period with DEBUG=1
+static void memLine()
+{
+  nbout.printf("[MEM] heap=%u min=%u dma_max=%u psram=%u\n", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+               (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+               (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+               (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+}
+
 static void dbgTask(void*)
 {
+  uint32_t memAt = 0;
   char path[32];
   char* prev = nullptr;
   uint32_t prevLen = 0;
@@ -55,6 +79,8 @@ static void dbgTask(void*)
   snprintf(path, sizeof(path), DBG_DIR "/D%lu.LOG", (unsigned long)s_boot);
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(DBG_EVERY_MS));
+    if (s_on && (!memAt || millis() - memAt >= DBG_MEM_MS)) { memAt = millis(); memLine(); }
+    if (!s_on) memAt = 0;                     // switched on again: the first [MEM] line at once
     if (!s_on || !s_sdOk) { s_pos = netlogHead(); continue; }   // off: start from "now" when switched on
     uint32_t lost = 0;
     int n;

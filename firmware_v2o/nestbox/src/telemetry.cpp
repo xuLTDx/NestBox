@@ -100,6 +100,7 @@ static GnssFix fixGet() { portENTER_CRITICAL(&s_fixMux); GnssFix f = s_fix; port
 static void fixSet(const GnssFix& f) { portENTER_CRITICAL(&s_fixMux); s_fix = f; portEXIT_CRITICAL(&s_fixMux); }
 static volatile int s_csq;                   // dBm from cellTask (0 = unknown)
 static volatile uint32_t s_csqAt;            // millis() of that reading
+static char s_vin[18];                        // PG233: the car's VIN (vinTick), "" = not read yet
 #define CSQ_EVERY_MS 10000UL                 // cellTask reads it this often
 #define CSQ_FRESH_MS 30000UL                 // older = not put into the record
 // p66: GNSS start mode for the boot after a GPS_TEST sleep (one-shot), time to the first fix reported once
@@ -1388,6 +1389,8 @@ void telemetryBegin(uint32_t bootId, bool sdOk)
   size_t vl = sizeof(veh);
   nvs_get_str(nvs, "VEH", veh, &vl);
   carSetProfile(veh);
+  size_t vinl = sizeof(s_vin);                // PG233: the last VIN read, for the login
+  if (nvs_get_str(nvs, "VIN", s_vin, &vinl) != ESP_OK) s_vin[0] = 0;
   uint8_t c = 0;
   nvs_get_u8(nvs, "CELL", &c);
   s_cellOn = c == 1;
@@ -1582,11 +1585,66 @@ static bool scanTick()
   return true;
 }
 
+// PG233 (18.11.2026, Vojtech; FleetNest FN245 takes VIN= from the login event and offers the car with that VIN):
+// the car's VIN, OBD service 09 PID 02 (SAE J1979) to the engine 0x7E0/0x7E8, once per engine start (5 s after it,
+// the bus is awake), CAN1 (OBD 6/14) first, then CAN2 (OBD 3/8). Kept in NVS "VIN": a box moved to another car
+// sends the new one at the next login, a new value goes to FleetNest at once as the status line "VIN <17>".
+// UDS 22 F190 is not tried (Vojtech 18.11.: it answered in one car only - Toyota radio 17.11.). Which cars answer
+// 09 02 and on which bus: NEOVERENE.
+const char* telemetryVin() { return s_vin; }
+static bool vinChar(uint8_t c) { return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z' && c != 'I' && c != 'O' && c != 'Q'); }
+static bool vinTick()
+{
+  static bool wasOn, want;
+  static uint32_t onAt;
+  bool on = s_engineOn;
+  if (on && !wasOn) { want = true; onAt = millis(); }
+  wasOn = on;
+  if (!want || !on || millis() - onAt < 5000) return false;
+  want = false;
+  NbRead r = {};
+  r.txId = 0x7E0; r.rxId = 0x7E8;
+  r.req[0] = 0x09; r.req[1] = 0x02; r.reqLen = 2;
+  static uint8_t resp[NB_READ_MAX];
+  int len = 0, res = NBR_NO_REPLY;
+  uint8_t nrc = 0;
+  for (uint8_t bus = 1; bus <= 2; bus++) {
+    r.bus = bus;
+    lastStep("vin bus %u", bus);
+    res = busExchange(&r, resp, sizeof(resp), &len, &nrc);
+    if (res == NBR_OK || res == NBR_NRC) break;
+  }
+  char line[300];
+  nbReadLine(line, sizeof(line), 999, &r, res, nrc, resp, len);
+  s_log.logEvent(line);
+  nbout.println(line);
+  bool ok = res == NBR_OK && len >= 19 && resp[0] == 0x49 && resp[1] == 0x02;
+  for (int i = 0; ok && i < 17; i++) ok = vinChar(resp[len - 17 + i]);   // the VIN = the last 17 bytes
+  if (!ok) return true;
+  char v[18];
+  memcpy(v, resp + len - 17, 17);
+  v[17] = 0;
+  if (strcmp(v, s_vin)) {
+    strcpy(s_vin, v);
+    nvs_set_str(nvs, "VIN", s_vin);
+    nvs_commit(nvs);
+    char m[32];
+    snprintf(m, sizeof(m), "VIN %s", s_vin);
+    statusLine(m);
+  }
+  return true;
+}
+
+const char* telemetryLinkName() { return s_client.link ? s_client.link->name() : "-"; }   // PG233 (install.cpp)
+const char* telemetryCellState() { return s_cell.status(); }                            // PG233 mini page
+int telemetryCsq() { return s_csq && millis() - s_csqAt < CSQ_FRESH_MS ? s_csq : 0; }
+
 void readTick()
 {
   scanAutoTick();                           // p86 loop: start at engine START, stop at STOP
   if (probeTick()) return;                  // p84: the probe owns the bus while it runs
   if (scanTick()) return;                   // p86
+  if (vinTick()) return;                    // PG233
   NbRead r;
   uint32_t seq;
   if (!nbReadTake(&r, &seq)) { autoReadTick(); return; }

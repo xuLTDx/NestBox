@@ -30,3 +30,13 @@ bool wifiPlacesStore(const String& body, bool* changed, int* total, int* usable)
 int wifiPlacesCount();                         // 0 = no list: no WiFi is searched (PG230, 14.11.2026: no built-in networks)
 bool wifiPlaceGet(int i, WifiPlace* out);
 bool wifiPlaceHolds(const WifiPlace& p, float lat, float lng);   // the position is inside its radius
+
+// PG233 (18.11.2026, install.h): the network chosen on the box's mini page. Kept apart from the server list (NVS
+// WIFI_USER, the list download never overwrites it) and served as the list's last entry by wifiPlacesCount() /
+// wifiPlaceGet(). Saved without an address (radius 0 = searched like a phone hotspot); the first time the box is
+// joined to it with a position, that position + WIFI_USER_RADIUS_M is kept, from then on it is searched only there
+// (Vojtech 18.11.2026: "v okoli, moze byt 200m" - a box in a car must not search everywhere, PG205).
+#define WIFI_USER_RADIUS_M 200.0f
+bool wifiUserSet(const char* ssid, const char* pass);   // false = bad length
+bool wifiUserGet(WifiPlace* out);
+bool wifiUserLearn(float lat, float lng);    // true = the position was taken now

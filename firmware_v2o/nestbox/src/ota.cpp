@@ -9,6 +9,8 @@
 #include <esp_ota_ops.h>
 #include <esp_partition.h>
 #include "otaverify.h"
+#include "dbglog.h"
+#include "netlog.h"
 #include <nvs.h>
 #include <mbedtls/sha256.h>
 #include "nb_sd.h"
@@ -76,7 +78,7 @@ static void otaLog(const char* text)
     char m[120];                              // PG99/PG98: on /api/serial with the internal + DMA memory at that moment
     snprintf(m, sizeof(m), "%s | heap=%u dma_max=%u", text, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
-    netlogLine(m);
+    dbgLine(m);                               // PG270: only with DEBUG=1 (dbglog.h)
   }
   logNetEvent(text);
   nbout.println(text);
@@ -193,7 +195,19 @@ struct WifiConn : OtaConn {
   bool connect(const char* host, uint16_t port) override {
     c.setInsecure();
     c.setTimeout(OTA_TIMEOUT_MS / 1000);
-    return c.connect(host, port);
+    uint32_t t0 = millis();
+    if (c.connect(host, port)) return true;
+    // PG270 (18.11.2026): why the HTTPS connection failed, always (an error line). Why: 2Z 18.11. 'META_HTTP-1'
+    // within 55-300 ms, nothing on the OTA server, nothing in the log - the library's own log_e is compiled out
+    // (CORE_DEBUG_LEVEL=0, platformio.ini). lastError = the mbedTLS / socket code of the last connect.
+    char e[64] = "";
+    int code = c.lastError(e, sizeof(e));
+    char m[160];
+    snprintf(m, sizeof(m), "[TLS] %s:%u failed %lu ms err=%d %s | heap=%u dma_max=%u", host, (unsigned)port,
+             (unsigned long)(millis() - t0), code, e, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+    nbout.println(m);
+    return false;
   }
   void write(const char* s) override { c.print(s); }
   void writeRaw(const uint8_t* d, int n) override { c.write(d, n); }

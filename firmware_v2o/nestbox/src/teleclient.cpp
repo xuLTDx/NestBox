@@ -17,6 +17,8 @@
 #include <sys/time.h>
 
 void telemetrySetVehicle(const char* p);   // telemetry.cpp
+const char* telemetryVin();                // PG233
+#include "install.h"                       // PG233: INST=0
 bool webSetPassword(const char* pw);       // web.cpp (K13)
 void webSetApAllowed(bool on);            // web.cpp (K12 switch)
 bool wifiRequest(bool on);                // main.cpp (PG65)
@@ -65,7 +67,7 @@ bool TeleClientUDP::notify(uint8_t event, const char* payload)
 {
   if (!link) return false;
   char buf[48];
-  char cache[160];
+  char cache[192];                              // PG233: the login with VIN= is ~25 bytes longer
   CStorageRAM netbuf;
   netbuf.init(cache, sizeof(cache));
   netbuf.header(devid);
@@ -154,8 +156,12 @@ bool TeleClientUDP::connect(bool quick)
       continue;
     }
     // LOGIN carries the build (OTA ordering) and the variant (which hardware/firmware line)
-    char fw[80];
-    if (event == EVENT_LOGIN) snprintf(fw, sizeof(fw), "FW=%s,VARIANT=%s", FW_BUILD_STR, FIRMWARE_VARIANT);
+    // PG233: + VIN=<17> once the box has read it (FleetNest FN245 offers the car with that VIN)
+    char fw[112];
+    if (event == EVENT_LOGIN) {
+      int n = snprintf(fw, sizeof(fw), "FW=%s,VARIANT=%s", FW_BUILD_STR, FIRMWARE_VARIANT);
+      if (telemetryVin()[0]) snprintf(fw + n, sizeof(fw) - n, ",VIN=%s", telemetryVin());
+    }
     if (!notify(event, event == EVENT_LOGIN ? fw : 0)) {
       link->close();
       logNetEvent("NET NOTIFY_TIMEOUT");
@@ -198,7 +204,7 @@ bool TeleClientUDP::transmit(const char* packet, unsigned int size)
   if (!link || !link->send(packet, size)) return false;
   txBytes += size;
   txCount++;
-  nbout.printf("[%s] %u bytes sent\n", link->name(), size);
+  dbgout.printf("[%s] %u bytes sent\n", link->name(), size);   // PG270: detail, only with DEBUG=1
   return true;
 }
 
@@ -249,6 +255,12 @@ void TeleClientUDP::onMessage(char* msg, UdpRx* rx)
     }
     if (cmdp && !strncmp(cmdp + 4, "WEB_PW=", 7)) {  // K13: the password is never echoed into records
       statusLine(webSetPassword(cmdp + 11) ? "CMD WEB_PW OK" : "CMD WEB_PW ERR 8-32 a-z A-Z 0-9 . _ -");
+    }
+    // PG233: INST=0 (FleetNest FN252, sent once the box is assigned to a car) ends install mode (install.h). Always
+    // answered OK, also when it ended before - FleetNest waits for the line and sends the command again otherwise.
+    if (cmdp && !strcmp(cmdp + 4, "INST=0")) {
+      instEnd("FleetNest INST=0");
+      statusLine("CMD INST=0 OK");
     }
     if (cmdp && (!strcmp(cmdp + 4, "AP=1") || !strcmp(cmdp + 4, "AP=0"))) {   // K12 switch
       webSetApAllowed(cmdp[7] == '1');
@@ -341,7 +353,7 @@ void TeleClientUDP::inbound()
 void TeleClientUDP::inboundData(char* data, int len)
 {
   data[len] = 0;
-  nbout.printf("[UDP] %s\n", data);
+  dbgout.printf("[UDP] %s\n", data);              // PG270: every answer (ACK) is detail; commands have own lines
   rxBytes += len;
   UdpRx rx;
   rx.self = this;

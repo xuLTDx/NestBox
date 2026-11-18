@@ -25,6 +25,8 @@
 #include "sniff.h"
 #include "sdwriter.h"
 #include "page.h"
+#include "inst_page.h"                     // PG233
+#include "install.h"
 #include "cardecode.h"
 #include "ota.h"
 #include "teleclient.h"
@@ -618,6 +620,61 @@ static int handlerLive(UrlHandlerParam* param)
   return FLAG_DATA_RAW;
 }
 
+// PG233 (install.h): in install mode only these - the password of the box's own WiFi is the same on every box, so
+// the commands, AT, OTA upload and files stay closed until the install ends
+void wifiPageScan();                       // main.cpp
+bool wifiPageSave(const char* ssid, const char* pass);
+int wifiPageJson(char* out, int cap);
+const char* telemetryCellState();          // telemetry.cpp
+int telemetryCsq();
+const char* telemetryLinkName();
+
+static int handlerInstPage(UrlHandlerParam* param)
+{
+  param->pucBuffer = (char*)INST_HTML;
+  param->contentLength = sizeof(INST_HTML) - 1;
+  param->contentType = HTTPFILETYPE_HTML;
+  return FLAG_DATA_RAW;
+}
+
+static int handlerInst(UrlHandlerParam* param)
+{
+  char* buf = param->pucBuffer;
+  int cap = param->bufSize;
+  const char* sub = param->pucRequest;
+  int n;
+  if (!strncmp(sub, "/scan", 5)) {
+    wifiPageScan();
+    n = snprintf(buf, cap, "{\"ok\":1}");
+  } else if (!strncmp(sub, "/wifi", 5)) {
+    mwParseQueryString(param);                  // the POST body (urlencoded); the password is never printed
+    const char* ssid = mwGetVarValue(param->pxVars, "ssid", "");
+    char* pass = mwGetVarValue(param->pxVars, "pass", "");
+    size_t pl = strlen(pass);
+    bool ok = (pl == 0 || (pl >= 8 && pl <= 64)) && wifiPageSave(ssid, pass);
+    memset(pass, 0, pl);
+    n = snprintf(buf, cap, "{\"ok\":%d}", ok ? 1 : 0);
+  } else {
+    sdLock();
+    uint64_t tot = SD_MMC.totalBytes();
+    sdUnlock();
+    n = snprintf(buf, cap, "{\"id\":\"%s\",\"fw\":\"%s\",\"inst\":%d,\"cell\":\"%s\",\"csq\":%d,\"login\":%d,\"link\":\"%s\","
+                 "\"sd_mb\":%llu,", devid, FW_BUILD_STR, instActive() ? 1 : 0, telemetryCellState(), telemetryCsq(),
+                 telemetryLogin() ? 1 : 0, telemetryLinkName(), (unsigned long long)(tot >> 20));
+    n += wifiPageJson(buf + n, cap - n - 2);
+    n += snprintf(buf + n, cap - n, "}");
+  }
+  param->contentLength = n;
+  param->contentType = HTTPFILETYPE_JSON;
+  return FLAG_DATA_RAW;
+}
+
+static UrlHandler instHandlerList[] = {
+  {"", handlerInstPage},
+  {"api/inst", handlerInst},
+  {0}
+};
+
 static UrlHandler urlHandlerList[] = {
   {"", handlerPage},           // empty prefix = only "/" (httpd.c _mwCheckUrlHandlers)
   {"api/info", handlerInfo},
@@ -639,7 +696,7 @@ bool webStart()
   // password could download it. Every page is a handler (urlHandlerList, page.h); "/nowww" is no VFS mount, so a
   // file request (also with "../") finds nothing.
   mwInitParam(&httpParam, 80, "/nowww");
-  httpParam.pxUrlHandler = urlHandlerList;
+  httpParam.pxUrlHandler = instActive() ? instHandlerList : urlHandlerList;   // PG233
   s_webPrefs.begin("web", false);
   String pw = s_webPrefs.getString("pw", "");
   snprintf(s_webPw, sizeof(s_webPw), "%s", pw.c_str());
@@ -651,3 +708,5 @@ bool webStart()
 }
 
 void webProcess(int timeoutMs) { mwHttpLoop(&httpParam, timeoutMs); }
+
+void webInstallEnded() { httpParam.pxUrlHandler = urlHandlerList; }   // PG233: install.cpp instEnd()

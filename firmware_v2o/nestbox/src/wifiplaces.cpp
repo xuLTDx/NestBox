@@ -16,8 +16,11 @@ static bool alloc()
   return s_pl != nullptr;
 }
 
+static void userLoad();                        // PG233, below
+
 void wifiPlacesBegin()
 {
+  userLoad();
   if (!alloc()) return;
   size_t l = WIFI_PLACES_MAX * sizeof(WifiPlace);
   if (nvs_get_blob(nvs, "WIFI_NETS", s_pl, &l) != ESP_OK || l % sizeof(WifiPlace)) { s_n = 0; return; }
@@ -76,13 +79,72 @@ bool wifiPlacesStore(const String& body, bool* changed, int* total, int* usable)
   return !bad;
 }
 
-int wifiPlacesCount() { return s_n; }
+// PG233: the network chosen on the mini page (wifiplaces.h)
+static WifiPlace* s_user;                      // PSRAM, ssid[0] == 0 = none
+static bool userAlloc()
+{
+  if (!s_user) s_user = (WifiPlace*)ps_calloc(1, sizeof(WifiPlace));
+  return s_user != nullptr;
+}
+static void userLoad()
+{
+  if (!userAlloc()) return;
+  size_t l = sizeof(WifiPlace);
+  if (nvs_get_blob(nvs, "WIFI_USER", s_user, &l) != ESP_OK || l != sizeof(WifiPlace)) { memset(s_user, 0, sizeof(WifiPlace)); return; }
+  s_user->ssid[sizeof(s_user->ssid) - 1] = 0;
+  s_user->pass[sizeof(s_user->pass) - 1] = 0;
+}
+static void userSave(const WifiPlace& p)
+{
+  nvs_set_blob(nvs, "WIFI_USER", &p, sizeof(p));
+  nvs_commit(nvs);
+}
+static bool userHas() { return s_user && s_user->ssid[0]; }
+
+bool wifiUserSet(const char* ssid, const char* pass)
+{
+  if (!userAlloc() || !ssid || !*ssid || strlen(ssid) > 32 || strlen(pass) > 64) return false;
+  WifiPlace p = {};
+  strcpy(p.ssid, ssid);
+  strcpy(p.pass, pass);
+  portENTER_CRITICAL(&s_mux);
+  *s_user = p;
+  portEXIT_CRITICAL(&s_mux);
+  userSave(p);
+  memset(p.pass, 0, sizeof(p.pass));
+  return true;
+}
+
+bool wifiUserGet(WifiPlace* out)
+{
+  bool ok = false;
+  portENTER_CRITICAL(&s_mux);
+  if (userHas()) { *out = *s_user; ok = true; }
+  portEXIT_CRITICAL(&s_mux);
+  return ok;
+}
+
+bool wifiUserLearn(float lat, float lng)
+{
+  if (!userHas() || s_user->radiusM > 0 || (!lat && !lng)) return false;
+  WifiPlace p;
+  portENTER_CRITICAL(&s_mux);
+  s_user->lat = lat; s_user->lng = lng; s_user->radiusM = WIFI_USER_RADIUS_M;
+  p = *s_user;
+  portEXIT_CRITICAL(&s_mux);
+  userSave(p);
+  memset(p.pass, 0, sizeof(p.pass));
+  return true;
+}
+
+int wifiPlacesCount() { return s_n + (userHas() ? 1 : 0); }
 
 bool wifiPlaceGet(int i, WifiPlace* out)
 {
   bool ok = false;
   portENTER_CRITICAL(&s_mux);
   if (s_pl && i >= 0 && i < s_n) { *out = s_pl[i]; ok = true; }
+  else if (i == s_n && userHas()) { *out = *s_user; ok = true; }   // PG233: the chosen network last
   portEXIT_CRITICAL(&s_mux);
   return ok;
 }
