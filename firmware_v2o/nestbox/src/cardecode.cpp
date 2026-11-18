@@ -8,6 +8,15 @@ static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 void carSetProfile(const char* p) { snprintf(s_profile, sizeof(s_profile), "%s", p ? p : ""); }
 const char* carProfile() { return s_profile; }
 
+void carFromObd(float rpm, int speedKmh)   // PG277 (cardecode.h)
+{
+  uint32_t now = millis();
+  portENTER_CRITICAL(&s_mux);
+  if (rpm > 0) { s_v.rpm = rpm; s_v.rpmAt = now; s_v.rpmPosAt = now; }
+  if (speedKmh >= 0) { s_v.speedKmh = speedKmh; s_v.speedAt = now; }
+  portEXIT_CRITICAL(&s_mux);
+}
+
 CarValues carValues()
 {
   portENTER_CRITICAL(&s_mux);
@@ -67,6 +76,11 @@ void carDecode(uint32_t id, bool ext, uint8_t dlc, const uint8_t* d)
     portENTER_CRITICAL(&s_mux);
     if (!s_v.c572At || d[0] != s_v.c572b0 || d[4] != s_v.c572b4) { s_v.c572b0 = d[0]; s_v.c572b4 = d[4]; s_v.c572Chg++; }
     s_v.c572At = now;
+    portEXIT_CRITICAL(&s_mux);
+  } else if (id == 0x512 && dlc >= 2) {      // PG280: lock candidate (cardecode.h), raw, every change counted
+    portENTER_CRITICAL(&s_mux);
+    if (!s_v.c512At || d[1] != s_v.c512b1) { s_v.c512b1 = d[1]; s_v.c512Chg++; }
+    s_v.c512At = now;
     portEXIT_CRITICAL(&s_mux);
   } else if (id == 0x4F2 && dlc >= 4) {      // PG57: passenger seated candidate (cardecode.h), raw, every change counted
     portENTER_CRITICAL(&s_mux);

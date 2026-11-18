@@ -51,6 +51,10 @@ struct CarValues {
   // in all 12 reads, 4 seated; NEOVERENE until more drives). c572Chg counts changes of any of the three bytes, the
   // record sends each change once. Why raw: the bits are candidates, FleetNest compares them with READ D997/D998/D99F
   uint8_t c572b0, c572b4, c4f2b3; uint32_t c572At, c4f2At, c572Chg;
+  // PG280 (18.11.2026): 0x512 byte 1 raw - lock candidate (bit 4: Toyota J0 sniff S4 17.11., toyota_sniff/ROZBOR.md:125,
+  // changed only at the lock 17:49:56 and the unlock 17:51:06 - one event each, NEOVERENE). Sent once per change so
+  // every lock / unlock of normal use is compared with the driver's actions without a sniff.
+  uint8_t c512b1; uint32_t c512At, c512Chg;
 };
 
 void carSetProfile(const char* p);    // "K0" or "" (none)
@@ -58,3 +62,6 @@ const char* carProfile();
 CarValues carValues();
 // p81: a positive answer of an automatic read (whole answer from 0x62) - decoded when known
 void carFromRead(uint32_t txId, const uint8_t* resp, int len);
+// PG277: rpm / speed asked over standard OBD (cars without a profile, telemetry.cpp obdTick); rpm < 0 / speed < 0 = not
+// in this answer. rpm 0 does not refresh rpmAt (an engine that stopped must go silent for ENGINE STOP, engineTick).
+void carFromObd(float rpm, int speedKmh);

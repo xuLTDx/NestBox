@@ -66,6 +66,7 @@ const char* bootResetInfo(char* buf, int cap);   // main.cpp
 #define PID_REFUEL_CNT 0x3AA     // PG-p12: K0 0x432 byte 6 bits 2-0 refuel counter
 #define PID_CREW       0x3A4     // p83: bit0 driver belt, bit1 passenger belt, bit2 passenger seated
 #define PID_SPEED_DISP 0x3A5     // p83: speed as on the cluster (BSI D8F9), km/h
+#define PID_LOCK_CAN   0x3AC     // PG280: K0 0x512 byte 1 raw (lock candidate bit 4), in the record after each change
 #define PID_CREW_CAN   0x3AB     // PG55/PG57: K0 0x572 byte 0, byte 4, 0x4F2 byte 3 raw (belt / seat candidates), in the record after each change
 #define PID_ENGINE_EVENT      0x380   // v1F: 1 = START, 2 = STOP
 #define PID_ENGINE_EVENT_TIME 0x381   // v1F: unix time of the event
@@ -538,7 +539,8 @@ static void makeRecord(int event = 0, time_t when = 0)
   }
   // PG47 (8.11.2026, FleetNest FN62): once per read - before, the value was repeated in every record up to 90 s
   // (boot 177: "99 km/h" on the cluster speed for ~37 s while the car braked from 100 to 49)
-  static uint32_t crewSent, dispSent, c572Sent;
+  static uint32_t crewSent, dispSent, c572Sent, c512Sent;
+  if (cv.c512Chg != c512Sent) { c512Sent = cv.c512Chg; r.u32(PID_LOCK_CAN, cv.c512b1); }   // PG280
   if (cv.crewAt && cv.crewAt != crewSent) { crewSent = cv.crewAt; r.u32(PID_CREW, cv.crew); }
   if (cv.speedDispAt && cv.speedDispAt != dispSent) { dispSent = cv.speedDispAt; r.u32(PID_SPEED_DISP, cv.speedDisp); }
   if (cv.c572Chg != c572Sent) {                  // PG55: each change of the 0x572 belt candidate once
@@ -1391,8 +1393,12 @@ void telemetryBegin(uint32_t bootId, bool sdOk)
   carSetProfile(veh);
   size_t vinl = sizeof(s_vin);                // PG233: the last VIN read, for the login
   if (nvs_get_str(nvs, "VIN", s_vin, &vinl) != ESP_OK) s_vin[0] = 0;
-  uint8_t c = 0;
-  nvs_get_u8(nvs, "CELL", &c);
+  // PG279 (18.11.2026): no stored CELL = modem ON. Why: "off until CELL=1" came with the untested SIM7600 driver
+  // (0abc565, 18.10.) and was never turned around after the modem was proven (PPP, J0 cell login + OTA 18.11.); a new
+  // box (U9K2652Z, novy_box.py, install mode) had no cell and no GPS (the GNSS is in the modem) - a customer would get
+  // a box without position. CELL=0 stored by a command is still kept.
+  uint8_t c = 1;
+  if (nvs_get_u8(nvs, "CELL", &c) != ESP_OK) c = 1;
   s_cellOn = c == 1;
   // APN of the home operator (4ka, as v1F CELL_APN "internet"); it stays the same in roaming -
   // only the visited network changes, the modem picks it. CELL_APN= overrides (stored).
@@ -1635,6 +1641,80 @@ static bool vinTick()
   return true;
 }
 
+// PG277 (18.11.2026, Vojtech "277 dočasne, kým nebudú dokončené profily vo FleetNest, do 2Z; potom to musí byť
+// všeobecné na každom FW"): a car WITHOUT a profile (VEH= empty - VW Caddy 2Z) is asked over standard OBD-II.
+// Why: the engine was known only from the K0 frame 0x208 (cardecode.cpp), a3 had no OBD questions at all - without
+// a profile no ENGINE START / STOP, so no VIN read (vinTick) and no trips by engine.
+//  - the car off: nothing is sent on CAN (no bus wake, no battery load). Asked only while the 12 V shows charging
+//    (>= ENGINE_OFF_VOLTAGE 12.8 V, the v1F engine-on level, standby.h) or rose by >= 0.5 V within 10 s (a start).
+//    The agreed design said 13.0 V; 12.8 V is the level the rest of the firmware already uses for "engine on".
+//  - every 2 s one question to 7DF (functional), answer 7E8: 01 0C rpm; with the engine on every 2nd is 01 0D speed.
+//    rpm > 0 -> carFromObd -> engineTick: ENGINE START as with K0; no rpm > 0 for ENGINE_SILENT_MS -> ENGINE STOP.
+//  - bus 1, then 2; the bus that answered is kept. 3 questions in a row without an answer -> 60 s pause (a car that
+//    does not answer is not asked every 2 s while the alternator charges), status line "OBD no answer <v> V" once.
+//  - status line "OBD rpm bus <n> <v> V" at the first answer of each start: the voltage shows whether 12.8 V fits this
+//    car (VW Euro 5 may have a smart alternator - NEOVERENÉ).
+#define OBD_EVERY_MS   2000UL
+#define OBD_PAUSE_MS   60000UL
+static bool obdTick()
+{
+  static float vHist[10];
+  static uint8_t vN, vPos;
+  static uint32_t vAt, lastAsk, pauseUntil;
+  static uint8_t bus, misses, toggle;
+  static bool told, toldMiss;
+  if (carProfile()[0]) return false;                 // a profile (K0) reads its own way
+  uint32_t ms = millis();
+  float v = read12V();
+  if (ms - vAt >= 1000) { vAt = ms; vHist[vPos] = v; vPos = (vPos + 1) % 10; if (vN < 10) vN++; }
+  float vMin = v;
+  for (uint8_t i = 0; i < vN; i++) if (vHist[i] < vMin) vMin = vHist[i];
+  bool armed = s_engineOn || v >= ENGINE_OFF_VOLTAGE || v - vMin >= 0.5f;
+  if (!armed) { told = false; toldMiss = false; misses = 0; return false; }
+  if (ms - lastAsk < OBD_EVERY_MS || (pauseUntil && (int32_t)(pauseUntil - ms) > 0)) return false;
+  lastAsk = ms;
+  pauseUntil = 0;
+  bool speed = s_engineOn && (++toggle & 1);
+  NbRead r = {};
+  r.txId = 0x7DF; r.rxId = 0x7E8;
+  r.req[0] = 0x01; r.req[1] = speed ? 0x0D : 0x0C; r.reqLen = 2;
+  static uint8_t resp[NB_READ_MAX];
+  int len = 0, res = NBR_NO_REPLY;
+  uint8_t nrc = 0;
+  for (uint8_t b = bus ? bus : 1; b <= 2; b++) {
+    r.bus = b;
+    lastStep("obd bus %u", b);
+    res = busExchange(&r, resp, sizeof(resp), &len, &nrc);
+    if (res == NBR_OK) { bus = b; break; }
+    if (bus) break;                                  // the known bus did not answer: no hunting every 2 s
+  }
+  if (res != NBR_OK || len < 3 || resp[0] != 0x41 || resp[1] != r.req[1]) {
+    if (++misses >= 3) {
+      misses = 0;
+      pauseUntil = ms + OBD_PAUSE_MS;
+      if (!toldMiss) {
+        toldMiss = true;
+        char m[40];
+        snprintf(m, sizeof(m), "OBD no answer %.1f V", v);
+        statusLine(m);
+      }
+    }
+    return true;
+  }
+  misses = 0;
+  if (speed) { carFromObd(-1, resp[2]); return true; }
+  if (len < 4) return true;
+  float rpm = (resp[2] * 256 + resp[3]) / 4.0f;
+  carFromObd(rpm, -1);
+  if (rpm > 0 && !told) {
+    told = true;
+    char m[40];
+    snprintf(m, sizeof(m), "OBD rpm bus %u %.1f V", (unsigned)bus, v);
+    statusLine(m);
+  }
+  return true;
+}
+
 const char* telemetryLinkName() { return s_client.link ? s_client.link->name() : "-"; }   // PG233 (install.cpp)
 const char* telemetryCellState() { return s_cell.status(); }                            // PG233 mini page
 int telemetryCsq() { return s_csq && millis() - s_csqAt < CSQ_FRESH_MS ? s_csq : 0; }
@@ -1647,7 +1727,7 @@ void readTick()
   if (vinTick()) return;                    // PG233
   NbRead r;
   uint32_t seq;
-  if (!nbReadTake(&r, &seq)) { autoReadTick(); return; }
+  if (!nbReadTake(&r, &seq)) { if (!obdTick()) autoReadTick(); return; }   // PG277: OBD only without a profile
   static uint8_t resp[NB_READ_MAX];
   int len = 0;
   uint8_t nrc = 0;
