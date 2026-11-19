@@ -33,6 +33,7 @@
 #include "ota.h"
 #include "otaverify.h"
 #include "standby.h"
+#include "profile.h"                      // PG283: car profile from the server
 #include "laststep.h"
 #include "clocktrust.h"                // PG259
 
@@ -371,7 +372,6 @@ static const AutoRead K0_READS[] = {
   {0x752, 0x652, {0xD8, 0xC6}, {2, 1}},
 };
 #define K0_READS_N (sizeof(K0_READS) / sizeof(K0_READS[0]))
-static uint8_t s_autoBus[K0_READS_N];        // the bus that answered (0 = not known yet)
 #define AUTO_Q 8
 static uint8_t s_autoQ[AUTO_Q][5 + NB_READ_RECORD_MAX];
 static int s_autoQLen[AUTO_Q];
@@ -405,45 +405,182 @@ static int autoReadForRecord(uint8_t* out, int cap)
   return n;
 }
 
+// PG283: the list of automatic reads = the server profile's UDS items, else the fixed K0_READS (VEH=K0).
+// One item: its fixed number (PID 0x39F, FleetNest pids.AUTO_READS), tx / rx, the request, the buses to try.
+#define READS_MAX 64
+static int readsCount()
+{
+  const Profile* pf = profileGet();
+  if (pf) return pf->nUds;
+  return strcmp(carProfile(), "K0") ? 0 : (int)K0_READS_N;
+}
+static bool readsItem(int i, NbRead* r, uint8_t* num, uint8_t buses[2])
+{
+  memset(r, 0, sizeof(*r));
+  r->req[0] = 0x22; r->reqLen = 1;
+  const Profile* pf = profileGet();
+  if (pf) {
+    const ProfUds& u = pf->uds[i];
+    *num = u.num; buses[0] = u.buses[0]; buses[1] = u.buses[1];
+    r->txId = u.tx; r->rxId = u.rx;
+    for (int k = 0; k < u.nDid; k++) { r->req[r->reqLen++] = u.did[k] >> 8; r->req[r->reqLen++] = u.did[k] & 0xFF; }
+    return true;
+  }
+  const AutoRead& a = K0_READS[i];
+  *num = i; buses[0] = a.buses[0]; buses[1] = a.buses[1];
+  r->txId = a.tx; r->rxId = a.rx;
+  for (int k = 0; k < 6 && a.did[k]; k += 2) { r->req[r->reqLen++] = a.did[k]; r->req[r->reqLen++] = a.did[k + 1]; }
+  return true;
+}
+
+// PG283 (Vojtech 18.11. "tak to vyriešte"): an item this car never answers is not asked any more IN THIS CAR.
+// Why: one profile serves several cars (K0: Peugeot with the DCM62 engine unit, Toyota) - an item verified on one
+// may not exist on the other; asked every minute it only loads the bus (PG-p13: CVM D409 187x no reply).
+// Counted: no reply on any bus, or NRC 0x31 (request out of range = not supported). Not counted: NRC 0x22 etc.
+// (conditions not correct - e.g. engine off) and a timeout in the middle of an answer. 5 misses over >= 2 engine
+// starts -> off in this box, status line "PROFIL <n> off <why>"; asked again after 30 days (valid clock) or when
+// the profile version changes. Kept in NVS "PDIS" (version + time per item number) over sleeps and restarts.
+struct ReadsOff { char ver[17]; uint32_t at[READS_MAX]; };
+static ReadsOff s_off;
+static uint8_t s_miss[READS_MAX], s_missStarts[READS_MAX];
+static uint16_t s_missStartNo[READS_MAX], s_startNo;
+#define READS_RETRY_S (30L * 24L * 3600L)
+static void readsOffLoad()
+{
+  static bool loaded;
+  const Profile* pf = profileGet();
+  const char* ver = pf ? pf->ver : "K0";
+  if (loaded && !strcmp(s_off.ver, ver)) return;
+  size_t l = sizeof(s_off);
+  if (!loaded && nvs_get_blob(nvs, "PDIS", &s_off, &l) != ESP_OK) memset(&s_off, 0, sizeof(s_off));
+  loaded = true;
+  if (strcmp(s_off.ver, ver)) {                         // another profile version: every item is asked again
+    memset(&s_off, 0, sizeof(s_off));
+    snprintf(s_off.ver, sizeof(s_off.ver), "%s", ver);
+    nvs_set_blob(nvs, "PDIS", &s_off, sizeof(s_off));
+    nvs_commit(nvs);
+  }
+}
+static bool readsIsOff(uint8_t num)
+{
+  if (num >= READS_MAX || !s_off.at[num]) return false;
+  time_t now = time(nullptr);
+  if (s_off.at[num] > 1 && now > 1735689600 && (uint32_t)now - s_off.at[num] > READS_RETRY_S) {
+    s_off.at[num] = 0;                                  // 30 days: try once more
+    nvs_set_blob(nvs, "PDIS", &s_off, sizeof(s_off));
+    nvs_commit(nvs);
+    return false;
+  }
+  return true;
+}
+static void readsResult(uint8_t num, int res, uint8_t nrc)
+{
+  if (num >= READS_MAX) return;
+  bool miss = res == NBR_NO_REPLY || (res == NBR_NRC && nrc == 0x31);
+  if (!miss) { if (res == NBR_OK) { s_miss[num] = 0; s_missStarts[num] = 0; } return; }
+  if (s_missStartNo[num] != s_startNo) { s_missStartNo[num] = s_startNo; s_missStarts[num]++; }
+  if (++s_miss[num] < 5 || s_missStarts[num] < 2) return;
+  time_t now = time(nullptr);
+  s_off.at[num] = now > 1735689600 ? (uint32_t)now : 1;   // 1 = no clock: off until the profile changes
+  nvs_set_blob(nvs, "PDIS", &s_off, sizeof(s_off));
+  nvs_commit(nvs);
+  char m[48];
+  snprintf(m, sizeof(m), "PROFIL %u off %s", (unsigned)num, res == NBR_NRC ? "NRC 31" : "no reply");
+  statusLine(m);
+}
+
 // loop() (the bus owner, as readTick): one read per call when due
 static void autoReadTick()
 {
   static bool wasOn;
   static int next = -1;
   static uint32_t lastRound, lastItem;
-  if (strcmp(carProfile(), "K0")) return;
+  static uint8_t s_autoBusN[READS_MAX];       // the bus that answered, by item number (0 = not known yet)
+  int count = readsCount();
+  if (!count) return;
+  readsOffLoad();
+  const Profile* pf = profileGet();
+  uint32_t every = pf ? pf->udsEveryS * 1000UL : AUTO_READ_EVERY_MS;
   bool on = s_engineOn;
-  if (on && !wasOn) next = 0;                                   // START
+  if (on && !wasOn) { next = 0; s_startNo++; }                   // START
   wasOn = on;
-  if (on && next < 0 && lastRound && millis() - lastRound >= AUTO_READ_EVERY_MS) next = 0;
+  if (on && next < 0 && lastRound && millis() - lastRound >= every) next = 0;
   if (next < 0 || millis() - lastItem < AUTO_READ_GAP_MS) return;
-  const AutoRead& a = K0_READS[next];
-  if (!a.buses[0]) {                    // PG-p13: buses {0, 0} = item switched off, its number stays
-    if (++next >= (int)K0_READS_N) { next = -1; lastRound = millis(); }
+  if (next >= count) { next = -1; lastRound = millis(); return; }
+  NbRead r;
+  uint8_t num, buses[2];
+  readsItem(next, &r, &num, buses);
+  if (!buses[0] || readsIsOff(num)) {        // PG-p13: no buses = item switched off, its number stays; PG283: off here
+    if (++next >= count) { next = -1; lastRound = millis(); }
     return;
   }
-  NbRead r = {};
-  r.txId = a.tx; r.rxId = a.rx;
-  r.req[0] = 0x22; r.reqLen = 1;
-  for (int k = 0; k < 6 && a.did[k]; k += 2) { r.req[r.reqLen++] = a.did[k]; r.req[r.reqLen++] = a.did[k + 1]; }
   static uint8_t resp[NB_READ_MAX];
   int len = 0, res = NBR_NO_REPLY;
   uint8_t nrc = 0;
+  uint8_t known = num < READS_MAX ? s_autoBusN[num] : 0;
   for (int k = 0; k < 2; k++) {
-    uint8_t bus = s_autoBus[next] ? (k ? 0 : s_autoBus[next]) : a.buses[k];
+    uint8_t bus = known ? (k ? 0 : known) : buses[k];
     if (!bus) break;
     r.bus = bus;
-    lastStep("auto read %d bus %u", next, bus);
+    lastStep("auto read %u bus %u", (unsigned)num, bus);
     res = busExchange(&r, resp, sizeof(resp), &len, &nrc);
-    if (res == NBR_OK || res == NBR_NRC) { s_autoBus[next] = bus; break; }
+    if (res == NBR_OK || res == NBR_NRC) { if (num < READS_MAX) s_autoBusN[num] = bus; break; }
   }
-  if (res == NBR_OK) carFromRead(a.tx, resp, len);      // p81: decoded values into the records
-  autoReadPush((uint8_t)next, r.bus, res, nrc, resp, len);
+  if (res == NBR_OK) carFromRead(r.txId, resp, len);    // p81: decoded values into the records
+  readsResult(num, res, nrc);
+  autoReadPush(num, r.bus, res, nrc, resp, len);
   char line[300];
-  nbReadLine(line, sizeof(line), 1000 + next, &r, res, nrc, resp, len);
+  nbReadLine(line, sizeof(line), 1000 + num, &r, res, nrc, resp, len);
   s_log.logEvent(line);
   lastItem = millis();
-  if (++next >= (int)K0_READS_N) { next = -1; lastRound = millis(); }
+  if (++next >= count) { next = -1; lastRound = millis(); }
+}
+
+// PG283: the CAN values of a server profile (profile.h) into the record. "h" = every record while fresh
+// (CAR_FRESH_MS, as the fixed K0 values), "z" = once after each change. Rules with "field" >= 0 of one pid go
+// together as u32n (K0 0x3AB = 0x572 b0, 0x572 b4, 0x4F2 b3), sent when any of them changed / is fresh.
+static uint32_t s_obdVal[PROF_OBD_MAX], s_obdAt[PROF_OBD_MAX];   // PG283: profile OBD answers (obdTick)
+template <class R> static void profileRecord(R& r, uint32_t ms)
+{
+  const Profile* pf = profileGet();
+  if (!pf) return;
+  static uint32_t sent[PROF_CAN_MAX];
+  for (uint8_t i = 0; i < pf->nCan; i++) {
+    const ProfCan& c = pf->can[i];
+    if (c.field > 0) continue;                          // sent with its field 0
+    ProfVal v;
+    bool seen = profileCanValue(i, &v);
+    if (c.field == 0) {
+      uint32_t vals[8] = {0};
+      uint8_t n = 1;
+      bool any = false, fresh = false;
+      for (uint8_t j = 0; j < pf->nCan; j++) {
+        const ProfCan& o = pf->can[j];
+        if (o.pid != c.pid || o.field < 0 || o.field >= 8) continue;
+        ProfVal w;
+        if (!profileCanValue(j, &w)) continue;
+        vals[o.field] = w.val;
+        if (o.field + 1 > n) n = o.field + 1;
+        if (w.chg != sent[j]) any = true;
+        if (ms - w.at < CAR_FRESH_MS) fresh = true;
+      }
+      if (c.change ? !any : !fresh) continue;
+      for (uint8_t j = 0; j < pf->nCan; j++) {
+        ProfVal w;
+        if (pf->can[j].pid == c.pid && pf->can[j].field >= 0 && profileCanValue(j, &w)) sent[j] = w.chg;
+      }
+      r.u32n(c.pid, vals, n);
+      continue;
+    }
+    if (!seen) continue;
+    if (c.change ? v.chg == sent[i] : ms - v.at >= CAR_FRESH_MS) continue;
+    sent[i] = v.chg;
+    if (c.raw) { r.wire.log(c.pid, v.raw, v.rawN); s_log.log(c.pid, v.raw, v.rawN); }
+    else if ((int32_t)v.val < 0) r.i32(c.pid, (int32_t)v.val);
+    else r.u32(c.pid, v.val);
+  }
+  for (uint8_t i = 0; i < pf->nObd; i++)                // OBD answers while fresh (2 periods + 5 s)
+    if (s_obdAt[i] && ms - s_obdAt[i] < pf->obd[i].everyS * 2000UL + 5000) r.u32(pf->obd[i].pid, s_obdVal[i]);
 }
 
 // event: 0 = a regular record, 1 = START, 2 = STOP (timed at `when`, the record's own time)
@@ -554,6 +691,7 @@ static void makeRecord(int event = 0, time_t when = 0)
     r.wire.log(PID_UREA_RAW, u, 8);
     s_log.log(PID_UREA_RAW, u, 8);
   }
+  profileRecord(r, ms);                 // PG283: CAN values of a server profile
   uint8_t ar[5 + NB_READ_RECORD_MAX];   // automatic read result (PID 0x39F), one per record
   int arn = autoReadForRecord(ar, sizeof(ar));
   if (arn) { r.wire.log(PID_AUTO_READ, ar, arn); s_log.log(PID_AUTO_READ, ar, arn); }
@@ -1409,6 +1547,7 @@ void telemetryBegin(uint32_t bootId, bool sdOk)
   genDeviceID(devid);
   nbout.printf("[TEL] device ID %s\n", devid);
   txqBegin(bootId);
+  profileBegin();                               // PG283: needs /spiffs (mounted by txqBegin)
   if (sdOk) {
     uint32_t last = 0;
     nvs_get_u32(nvs, "DATA_ID", &last);
@@ -1663,7 +1802,10 @@ static bool obdTick()
   static uint32_t vAt, lastAsk, pauseUntil;
   static uint8_t bus, misses, toggle;
   static bool told, toldMiss;
-  if (carProfile()[0]) return false;                 // a profile (K0) reads its own way
+  // PG283: a server profile says itself whether the engine comes from OBD ("M obd"); without one, as PG277:
+  // only with VEH= empty (K0 reads its own way)
+  const Profile* pf = profileGet();
+  if (pf ? !pf->motorObd : carProfile()[0] != 0) return false;
   uint32_t ms = millis();
   float v = read12V();
   if (ms - vAt >= 1000) { vAt = ms; vHist[vPos] = v; vPos = (vPos + 1) % 10; if (vN < 10) vN++; }
@@ -1678,6 +1820,18 @@ static bool obdTick()
   NbRead r = {};
   r.txId = 0x7DF; r.rxId = 0x7E8;
   r.req[0] = 0x01; r.req[1] = speed ? 0x0D : 0x0C; r.reqLen = 2;
+  // PG283: in the speed slot a due OBD item of the profile is asked instead (each every its own seconds)
+  static uint32_t itemAt[PROF_OBD_MAX];
+  int item = -1;
+  if (speed && pf)
+    for (uint8_t i = 0; i < pf->nObd && item < 0; i++)
+      if (!itemAt[i] || ms - itemAt[i] >= pf->obd[i].everyS * 1000UL) item = i;
+  if (item >= 0) {
+    itemAt[item] = ms;
+    r.txId = pf->obd[item].tx ? pf->obd[item].tx : 0x7DF;
+    r.rxId = pf->obd[item].rx ? pf->obd[item].rx : 0x7E8;
+    r.req[1] = pf->obd[item].obdPid;
+  }
   static uint8_t resp[NB_READ_MAX];
   int len = 0, res = NBR_NO_REPLY;
   uint8_t nrc = 0;
@@ -1702,6 +1856,12 @@ static bool obdTick()
     return true;
   }
   misses = 0;
+  if (item >= 0) {                                      // PG283: the raw data bytes (max 4), FleetNest decodes them
+    uint32_t v = 0;
+    for (int k = 2; k < len && k < 6; k++) v = (v << 8) | resp[k];
+    s_obdVal[item] = v; s_obdAt[item] = ms;
+    return true;
+  }
   if (speed) { carFromObd(-1, resp[2]); return true; }
   if (len < 4) return true;
   float rpm = (resp[2] * 256 + resp[3]) / 4.0f;

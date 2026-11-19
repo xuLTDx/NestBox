@@ -1,5 +1,6 @@
 // see cardecode.h
 #include "cardecode.h"
+#include "profile.h"
 
 static char s_profile[8] = "K0";
 static CarValues s_v;
@@ -7,6 +8,15 @@ static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 
 void carSetProfile(const char* p) { snprintf(s_profile, sizeof(s_profile), "%s", p ? p : ""); }
 const char* carProfile() { return s_profile; }
+
+void carSetRpm(float rpm)                    // PG283 (cardecode.h)
+{
+  uint32_t now = millis();
+  portENTER_CRITICAL(&s_mux);
+  s_v.rpm = rpm; s_v.rpmAt = now;
+  if (rpm > 0) s_v.rpmPosAt = now;
+  portEXIT_CRITICAL(&s_mux);
+}
 
 void carFromObd(float rpm, int speedKmh)   // PG277 (cardecode.h)
 {
@@ -28,7 +38,9 @@ CarValues carValues()
 // CAN1 receive task (canbus1.cpp): every frame
 void carDecode(uint32_t id, bool ext, uint8_t dlc, const uint8_t* d)
 {
-  if (ext || strcmp(s_profile, "K0")) return;
+  if (ext) return;
+  if (profileGet()) { profileCanFrame(1, id, dlc, d); return; }   // PG283: a server profile replaces the fixed K0
+  if (strcmp(s_profile, "K0")) return;
   uint32_t now = millis();
   if (id == 0x552 && dlc >= 7) {
     uint32_t km = ((uint32_t)d[4] << 16) | ((uint32_t)d[5] << 8) | d[6];

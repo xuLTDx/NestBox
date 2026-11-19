@@ -65,3 +65,5 @@ void carFromRead(uint32_t txId, const uint8_t* resp, int len);
 // PG277: rpm / speed asked over standard OBD (cars without a profile, telemetry.cpp obdTick); rpm < 0 / speed < 0 = not
 // in this answer. rpm 0 does not refresh rpmAt (an engine that stopped must go silent for ENGINE STOP, engineTick).
 void carFromObd(float rpm, int speedKmh);
+// PG283: the engine rule of a server profile (profile.cpp) - the same as the K0 0x208 path: rpm 0 refreshes rpmAt
+void carSetRpm(float rpm);

@@ -9,6 +9,7 @@
 #include <esp_ota_ops.h>
 #include <esp_partition.h>
 #include "otaverify.h"
+#include "profile.h"
 #include "dbglog.h"
 #include "netlog.h"
 #include <nvs.h>
@@ -296,6 +297,38 @@ static void placesSync(bool force)
   s_busy = wasBusy;
 }
 
+// PG283: the car profile (profile.h) with the WiFi list, on its clock and on a requested check. The OTA server
+// before 2.7.0 answers 404 - logged once per new answer code, not on every check.
+static void profileFetch(OtaConn& c)
+{
+  char path[120];
+  snprintf(path, sizeof(path), "/api/nestbox/ota/%s/profile.txt", s_token);
+  long len = 0;
+  int code = httpGet(c, path, 0, &len);
+  static int lastCode;
+  if (code != 200) {
+    if (code != lastCode) {
+      char m[40];
+      snprintf(m, sizeof(m), "PROFIL ERR http=%d", code);
+      otaLog(m);
+    }
+    lastCode = code;
+    c.stop();
+    return;
+  }
+  lastCode = code;
+  String body = readAll(c);
+  c.stop();
+  bool changed = false;
+  char sum[48];
+  bool ok = profileStore(body, &changed, sum, sizeof(sum));
+  if (!ok || changed) {
+    char m[64];
+    snprintf(m, sizeof(m), ok ? "PROFIL %s new" : "PROFIL ERR %s", sum);
+    otaLog(m);
+  }
+}
+
 static void placesFetch(bool force, bool clock, time_t now)
 {
   CellLink* cell = telemetryWifiForData() ? nullptr : telemetryCellLink();
@@ -325,6 +358,7 @@ static void placesFetch(bool force, bool clock, time_t now)
     snprintf(m, sizeof(m), "WIFI PLACES %d of %d stored%s", usable, total, usable ? "" : " - no WiFi");
     otaLog(m);
   }
+  profileFetch(c);                            // PG283: the same link, right after the WiFi list
 }
 
 // -------------------------------------------------------------- check ---
