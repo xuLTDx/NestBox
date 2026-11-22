@@ -29,7 +29,8 @@ void telemetryCellOff();
 void logNetEvent(const char* text);
 void prepareRestart(const char* why);  // main.cpp
 
-#define ADC_12V_FACTOR_SB 195.7f      // = telemetry.cpp ADC_12V_FACTOR (raw / factor = volts)
+float adc12vFactor();                       // PG285: telemetry.cpp, the calibrated factor of this box (default 195.7)
+#define ADC_12V_FACTOR_SB adc12vFactor()    // raw / factor = volts
 #define FALSE_WAKES_RAISE 3           // after this many unconfirmed ULP wakes in a row: threshold up
 #define FALSE_WAKE_RAISE_V 0.3f
 // PG50 (2026-11-08, NAVRH 9 rule "the ULP runs only during the sleep"). Why: Peugeot 6.11 (boot 178 -> 179) and

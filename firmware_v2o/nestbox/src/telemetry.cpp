@@ -280,11 +280,52 @@ int telemetryStatus(char* buf, int size)
   return strlen(buf);
 }
 
+// PG285 (22.11.2026, Vojtech "285 kalibráciu môžeš robiť"): the 12 V factor per box, stored in NVS "ADC_F".
+// Why: 2Z on the lab supply 19.11. showed 13.31 V at 13.49 V on the supply (-0.18 V); the divider + ADC differ per
+// unit and OVMS3 calibrates every box the same way (system.adc factor12v, web "12V calibration" slider,
+// web_cfg_vehicle.cpp:287). CAL12V=<real volts> computes it from the reading now; CAL12V=0 = back to 195.7.
+// The standby thresholds (standby.cpp rawX4, ULP) use the same factor, so wake / sleep levels stay right.
+#define ADC_F_MIN 150.0f                     // outside = a wrong entry (e.g. volts typed as mV), refused
+#define ADC_F_MAX 250.0f
+static float s_adcF = ADC_12V_FACTOR;
+float adc12vFactor() { return s_adcF; }
 float read12V()
 {
   uint32_t raw = 0;
   for (int i = 0; i < 5; i++) raw += analogRead(ADC_12V_PIN);
-  return raw / 5.0f / ADC_12V_FACTOR;
+  return raw / 5.0f / s_adcF;
+}
+static void adcFactorLoad()
+{
+  uint32_t bits = 0;
+  float f;
+  if (nvs_get_u32(nvs, "ADC_F", &bits) != ESP_OK) return;
+  memcpy(&f, &bits, 4);
+  if (f >= ADC_F_MIN && f <= ADC_F_MAX) s_adcF = f;
+}
+// "CAL12V=<volts>" -> out = the answer line; true = stored
+bool telemetryCal12V(const char* arg, char* out, int cap)
+{
+  float volts = atof(arg);
+  if (volts == 0) {
+    nvs_erase_key(nvs, "ADC_F");
+    nvs_commit(nvs);
+    s_adcF = ADC_12V_FACTOR;
+    snprintf(out, cap, "CAL12V OK reset f=%.2f %.2fV", s_adcF, read12V());
+    return true;
+  }
+  if (volts < 9 || volts > 16) { snprintf(out, cap, "CAL12V ERR volts 9-16 (or 0 = reset)"); return false; }
+  uint32_t raw = 0;
+  for (int i = 0; i < 40; i++) { raw += analogRead(ADC_12V_PIN); delay(2); }
+  float f = raw / 40.0f / volts;
+  if (f < ADC_F_MIN || f > ADC_F_MAX) { snprintf(out, cap, "CAL12V ERR factor %.1f out of %d-%d", f, (int)ADC_F_MIN, (int)ADC_F_MAX); return false; }
+  float was = s_adcF;
+  uint32_t bits;
+  memcpy(&bits, &f, 4);
+  bool ok = nvs_set_u32(nvs, "ADC_F", bits) == ESP_OK && nvs_commit(nvs) == ESP_OK;
+  if (ok) s_adcF = f;
+  snprintf(out, cap, ok ? "CAL12V OK f=%.2f was %.2f" : "CAL12V ERR nvs f=%.2f was %.2f", f, was);
+  return ok;
 }
 
 // one value into both the SD file ("<pid>,<v>") and the wire record ("<pid>:<v>")
@@ -1528,6 +1569,7 @@ void telemetryBegin(uint32_t bootId, bool sdOk)
   char veh[8] = "K0";
   size_t vl = sizeof(veh);
   nvs_get_str(nvs, "VEH", veh, &vl);
+  adcFactorLoad();                              // PG285: the 12 V calibration of this box
   carSetProfile(veh);
   size_t vinl = sizeof(s_vin);                // PG233: the last VIN read, for the login
   if (nvs_get_str(nvs, "VIN", s_vin, &vinl) != ESP_OK) s_vin[0] = 0;

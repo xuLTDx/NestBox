@@ -49,6 +49,7 @@ void telemetrySetCell(bool on);
 bool telemetryCell();
 void telemetrySetApn(const char* apn);
 void telemetrySetVehicle(const char* p);
+bool telemetryCal12V(const char* arg, char* out, int cap);   // PG285
 int telemetryModemAt(const char* cmd, char* out, int cap);
 
 static HttpParam httpParam;
@@ -204,6 +205,11 @@ static int handlerControl(UrlHandlerParam* param)
   } else if (!strncmp(cmd, "VEH=", 4)) {            // car profile for the CAN1 values: K0 or empty
     telemetrySetVehicle(cmd + 4);
     n = snprintf(buf, bufsize, "OK veh=%s", carProfile());
+  } else if (!strncmp(cmd, "CAL12V=", 7)) {         // PG285: 12 V calibration (telemetry.cpp)
+    char m[64];
+    telemetryCal12V(cmd + 7, m, sizeof(m));
+    statusLine(m);
+    n = snprintf(buf, bufsize, "%s", m);
   } else if (!strncmp(cmd, "CAR?", 4)) {
     CarValues v = carValues();
     uint32_t ms = millis();

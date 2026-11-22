@@ -17,6 +17,7 @@
 #include <sys/time.h>
 
 void telemetrySetVehicle(const char* p);   // telemetry.cpp
+bool telemetryCal12V(const char* arg, char* out, int cap);   // PG285 telemetry.cpp
 const char* telemetryVin();                // PG233
 #include "install.h"                       // PG233: INST=0
 bool webSetPassword(const char* pw);       // web.cpp (K13)
@@ -251,6 +252,11 @@ void TeleClientUDP::onMessage(char* msg, UdpRx* rx)
       telemetrySetVehicle(cmdp + 8);
       char m[64];
       snprintf(m, sizeof(m), "CMD %s OK veh=%s", cmdp + 4, carProfile());
+      statusLine(m);
+    }
+    if (cmdp && !strncmp(cmdp + 4, "CAL12V=", 7)) {   // PG285: 12 V calibration from FleetNest
+      char m[64];
+      telemetryCal12V(cmdp + 11, m, sizeof(m));
       statusLine(m);
     }
     if (cmdp && !strncmp(cmdp + 4, "WEB_PW=", 7)) {  // K13: the password is never echoed into records
