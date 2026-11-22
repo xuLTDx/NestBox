@@ -448,7 +448,8 @@ static int autoReadForRecord(uint8_t* out, int cap)
 
 // PG283: the list of automatic reads = the server profile's UDS items, else the fixed K0_READS (VEH=K0).
 // One item: its fixed number (PID 0x39F, FleetNest pids.AUTO_READS), tx / rx, the request, the buses to try.
-#define READS_MAX 64
+#define READS_MAX 256                         // item numbers are uint8 (0x39F); FleetNest numbers them across profiles
+                                              // (K0 0-21, VW 2K 100-108, FN267 22.11.) - 64 would skip off / bus memory
 static int readsCount()
 {
   const Profile* pf = profileGet();
@@ -504,7 +505,7 @@ static void readsOffLoad()
 }
 static bool readsIsOff(uint8_t num)
 {
-  if (num >= READS_MAX || !s_off.at[num]) return false;
+  if (!s_off.at[num]) return false;
   time_t now = time(nullptr);
   if (s_off.at[num] > 1 && now > 1735689600 && (uint32_t)now - s_off.at[num] > READS_RETRY_S) {
     s_off.at[num] = 0;                                  // 30 days: try once more
@@ -516,7 +517,6 @@ static bool readsIsOff(uint8_t num)
 }
 static void readsResult(uint8_t num, int res, uint8_t nrc)
 {
-  if (num >= READS_MAX) return;
   bool miss = res == NBR_NO_REPLY || (res == NBR_NRC && nrc == 0x31);
   if (!miss) { if (res == NBR_OK) { s_miss[num] = 0; s_missStarts[num] = 0; } return; }
   if (s_missStartNo[num] != s_startNo) { s_missStartNo[num] = s_startNo; s_missStarts[num]++; }
@@ -558,14 +558,14 @@ static void autoReadTick()
   static uint8_t resp[NB_READ_MAX];
   int len = 0, res = NBR_NO_REPLY;
   uint8_t nrc = 0;
-  uint8_t known = num < READS_MAX ? s_autoBusN[num] : 0;
+  uint8_t known = s_autoBusN[num];
   for (int k = 0; k < 2; k++) {
     uint8_t bus = known ? (k ? 0 : known) : buses[k];
     if (!bus) break;
     r.bus = bus;
     lastStep("auto read %u bus %u", (unsigned)num, bus);
     res = busExchange(&r, resp, sizeof(resp), &len, &nrc);
-    if (res == NBR_OK || res == NBR_NRC) { if (num < READS_MAX) s_autoBusN[num] = bus; break; }
+    if (res == NBR_OK || res == NBR_NRC) { s_autoBusN[num] = bus; break; }
   }
   if (res == NBR_OK) carFromRead(r.txId, resp, len);    // p81: decoded values into the records
   readsResult(num, res, nrc);
