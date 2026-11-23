@@ -241,18 +241,31 @@ static void lpLoad()
     if (!s_lpHave) { s_lpLat = v[0]; s_lpLng = v[1]; s_lpHave = true; }
   }
 }
+static uint32_t s_lpSavedAt;
 static void lpSave()
 {
   if (!s_lpHave || (s_lpLat == s_lpSavedLat && s_lpLng == s_lpSavedLng)) return;
   float v[2] = {s_lpLat, s_lpLng};
   if (nvs_set_blob(nvs, "LASTPOS", v, sizeof(v)) == ESP_OK && nvs_commit(nvs) == ESP_OK) { s_lpSavedLat = v[0]; s_lpSavedLng = v[1]; }
+  s_lpSavedAt = millis() | 1;
 }
+// PG308 (23.11.2026, Vojtech "308 ano"): while the engine runs at most one LASTPOS write per LP_DRIVE_MS; with the
+// engine off at once (> 50 m moved), and always before a restart / sleep (telemetryBeforeRestart).
+// Why: every NVS commit is a flash write; the CAN1 receive interrupt is not in IRAM (Arduino libs sdkconfig
+// CONFIG_TWAI_ISR_IN_IRAM not set) and cannot run while the flash cache is off -> the 64-byte TWAI RX FIFO overflows.
+// J0 19.-23.11.: "ERR CAN1 overrun +15..+32" in every drive 3-8 min after the start and again every 10 min, +211 / +187
+// while the OTA image was written to flash (23.11. 13:09 / 13:12). The 50 m rule wrote LASTPOS every ~3.6 s at 50 km/h.
+// Lost by this: at most 5 min of position after a power loss while driving (the WiFi choice after it, PG232).
+#define LP_DRIVE_MS (5UL * 60UL * 1000UL)
+bool telemetryEngineOn();
 void telemetryKeepPosition(float lat, float lng)
 {
   lpLoad();
   s_lpLat = lat; s_lpLng = lng; s_lpHave = true;
   float dy = (lat - s_lpSavedLat) * 111320.0f, dx = (lng - s_lpSavedLng) * 111320.0f * cosf(lat * 0.0174533f);
-  if (dx * dx + dy * dy > 50.0f * 50.0f) lpSave();
+  if (dx * dx + dy * dy <= 50.0f * 50.0f) return;
+  if (telemetryEngineOn() && s_lpSavedAt && millis() - s_lpSavedAt < LP_DRIVE_MS) return;
+  lpSave();
 }
 bool telemetryLastPosition(float* lat, float* lng)
 {
