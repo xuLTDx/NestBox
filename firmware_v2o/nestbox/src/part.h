@@ -4,7 +4,11 @@
 // Arduino 3.3.11 libs, only the partition is missing ("No core dump partition found!"); the Peugeot can get a new
 // table only over OTA (USB = half the car taken apart, Vojtech 12.11.: the engine is kept running for the update).
 // How (agreed 12.11.2026, PG177):
-//  - armed by PART=CD (web /api/control; FleetNest after its validate() allows it), stored in NVS, PART=0 disarms;
+//  - PG300 (23.11.2026): AUTOMATIC and GENERAL (part.cpp TABLES, the last = target): a box with an older known table
+//    changes by itself after its build is confirmed, at the first stable >= 13.0 V (never on USB); nvs/otadata/app0/app1
+//    must be identical entries in both tables, else nothing is written. PART=CD arms it as before (also on USB, bench),
+//    PART=0 = off for good for this target; after an attempt / error the SAME build does not repeat it, a newer build tries once.
+//    PART? -> "table=<name>|unknown target=<name> mode=auto|armed|off";
 //  - runs only when: armed, the 12 V >= PART_MIN_V without a break for PART_STABLE_MS (engine running / bench supply),
 //    the delivery queue at most 5 live records (no backlog), no OTA running, the build confirmed (otaverify), and the table in flash is EXACTLY the
 //    known old one (PART_OLD) - anything else: "PART ERR ..." and disarmed, nothing written;

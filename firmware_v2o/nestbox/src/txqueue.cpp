@@ -253,6 +253,39 @@ static bool validateRing()
   return true;
 }
 
+// PG303 (23.11.2026, Vojtech "303 ano"): a LittleFS bigger than its partition is erased before the mount.
+// Why: 2Z 23.11. 12:32 - the PG177/PG300 table change made "spiffs" 64 KB smaller; since PG223 (14.11.) it holds
+// LittleFS and Arduino's LittleFS.begin mounts with grow_on_mount=true -> lfs_fs_grow_ asserts
+// "lfs.c:5272 (block_count >= lfs->block_count)" -> restart at every boot (boot 691, 692, 693 ... on USB). LittleFS can
+// grow, never shrink. The 13.11. test passed only because the partition still held SPIFFS. General: any table change
+// that shrinks the partition is covered. Read from the superblock (littlefs v2, both blocks of the pair 0/1:
+// revision(4) tag(4) "littlefs"(8) tag(4) version(4) block_size(4) block_count(4)); erasing both blocks = no file
+// system -> LittleFS.begin(true) formats it to the partition size. Lost: the standby records (the table change runs
+// only with an empty queue) and /spiffs/profile.txt -> WIFI_PL_T cleared, the list + profile are fetched again at once.
+static void fsShrinkGuard()
+{
+  const esp_partition_t* p = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, "spiffs");
+  if (!p) return;
+  uint32_t fsBytes = 0;
+  for (int b = 0; b < 2; b++) {
+    uint8_t h[32];
+    if (esp_partition_read(p, b * 4096, h, sizeof(h)) != ESP_OK || memcmp(h + 8, "littlefs", 8)) continue;
+    uint32_t bs, bc;
+    memcpy(&bs, h + 24, 4);
+    memcpy(&bc, h + 28, 4);
+    if (bs == 4096 && (uint64_t)bs * bc > fsBytes) fsBytes = bs * bc;
+  }
+  if (fsBytes <= p->size) return;
+  bool ok = esp_partition_erase_range(p, 0, 2 * 4096) == ESP_OK;
+  nvs_erase_key(nvs, "WIFI_PL_T");
+  nvs_commit(nvs);
+  char m[64];
+  snprintf(m, sizeof(m), "FS %luK > part %luK - erased %s", (unsigned long)(fsBytes / 1024),
+           (unsigned long)(p->size / 1024), ok ? "OK" : "ERR");
+  nbout.println(m);
+  statusLine(m);
+}
+
 void txqBegin(uint32_t bootId)
 {
   lock();
@@ -261,6 +294,7 @@ void txqBegin(uint32_t bootId)
   if (!kept) resetRing();
   // the internal flash file system for the standby records (also the httpd's
   // static files); /live.html, an old diagnostic page, removed (user, 2026-10-12)
+  fsShrinkGuard();                            // PG303: never mount a LittleFS bigger than its partition (assert loop)
   s_sbMounted = LittleFS.begin(true, "/spiffs", 10, "spiffs");   // true: formatted once after SPIFFS
   if (s_sbMounted && LittleFS.exists("/txq_sb.new")) LittleFS.remove("/txq_sb.new");   // a save cut off by a power loss
   if (s_sbMounted && LittleFS.exists("/txq_sb.bin")) {
