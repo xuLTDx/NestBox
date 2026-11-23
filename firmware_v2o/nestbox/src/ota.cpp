@@ -276,10 +276,20 @@ static String urlBuild()
 // OTA) fetches it at once. After a failed try the next one PLACES_RETRY_MS later (the list it has stays).
 #define PLACES_EVERY_S 7200
 #define PLACES_RETRY_MS 600000UL
-static void placesFetch(bool force, bool clock, time_t now);
-static void placesSync(bool force)
+static void placesFetch(bool force, bool clock, time_t now, bool cmd = false);
+
+// PG296 (23.11.2026, Vojtech "296 ano", FleetNest FN271): command WIFI_SYNC = fetch the WiFi list now, WITHOUT the
+// firmware check. Why: 20.11. 2Z fetched the list at 15:16 (ota_server.log), the company networks were added at
+// 15:35, the boot at 15:45 fetched nothing (2 h clock) - the car never joined the company WiFi. OTA_READY would fetch
+// it too, but also checks / starts a firmware download (Vojtech 14.11.: the WiFi list is not OTA). FleetNest sends
+// it by itself after a change of the company WiFi. Answer: "CMD WIFI_SYNC OK <n> of <m> stored" | "CMD WIFI_SYNC ERR
+// <why>" (FleetNest closes the command on any "CMD WIFI_SYNC" line). A repeated command only fetches again.
+static volatile bool s_wifiSyncReq;
+void otaWifiSync() { s_wifiSyncReq = true; }
+
+static void placesSync(bool force, bool cmd = false)
 {
-  if (!s_token[0]) return;
+  if (!s_token[0]) { if (cmd) otaLog("CMD WIFI_SYNC ERR no token"); return; }
   time_t now = time(nullptr);
   uint32_t last = 0;
   nvs_get_u32(nvs, "WIFI_PL_T", &last);
@@ -293,7 +303,7 @@ static void placesSync(bool force)
   triedAt = millis() | 1;
   bool wasBusy = s_busy;                      // the box does not fall asleep in the middle of the fetch
   s_busy = true;
-  placesFetch(force, clock, now);
+  placesFetch(force, clock, now, cmd);
   s_busy = wasBusy;
 }
 
@@ -329,10 +339,10 @@ static void profileFetch(OtaConn& c)
   }
 }
 
-static void placesFetch(bool force, bool clock, time_t now)
+static void placesFetch(bool force, bool clock, time_t now, bool cmd)
 {
   CellLink* cell = telemetryWifiForData() ? nullptr : telemetryCellLink();
-  if (!telemetryWifiForData() && !cell) return;
+  if (!telemetryWifiForData() && !cell) { if (cmd) otaLog("CMD WIFI_SYNC ERR no network"); return; }
   char path[200];
   snprintf(path, sizeof(path), "/api/nestbox/ota/%s/wifi.txt", s_token);
   if (cell) cell->makeDefault();
@@ -342,7 +352,7 @@ static void placesFetch(bool force, bool clock, time_t now)
   int code = httpGet(c, path, 0, &len);
   if (code != 200) {
     char m[48];
-    snprintf(m, sizeof(m), "WIFI PLACES ERR http=%d", code);
+    snprintf(m, sizeof(m), "%s ERR http=%d", cmd ? "CMD WIFI_SYNC" : "WIFI PLACES", code);
     otaLog(m);
     c.stop();
     return;
@@ -351,11 +361,15 @@ static void placesFetch(bool force, bool clock, time_t now)
   c.stop();
   bool changed = false;
   int total = 0, usable = 0;
-  if (!wifiPlacesStore(body, &changed, &total, &usable)) { otaLog("WIFI PLACES ERR bad list"); return; }
+  if (!wifiPlacesStore(body, &changed, &total, &usable)) {
+    otaLog(cmd ? "CMD WIFI_SYNC ERR bad list" : "WIFI PLACES ERR bad list");
+    return;
+  }
   if (clock) { nvs_set_u32(nvs, "WIFI_PL_T", (uint32_t)now); nvs_commit(nvs); }
   if (changed || force) {
-    char m[56];
-    snprintf(m, sizeof(m), "WIFI PLACES %d of %d stored%s", usable, total, usable ? "" : " - no WiFi");
+    char m[64];
+    snprintf(m, sizeof(m), "%s %d of %d stored%s", cmd ? "CMD WIFI_SYNC OK" : "WIFI PLACES", usable, total,
+             usable ? "" : " - no WiFi");
     otaLog(m);
   }
   profileFetch(c);                            // PG283: the same link, right after the WiFi list
@@ -794,6 +808,7 @@ static void otaTask(void*)
         s_busy = false;
       }
     }
+    if (s_wifiSyncReq) { s_wifiSyncReq = false; placesSync(true, true); }   // PG296: even during a paused download
     if (!s_retryAt && !s_staged) placesSync(false);   // PG205: the WiFi list on its own clock; not during a firmware download
     if (!s_staged || !flashAllowed()) logTick();   // PG49
     CellLink* cell = telemetryCellLink();     // p71

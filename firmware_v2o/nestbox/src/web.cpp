@@ -6,7 +6,7 @@
 //   /api/control?cmd=...        SNIFF=1[,<min>] | SNIFF=0 | SNIFF? | SNIFF_VEH=<tag> |
 //                               SNIFF_BUSES=<mask 1-7> | SNIFF_PURGE | SDW? | RESTART |
 //                               TEL? | REC_S=<s> | CELL=0|1 | CELL_APN=<apn> | VEH=K0 | CAR? |
-//                               OTA? | OTA_CHECK | OTA_TOKEN= | OTA_HOST= | OTA_PORT= |
+//                               OTA? | OTA_CHECK | WIFI_SYNC | OTA_TOKEN= | OTA_HOST= | OTA_PORT= |
 //                               READ=<bus>,<tx hex>,<rx hex>,<request hex>
 //   /api/ota                    raw firmware POST (v1F handlerOTA)
 //   /api/sniff, /api/sniff/live?id=&mask=, /api/sniff/list, /api/sniff/<n>[?from=&to=]
@@ -196,6 +196,9 @@ static int handlerControl(UrlHandlerParam* param)
     n = strlen(buf);
   } else if (!strcmp(cmd, "OTA_CHECK")) {           // pull-OTA check now (as the server's OTA_READY)
     otaRequest();
+    n = snprintf(buf, bufsize, "OK");
+  } else if (!strcmp(cmd, "WIFI_SYNC")) {           // PG296: as the server's WIFI_SYNC (answer in the status lines)
+    otaWifiSync();
     n = snprintf(buf, bufsize, "OK");
   } else if (!strncmp(cmd, "OTA_TOKEN=", 10) || !strncmp(cmd, "OTA_HOST=", 9) || !strncmp(cmd, "OTA_PORT=", 9)) {
     char key[12];

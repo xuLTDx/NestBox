@@ -19,6 +19,7 @@ extern const char NESTBOX_IMAGE_MARK[];
 
 void otaBegin();                     // after SD + NVS: settings, the OTA task
 void otaRequest();                   // server OTA_READY / web: check now
+void otaWifiSync();                  // PG296: server WIFI_SYNC - the WiFi list now, no firmware check (ota.cpp)
 bool otaBusy();                      // a check / download runs now (standby waits for it)
 int otaTakeStatus(uint8_t* out, int cap);   // the oldest pending step line (records)
 void statusLine(const char* text);   // p58: a text line to FleetNest the same way (BOOT, WIFI)

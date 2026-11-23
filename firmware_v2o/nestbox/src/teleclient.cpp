@@ -227,6 +227,10 @@ void TeleClientUDP::onMessage(char* msg, UdpRx* rx)
       logNetEvent("NET CMD_OTA_READY");
       otaReadyRequested();
     }
+    if (cmdp && !strncmp(cmdp + 4, "WIFI_SYNC", 9)) {   // PG296 (ota.cpp): the WiFi list now, answer in the OTA task
+      nbout.println("[UDP] CMD:WIFI_SYNC");
+      otaWifiSync();
+    }
     if (cmdp && !strncmp(cmdp + 4, "SNIFF=", 6)) {
       bool on = cmdp[10] == '1';
       const char* c = strchr(cmdp + 10, ',');
