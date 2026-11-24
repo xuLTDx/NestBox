@@ -109,6 +109,17 @@ static bool parse(const char* text, Profile* p)
       o.everyS = atoi(f[6]);
       if (o.everyS < 2) o.everyS = 10;
       if (o.pid) p->nObd++;
+    } else if (!strcmp(f[0], "F") && n >= 7 && p->nFast < PROF_FAST_MAX) {   // PG319 (profile.h)
+      ProfFast& q = p->fast[p->nFast];
+      q.tx = strtoul(f[1], nullptr, 10);
+      q.rx = strtoul(f[2], nullptr, 10);
+      uint8_t nb = parseList(f[3], l, 2);
+      for (int i = 0; i < nb; i++) q.buses[i] = l[i];
+      q.did = strtoul(f[4], nullptr, 10);
+      q.pid = strtoul(f[5], nullptr, 10);
+      q.everyS = atoi(f[6]);
+      if (q.everyS < 1) q.everyS = 1;
+      if (q.pid && q.tx && q.rx && nb) p->nFast++;
     }
   }
   free(buf);
@@ -154,8 +165,8 @@ bool profileStore(const String& body, bool* changed, char* summary, int cap)
   if (!p) { snprintf(summary, cap, "no memory"); return false; }
   bool ok = parse(body.c_str(), p);
   if (ok) {
-    snprintf(summary, cap, "%s %.8s c=%u u=%u o=%u%s", p->code[0] ? p->code : "none", p->ver, p->nCan, p->nUds,
-             p->nObd, p->motorObd ? " m=obd" : p->motorCan ? " m=can" : "");
+    snprintf(summary, cap, "%s %.8s c=%u u=%u o=%u f=%u%s", p->code[0] ? p->code : "none", p->ver, p->nCan, p->nUds,
+             p->nObd, p->nFast, p->motorObd ? " m=obd" : p->motorCan ? " m=can" : "");
     if (strcmp(p->ver, s_storedVer)) {
       FILE* f = fopen(PROF_TMP, "wb");      // tmp + rename: a power loss never leaves half a file
       bool w = f && fwrite(body.c_str(), 1, body.length(), f) == body.length();

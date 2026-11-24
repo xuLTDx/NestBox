@@ -594,6 +594,9 @@ static void autoReadTick()
 // (CAR_FRESH_MS, as the fixed K0 values), "z" = once after each change. Rules with "field" >= 0 of one pid go
 // together as u32n (K0 0x3AB = 0x572 b0, 0x572 b4, 0x4F2 b3), sent when any of them changed / is fresh.
 static uint32_t s_obdVal[PROF_OBD_MAX], s_obdAt[PROF_OBD_MAX];   // PG283: profile OBD answers (obdTick)
+struct FastVal { uint8_t raw[8], n; uint32_t chg, sent; };          // PG319: profile "F" answers (fastReadTick)
+static FastVal s_fast[PROF_FAST_MAX];
+static portMUX_TYPE s_fastMux = portMUX_INITIALIZER_UNLOCKED;     // loop() writes, the record task reads
 template <class R> static void profileRecord(R& r, uint32_t ms)
 {
   const Profile* pf = profileGet();
@@ -635,6 +638,16 @@ template <class R> static void profileRecord(R& r, uint32_t ms)
   }
   for (uint8_t i = 0; i < pf->nObd; i++)                // OBD answers while fresh (2 periods + 5 s)
     if (s_obdAt[i] && ms - s_obdAt[i] < pf->obd[i].everyS * 2000UL + 5000) r.u32(pf->obd[i].pid, s_obdVal[i]);
+  for (uint8_t i = 0; i < pf->nFast; i++) {             // PG319: fast reads once after each change, raw bytes
+    FastVal f;
+    portENTER_CRITICAL(&s_fastMux);
+    f = s_fast[i];
+    s_fast[i].sent = s_fast[i].chg;
+    portEXIT_CRITICAL(&s_fastMux);
+    if (f.chg == f.sent || !f.n) continue;
+    r.wire.log(pf->fast[i].pid, f.raw, f.n);
+    s_log.log(pf->fast[i].pid, f.raw, f.n);
+  }
 }
 
 // event: 0 = a regular record, 1 = START, 2 = STOP (timed at `when`, the record's own time)
@@ -1934,6 +1947,74 @@ const char* telemetryLinkName() { return s_client.link ? s_client.link->name() :
 const char* telemetryCellState() { return s_cell.status(); }                            // PG233 mini page
 int telemetryCsq() { return s_csq && millis() - s_csqAt < CSQ_FRESH_MS ? s_csq : 0; }
 
+// PG319 (profile.h "F"): the profile's fast UDS reads, each every its own seconds while the engine runs; the answer
+// bytes after "62 <did>" are kept and go into the next record once when they differ from the last answer.
+// PG322 (Vojtech 24.11.2026 "322 áno"): an item is never switched off, only slowed down. FAST_MISS_MAX misses in a
+// row (no reply or NRC 0x31 "not supported") -> asked every FAST_SLOW_MS ("PROFIL F<n> 60s ..."); the first answer
+// again -> back to its own seconds ("PROFIL F<n> 1s"). Why: a silent unit asked every second only loads the bus
+// (Peugeot: CVM D409 187x no reply, PG-p13), but switching off for the drive would lose a camera that only starts late.
+// Misses in the first FAST_GRACE_MS after the engine START are not counted - the camera may still be booting (how long
+// it needs: NEOVERENÉ).
+#define FAST_MISS_MAX 10
+#define FAST_SLOW_MS  60000UL
+#define FAST_GRACE_MS 60000UL
+static bool fastReadTick()
+{
+  const Profile* pf = profileGet();
+  static bool wasOn;
+  static uint32_t onAt;
+  if (s_engineOn && !wasOn) onAt = millis();
+  wasOn = s_engineOn;
+  if (!pf || !pf->nFast || !s_engineOn) return false;
+  static uint32_t at[PROF_FAST_MAX];
+  static uint8_t miss[PROF_FAST_MAX], bus[PROF_FAST_MAX];
+  static bool slow[PROF_FAST_MAX];
+  uint32_t ms = millis();
+  int item = -1;
+  for (uint8_t i = 0; i < pf->nFast && item < 0; i++)
+    if (!at[i] || ms - at[i] >= (slow[i] ? FAST_SLOW_MS : pf->fast[i].everyS * 1000UL)) item = i;
+  if (item < 0) return false;
+  at[item] = ms;
+  const ProfFast& q = pf->fast[item];
+  NbRead r = {};
+  r.txId = q.tx; r.rxId = q.rx;
+  r.req[0] = 0x22; r.req[1] = q.did >> 8; r.req[2] = q.did & 0xFF; r.reqLen = 3;
+  static uint8_t resp[NB_READ_MAX];
+  int len = 0, res = NBR_NO_REPLY;
+  uint8_t nrc = 0;
+  for (int k = 0; k < 2; k++) {
+    uint8_t b = bus[item] ? (k ? 0 : bus[item]) : q.buses[k];
+    if (!b) break;
+    r.bus = b;
+    lastStep("fast read %u bus %u", (unsigned)item, b);
+    res = busExchange(&r, resp, sizeof(resp), &len, &nrc);
+    if (res == NBR_OK || res == NBR_NRC) { bus[item] = b; break; }
+  }
+  if (res != NBR_OK || len < 3 || resp[0] != 0x62 || resp[1] != r.req[1] || resp[2] != r.req[2]) {
+    bool counts = res == NBR_NO_REPLY || (res == NBR_NRC && nrc == 0x31);
+    if (counts && ms - onAt >= FAST_GRACE_MS && !slow[item] && ++miss[item] >= FAST_MISS_MAX) {
+      slow[item] = true;
+      char m[48];
+      snprintf(m, sizeof(m), "PROFIL F%u 60s %s", (unsigned)item, res == NBR_NRC ? "NRC 31" : "no reply");
+      statusLine(m);
+    }
+    return true;
+  }
+  miss[item] = 0;
+  if (slow[item]) {
+    slow[item] = false;
+    char m[32];
+    snprintf(m, sizeof(m), "PROFIL F%u %us", (unsigned)item, (unsigned)q.everyS);
+    statusLine(m);
+  }
+  uint8_t n = len - 3 > 8 ? 8 : len - 3;
+  portENTER_CRITICAL(&s_fastMux);
+  FastVal& f = s_fast[item];
+  if (n != f.n || memcmp(f.raw, resp + 3, n)) { memcpy(f.raw, resp + 3, n); f.n = n; f.chg++; }
+  portEXIT_CRITICAL(&s_fastMux);
+  return true;
+}
+
 void readTick()
 {
   scanAutoTick();                           // p86 loop: start at engine START, stop at STOP
@@ -1942,7 +2023,10 @@ void readTick()
   if (vinTick()) return;                    // PG233
   NbRead r;
   uint32_t seq;
-  if (!nbReadTake(&r, &seq)) { if (!obdTick()) autoReadTick(); return; }   // PG277: OBD only without a profile
+  if (!nbReadTake(&r, &seq)) {                // PG277: OBD only without a profile; PG319: fast reads before the round
+    if (!obdTick() && !fastReadTick()) autoReadTick();
+    return;
+  }
   static uint8_t resp[NB_READ_MAX];
   int len = 0;
   uint8_t nrc = 0;

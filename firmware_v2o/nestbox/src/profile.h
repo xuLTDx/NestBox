@@ -15,6 +15,13 @@
 //                                                       field >= 0: the rules of one pid go together (u32n)
 //   U  <number> <tx> <rx> <buses> <dids>                a UDS 22 read; buses "-" = switched off, the number stays
 //   O  <tx> <rx> <buses> <obd pid> <pid> <every s>      an OBD 01 question while the engine runs, raw data bytes
+//   F  <tx> <rx> <buses> <did> <pid> <every s>          PG319: a UDS 22 read of its own pace (>= 1 s) while the engine
+//                                                       runs; the answer bytes after the DID go raw as <pid> once after
+//                                                       each change (not in every record)
+//      Why (Vojtech 24.11.2026 "319 áno"): the camera's speed-limit reading (Toyota K0: CVM 74A->64A D409 = SLI value km/h,
+//      flags, distance x20 m - Diagbox 2024) must be seen within a second of a change; a U line is asked only every
+//      "E" seconds with all the others (>= 10 s, profile.cpp: a 10 s floor keeps 22 reads from filling the bus), a
+//      server READ takes ~7 s per answer (17.11. sli_reads.txt). One single-frame request + answer per second is light.
 //
 // A new profile is stored at once but used from the next start of the box (after a sleep / restart) - swapping the
 // tables while the CAN task decodes would need a lock on every frame; profiles change rarely.
@@ -25,6 +32,12 @@
 #define PROF_CAN_MAX 48
 #define PROF_UDS_MAX 32
 #define PROF_OBD_MAX 16
+#define PROF_FAST_MAX 4                // PG319: a few fast reads only - each costs one bus exchange per its period
+struct ProfFast {
+  uint32_t tx, rx;
+  uint16_t did, pid, everyS;
+  uint8_t buses[2];
+};
 
 struct ProfCan {
   uint32_t id, mask, inv;
@@ -52,10 +65,11 @@ struct Profile {
   uint8_t motorNb, motorBytes[4];
   float motorMult;
   uint16_t udsEveryS;
-  uint8_t nCan, nUds, nObd;
+  uint8_t nCan, nUds, nObd, nFast;
   ProfCan can[PROF_CAN_MAX];
   ProfUds uds[PROF_UDS_MAX];
   ProfObd obd[PROF_OBD_MAX];
+  ProfFast fast[PROF_FAST_MAX];
 };
 
 void profileBegin();                                  // setup(), after the file system (telemetryEarly)
