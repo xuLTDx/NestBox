@@ -31,6 +31,7 @@
 #define STANDBY_REPORT_GPS_S   150        // max wait for a fix in the parked report
 #define STANDBY_REPORT_SEND_S  60         // max wait for the delivery after the record
 #define STANDBY_OTA_WAIT_MS    180000UL   // a running OTA download delays the sleep at most this
+#define STANDBY_SNIFFUP_WAIT_MS 1200000UL // PG340: sending a sniff on WiFi delays the sleep at most this (20 min, Vojtech 24.11.2026)
 #define STANDBY_ULP_PERIOD_US  200000     // ULP measures every 200 ms
 #ifndef STANDBY_AUTO
 #define STANDBY_AUTO 1                    // automatic sleep: on again 27.10.2026 (D8) - ULP wake fixed (p64/p65) and verified in the Passat

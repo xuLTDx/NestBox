@@ -28,6 +28,7 @@ void sniffStopNow();
 bool sniffActive();
 uint16_t sniffMinutesLeft();
 uint32_t sniffFileNo();
+bool sniffWriting();                     // PG340: the file sniffFileNo() is open (being written)
 void sniffCloseForRestart();
 int sniffPurgeOld(time_t now);
 void sniffSetSdLimit(int pct);

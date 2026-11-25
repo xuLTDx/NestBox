@@ -84,6 +84,13 @@ static volatile bool s_refused;
 static bool s_tasksMade;
 
 static Preferences s_prefs;                  // namespace "sniff"
+// PG340 (Vojtech 24.11.2026): the session file is closed when CAN1 is quiet (car off) and a new one is opened at the
+// next CAN1 frame. Why: the box sends closed sniff files to the server by itself when on WiFi (ota.cpp sniffUpTick);
+// without the split the file of the drive that just ended stays open until the sleep and would be sent only at the
+// next boot on WiFi - the drive the user wants to see waits a day or more. Removing it = the last drive is sent late.
+#define SNIFF_SPLIT_QUIET_MS 60000UL
+static uint32_t s_framesAtOpen;               // s_frames when the file was opened: the file holds frames if different
+static bool s_split;                          // file closed by the split, reopen at the next CAN1 frame
 
 // ---------------------------------------------------------------- queue ----
 static void pushFrame(const Frame& f)
@@ -338,6 +345,7 @@ static void openFile()
            (unsigned long)(esp_timer_get_time() / 1000));
   addLine(line);
   addLine("# format: <ms>.<us>,<bus>,<ID hex>,<s=11-bit|x=29-bit>,<dlc>,<data hex>");
+  s_framesAtOpen = s_frames;
   s_fileOk = sdwSniffOpen(path);
   nbout.printf("[SNIFF] file %s %s\n", path, s_fileOk ? "open" : "FAILED");
 }
@@ -447,6 +455,7 @@ static bool startNow(uint16_t minutes)
     if (i == 1 && s_vehicle == "Peugeot_K0") b.speedFound = true;
   }
   s_closing = false;
+  s_split = false;
   s_lastStats = millis();
   openFile();
   s_active = true;                            // before the buses: the MCP tasks push only while active
@@ -572,6 +581,22 @@ int sniffTick()
   }
   if (!s_active) return ev;
   speedTick();
+  // PG340: split the session file at a quiet CAN1 (see SNIFF_SPLIT_QUIET_MS)
+  Can1Stats cs = can1Stats();
+  uint32_t quiet = millis() - (cs.lastFrameMs ? cs.lastFrameMs : 0);
+  if (!s_split && s_fileOk && !s_closing && cs.lastFrameMs && quiet >= SNIFF_SPLIT_QUIET_MS && s_frames != s_framesAtOpen) {
+    closeFile("# split (CAN1 quiet)");
+    s_split = true;
+    nbout.printf("[SNIFF] %s closed (CAN1 quiet %lu s) - the next CAN1 frame opens a new file\n", s_path,
+                 (unsigned long)(quiet / 1000));
+  } else if (s_split && s_fileOk && s_closing && !sdwSniffOpenNow()) {
+    s_fileOk = false;                         // the writer finished the close later than closeFile() waited
+    s_closing = false;
+  } else if (s_split && !s_fileOk && quiet < SNIFF_SPLIT_QUIET_MS) {
+    s_split = false;
+    s_lastStats = millis();
+    openFile();
+  }
   if (millis() - s_minuteMs >= 60000) {
     s_minuteMs += 60000;
     if (s_minLeft) s_minLeft--;
@@ -588,6 +613,7 @@ int sniffTick()
 bool sniffActive() { return s_active; }
 uint16_t sniffMinutesLeft() { return s_active ? s_minLeft : 0; }
 uint32_t sniffFileNo() { return s_fileNo; }
+bool sniffWriting() { return s_active && s_fileOk; }   // PG340: S<sniffFileNo()> is open now - not to be sent
 
 // ----------------------------------------------------------------- web ---
 int sniffStatus(char* buf, int size)

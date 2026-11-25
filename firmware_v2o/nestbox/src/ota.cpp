@@ -23,6 +23,8 @@
 extern const char FW_BUILD_STR[];
 #include "wifiplaces.h"
 #include "standby.h"
+#include "sniff.h"
+#include <Preferences.h>
 extern nvs_handle_t nvs;
 void logNetEvent(const char* text);
 void prepareRestart(const char* why);
@@ -169,7 +171,7 @@ static void udpDiagNote(const char* text)
 struct OtaConn {
   virtual bool connect(const char* host, uint16_t port) = 0;
   virtual void write(const char* s) = 0;
-  virtual void writeRaw(const uint8_t* d, int n) = 0;   // PG49: a POST body
+  virtual int writeRaw(const uint8_t* d, int n) = 0;    // PG49: a POST body; PG340: returns the bytes written
   virtual int read(uint8_t* buf, int cap, unsigned int timeoutMs) = 0;   // >0, 0 closed, -1 timeout
   virtual void stop() = 0;
   virtual ~OtaConn() {}
@@ -211,7 +213,7 @@ struct WifiConn : OtaConn {
     return false;
   }
   void write(const char* s) override { c.print(s); }
-  void writeRaw(const uint8_t* d, int n) override { c.write(d, n); }
+  int writeRaw(const uint8_t* d, int n) override { return (int)c.write(d, n); }
   int read(uint8_t* buf, int cap, unsigned int timeoutMs) override {
     uint32_t t = millis();
     while (!c.available() && c.connected() && millis() - t < timeoutMs) delay(2);
@@ -783,6 +785,162 @@ static void logTick()
   if (s_logTries >= LOG_TRIES) logEnd(m); else otaLog(m);
 }
 
+// ---- PG340 (Vojtech 24.11.2026 „box je na wifi posiela sniff bodka“): closed sniff files to the OTA server --------
+// Why: the server pulled sniffs from the box's local web on a cron (cardata/fetch.py) - guesswork: the box sleeps 5 min
+// after CAN1 goes quiet, the cron saw the WiFi up to 5 min late, a 50-75 MB drive (~5-8 min at 170 kB/s) was cut and
+// started again from 0 next time - a drive could never arrive. Now the box sends by itself on WiFi (never over the modem):
+// the unfinished file first, then the others oldest first, nothing skipped. POST .../sniff?file=<n>&off=<o>&size=<s>:
+// an empty body asks what the server has ("next="), a body is appended from off - the server keeps every byte it got,
+// also of a cut POST, so a break goes on from there (same answer as LOG, PG49). NVS "snup"/"done" = every file up to
+// that number is on the server whole (the server checked the size). The file stays on SD (60-day purge as before).
+// Not while the sniff writes (SD load, rule 8 car days) nor during an OTA download / LOG upload. Standby waits for it
+// at most STANDBY_SNIFFUP_WAIT_MS (standby.cpp). Status lines: "SNIFF-UP S<n> start <off>/<size>",
+// "SNIFF-UP S<n> OK <size> B <s> s", "SNIFF-UP S<n> ERR <what> @<off>".
+#define SNUP_POST_MAX  (1024UL * 1024UL)   // one POST (the server writes as it reads)
+#define SNUP_PIECE     16384               // one SD read
+#define SNUP_RETRY_MS  30000UL
+#define SNUP_SCAN_MS   300000UL            // nothing to send: look at /SNIFF again after this (or at a split)
+static Preferences s_snPrefs;
+static uint8_t* s_snBuf;
+static uint32_t s_snFile, s_snSize, s_snOff, s_snAt, s_snWait, s_snT0, s_snDone, s_snSeenNo;
+static uint16_t s_snErrs;
+static bool s_snProbe, s_snPrefsOk;
+static volatile bool s_snBusy;
+bool otaSniffUpBusy() { return s_snBusy; }
+
+// the oldest file above s_snDone that is not being written; 0 = none. An SD with lower numbers only (new card) restarts.
+static uint32_t sniffUpPick(uint32_t* size)
+{
+  uint32_t best = 0, bestSize = 0, maxNo = 0;
+  uint32_t open = sniffWriting() ? sniffFileNo() : 0;
+  sdLock();
+  File dir = SD.open("/SNIFF");
+  File f;
+  while (dir && (f = dir.openNextFile())) {
+    const char* fn = f.name();
+    const char* p = strrchr(fn, '/');
+    if (p) fn = p + 1;
+    uint32_t no = fn[0] == 'S' ? (uint32_t)atoi(fn + 1) : 0;
+    if (no > maxNo) maxNo = no;
+    if (no && no > s_snDone && no != open && (!best || no < best)) { best = no; bestSize = f.size(); }
+    f.close();
+  }
+  if (dir) dir.close();
+  sdUnlock();
+  if (maxNo && maxNo < s_snDone) {           // another card: its numbers start again
+    s_snDone = 0;
+    s_snPrefs.putUInt("done", 0);
+    return 0;                                 // the next scan picks from 0
+  }
+  *size = bestSize;
+  return best;
+}
+
+// one POST: probe (n = 0) or up to SNUP_POST_MAX bytes from s_snOff streamed from SD; -1 no connection
+static int sniffUpPost(uint32_t n, String* answer)
+{
+  OtaConn& c = s_wc;
+  c.rn = c.rp = 0;
+  if (!c.connect(s_host, s_port)) return -1;
+  char req[400];
+  snprintf(req, sizeof(req), "POST /api/nestbox/ota/%s/sniff?file=%u&off=%u&size=%u HTTP/1.1\r\nHost: %s\r\n"
+           "Content-Type: application/octet-stream\r\nContent-Length: %u\r\nConnection: close\r\n\r\n",
+           s_token, (unsigned)s_snFile, (unsigned)s_snOff, (unsigned)s_snSize, s_host, (unsigned)n);
+  c.write(req);
+  if (n) {
+    char path[32];
+    snprintf(path, sizeof(path), "/SNIFF/S%u.LOG", (unsigned)s_snFile);
+    uint32_t sent = 0;
+    sdLock();
+    File f = SD.open(path, FILE_READ);
+    bool ok = f && f.seek(s_snOff);
+    sdUnlock();
+    int fail = ok ? 0 : -2;
+    while (!fail && sent < n) {
+      uint32_t want = n - sent < SNUP_PIECE ? n - sent : SNUP_PIECE;
+      sdLock();                               // only around the read: the record / sniff writers go between pieces
+      int got = f.read(s_snBuf, want);
+      sdUnlock();
+      if (got <= 0) fail = -2;                // SD read: the server keeps what it got
+      else if (c.writeRaw(s_snBuf, got) != got) fail = -3;   // connection lost: the server keeps what it got
+      else sent += got;
+    }
+    sdLock();
+    if (f) f.close();
+    sdUnlock();
+    if (fail) { c.stop(); return fail; }
+  }
+  String status = c.line(OTA_TIMEOUT_MS);
+  int code = status.length() > 12 ? status.substring(9, 12).toInt() : 0;
+  for (;;) {
+    String h = c.line(OTA_TIMEOUT_MS);
+    if (h.length() <= 1) break;
+  }
+  if (answer) *answer = readAll(c);
+  c.stop();
+  return code;
+}
+
+static void sniffUpTick()
+{
+  if (!s_snPrefsOk) { s_snPrefsOk = s_snPrefs.begin("snup", false); s_snDone = s_snPrefs.getUInt("done", 0); }
+  bool can = telemetryWifiForData() && s_token[0] && !s_retryAt && !s_staged && !s_logReq;
+  if (!can || sniffWriting()) { s_snBusy = false; return; }   // not while the sniff writes (SD load); its split ends that
+  uint32_t openNo = sniffWriting() ? sniffFileNo() : 0;   // a split (file closed) or a new file = look again at once
+  if (s_snAt && millis() - s_snAt < s_snWait && !(!s_snFile && openNo != s_snSeenNo)) return;
+  s_snAt = millis();
+  char m[96];
+  if (!s_snFile) {
+    s_snSeenNo = openNo;
+    s_snFile = sniffUpPick(&s_snSize);
+    s_snWait = SNUP_SCAN_MS;
+    if (!s_snFile) { s_snBusy = false; return; }
+    s_snProbe = true;
+    s_snErrs = 0;
+    s_snT0 = millis();
+  }
+  if (!s_snBuf) s_snBuf = (uint8_t*)ps_malloc(SNUP_PIECE);
+  if (!s_snBuf) { s_snWait = SNUP_RETRY_MS; return; }
+  s_snBusy = true;
+  WifiLink::makeDefault();                    // PG96: WiFi only, never the modem
+  uint32_t n = s_snProbe ? 0 : (s_snSize - s_snOff < SNUP_POST_MAX ? s_snSize - s_snOff : SNUP_POST_MAX);
+  String answer;
+  int code = sniffUpPost(n, &answer);
+  int k = answer.indexOf("next=");
+  if (code == 200 && k >= 0) {
+    uint32_t next = (uint32_t)answer.substring(k + 5).toInt();
+    if (s_snProbe) {
+      snprintf(m, sizeof(m), "SNIFF-UP S%u start %u/%u", (unsigned)s_snFile, (unsigned)next, (unsigned)s_snSize);
+      if (next < s_snSize) otaLog(m);
+    }
+    s_snProbe = false;
+    s_snOff = next;
+    s_snErrs = 0;
+    s_snWait = 0;
+    if (s_snOff >= s_snSize) {
+      if (s_snSize > 0 && millis() - s_snT0 > 1000) {
+        snprintf(m, sizeof(m), "SNIFF-UP S%u OK %u B %u s", (unsigned)s_snFile, (unsigned)s_snSize,
+                 (unsigned)((millis() - s_snT0) / 1000));
+        otaLog(m);
+      }
+      s_snDone = s_snFile;
+      s_snPrefs.putUInt("done", s_snDone);
+      s_snFile = 0;
+      s_snBusy = false;
+    }
+    return;
+  }
+  // an error: ask the server again what it has, then go on from there (nothing is sent twice in a row)
+  s_snProbe = true;
+  s_snWait = SNUP_RETRY_MS;
+  if (++s_snErrs == 1 || s_snErrs % 10 == 0) {
+    snprintf(m, sizeof(m), "SNIFF-UP S%u ERR %s%d @%u x%u", (unsigned)s_snFile,
+             code == -2 ? "sd" : code == -3 ? "send" : code == -1 ? "conn" : "http=", code < 0 ? 0 : code,
+             (unsigned)s_snOff, (unsigned)s_snErrs);
+    otaLog(m);
+  }
+}
+
 static void otaTask(void*)
 {
   uint32_t last = 0;
@@ -811,6 +969,7 @@ static void otaTask(void*)
     if (s_wifiSyncReq) { s_wifiSyncReq = false; placesSync(true, true); }   // PG296: even during a paused download
     if (!s_retryAt && !s_staged) placesSync(false);   // PG205: the WiFi list on its own clock; not during a firmware download
     if (!s_staged || !flashAllowed()) logTick();   // PG49
+    sniffUpTick();                              // PG340
     CellLink* cell = telemetryCellLink();     // p71
     if (cell && !cell->udpDiag) cell->udpDiag = udpDiagNote;
     if (cell && s_dCount && s_token[0] && !telemetryWifiForData() && millis() - s_dAt > 20000) {

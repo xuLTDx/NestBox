@@ -27,3 +27,4 @@ int otaStatus(char* buf, int size);  // web
 bool otaSet(const char* key, const char* value);   // OTA_TOKEN / OTA_HOST / OTA_PORT
 // PG49: SD data file <file> (0 = the current one) from byte <from> to the OTA server; false = one runs already
 bool otaLogRequest(uint32_t file, uint32_t from);
+bool otaSniffUpBusy();               // PG340: a sniff file is being sent on WiFi (standby waits, max 20 min)

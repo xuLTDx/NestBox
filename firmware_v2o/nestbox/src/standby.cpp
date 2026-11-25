@@ -90,7 +90,7 @@ static float s_battV;
 static char s_wake[48] = "-";
 static char s_ulpStats[56];                   // p62: the last sleep's ULP counters ("" = no ULP sleep)
 static bool s_parked;
-static uint32_t s_otaWaitSince, s_reportAt, s_recAt;
+static uint32_t s_otaWaitSince, s_reportAt, s_recAt, s_snupWaitSince;
 static bool s_reportFix, s_reportRecDone;
 static bool s_lowOn;                   // PG148: 12 V under ENGINE_OFF_VOLTAGE since s_lowSince without a break
 static uint32_t s_lowSince;
@@ -490,6 +490,12 @@ void standbyTick()
   if (otaBusy()) {
     if (!s_otaWaitSince) s_otaWaitSince = millis();
     if (millis() - s_otaWaitSince < STANDBY_OTA_WAIT_MS) return;
+  }
+  // PG340: a sniff file being sent on WiFi (ota.cpp sniffUpTick) - at most STANDBY_SNIFFUP_WAIT_MS, then sleep anyway;
+  // the rest goes at the next WiFi. Why: Vojtech 24.11.2026 - a drive's sniff (50-75 MB, ~5-8 min) must arrive.
+  if (otaSniffUpBusy()) {
+    if (!s_snupWaitSince) s_snupWaitSince = millis();
+    if (millis() - s_snupWaitSince < STANDBY_SNIFFUP_WAIT_MS) return;
   }
   goStandby();
 }
