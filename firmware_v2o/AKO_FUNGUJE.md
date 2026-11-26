@@ -125,8 +125,14 @@ Zaradiť príkaz: /home/claude/Claude/fn_db/cmd.sh <box> '<príkaz>'.
 | tankovanie | FleetNest zo skoku 0x54E / D8C4 | priamy signál nenájdený (0x432 vyradené) |
 | palivo litre, spolujazdec, servis, olej | len čítaním (UDS) | na zbernici nenájdené (spolujazdec najlepšie 92 %) |
 | motor beží – všetky vetvy | profil M + K0 0x208 | popis vetiev telemetryEngineOn v tomto dokumente chýba |
-| CAN prebehy | – | PG308 overiť na novom builde |
+| CAN1 overrun (prebehy) | PG308 nasadené (LASTPOS max 5 min za jazdy) – opakovaní menej, nezmizlo | ďalší podozriví: TXQ_CUR NVS každých 30 s, TWAI ISR mimo IRAM; overiť jazdou na builde 25.11. (riadok 6a) |
 | CAN3 | – | PG317 LS.CAR (zásah do káblov) |
+
+## 6a. Čo sa riešilo a čo je vyriešené (dátum, dôkaz; zatvára len Vojtech)
+| vec | čo sa spravilo | výsledok (overené) | stav |
+|---|---|---|---|
+| CAN1 overrun PG307/PG308 | 23.11.: rozbor Claude/can_overrun/ROZBOR.md – HW RX FIFO TWAI (~5 rámcov) sa plní, keď je cache vypnutá pri zápise do flash (ISR nie je v IRAM); najviac pri OTA zápise (+211, +187). PG308 (5714041, build 23.11. 14:43:42): LASTPOS do NVS max raz za 5 min za jazdy (predtým každých 50 m). Na J0 od 24.11. 09:19 (b22). | DB 0x399: pred PG308 po štarte +14..+29, potom x1–x4 / 10 min; po PG308 (b24–b26) po štarte +23..+30, potom x1 / 10 min; počas OTA x22; missed +144 raz (b25). Menej, nezmizlo. | čiastočne – otvorené PG308 |
+| PG340 sniffy posiela box sám | firmvér 430a503 (build Nov 25 2026 00:17:18), nestbox-ota 2.8.0 d85c0ee, cardata receive.py (oprava „už máme“ 25.11.), sniffy.py (párovanie b73) | 25.11. 12:05–12:09 J0 poslal 32 chýbajúcich sniffov, 14:29–14:30 2Z S1–S10; všetky na serveri, u mňa, na NAS; na J0 aj 2Z SD nič neposlané neostalo | funguje na malých súboroch; veľký súbor z jazdy NEOVERENÝ |
 
 ## 7. Plán (poradie podľa dohody; uzatvára len Vojtech)
 1. PG340: inštalácia nestbox-ota 2.8.0 (sudo ultd) → príjem sniffov na serveri (cardata-sniff.path, seed) → OTA J0 (PG342, vlastné áno) → prvý príchod na uLTD_ext overí posielanie.
@@ -134,5 +140,5 @@ Zaradiť príkaz: /home/claude/Claude/fn_db/cmd.sh <box> '<príkaz>'.
 3. PG305: 26.11. otázka prepnúť Peugeot na v2o_a3.
 4. AdBlue mierka pri najbližšom doliatí so známym množstvom.
 5. PG304 / PG327 značky a limit z vyhodnotenia sniffov.
-7. U9K2652Z (2Z): zatiaľ vypnutý; pri zapnutí si stiahne posledný build v2o_a3 - Vojtech 25.11.: v poriadku (vlastný profil), na 2Z sa ešte bude robiť diag a sniff.
+7. U9K2652Z (2Z): Vojtech 25.11.: v poriadku, že má build v2o_a3 (vlastný profil), na 2Z sa ešte bude robiť diag a sniff. 25.11. 14:27 zapnutý na zdroji (NTLIRIS 192.168.0.33), 14:28 OTA na build Nov 25 2026 00:17:18 (VALID 14:28:54, b1048), 14:29-14:30 poslal S1-S10 (najväčší S7 688525 B za 5 s), na boxe mu nič neostalo. J0 od 25.11. 14:28 v Toyote (b30, cell online). Plán (Vojtech 26.11. „zajtra asi“): 2Z do Caddy 27.11. - jazda + SNIFF (zapnem cmd.sh, keď napíše že jazdí); overiť čítanie profilu 2K, DID 1018 za jazdy, READ 02BD; Launch dvere + motor podľa odpovede (2K_TABULKA.md).
 6. Z PROJEKT_STAV.md 6 (otvorené dlhšie): PG222 mazanie potvrdených /DATA pri plnej SD, box bez SIM, šifrovanie flash/NVS, ACK test v aute, CELL REG LOST v aute, OTA cez cell v aute.
