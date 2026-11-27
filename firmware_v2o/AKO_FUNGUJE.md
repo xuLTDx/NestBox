@@ -4,7 +4,7 @@ Vojtech 24.11.2026: „Ako nechceš si takéto informácie niekde popísať? Čo
 odbočkami, podmienkami + čo máme zistené, čo sa rieši.“ Toto je JEDINÝ popis aktuálneho správania (NAVRH.md = história
 návrhov, LOGIKA.mmd = stav 18.10., zastaraný). Pri každej zmene firmvéru sa upraví TU, v tom istom commite.
 Zdroj: vetva v2o-arduino3, worktree /home/claude/Claude/nestbox_a3, súbory firmware_v2o/nestbox/src/. Riadky = stav 24.11.2026.
-Na J0 beží build Nov 27 2026 14:28:13 (OTA VALID 27.11. 14:35:59, b54; kód = tento commit).
+Na J0 beží build Nov 27 2026 14:28:13 (OTA VALID 27.11. 14:35:59, b54; commit 623cc07). Na v2o_a3: build Nov 27 2026 20:53:21.
 
 Súvisiace (čítať pred tvrdením):
 - merania (odber, napätia, časy): /home/claude/notes/MERANIA.md
@@ -66,6 +66,13 @@ webStart → wdt. loop(): web, can1Tick, readTick, sniffTick, wifiTick, instTick
 - Motor beží (profil M riadok; K0: 0x208 ×0,125 > 0; ďalšie vetvy telemetryEngineOn – v tomto popise ešte NEPREJDENÉ) → záznam každú 1 s (DRIVE_REC_MS, telemetry.cpp:79).
 - Každý záznam → SD /DATA/<n>.CSV + rad (txqueue). Zahodí sa až po ACK servera. Identita = (boot, ms od bootu).
 - Sieť: WiFi s internetom má prednosť (telemetryWifiForData), inak modem PPP.
+- Kedy WiFi „nie“ (build Nov 27 2026 20:53:21, Vojtech 27.11. „1-3 áno“): server cez WiFi mlčí (30 s bez odpovede pri
+  čakajúcich paketoch / 2 neúspešné prihlásenia / skúšobný paket každé 2 min) -> box pošle 1 ping na server CEZ MODEM
+  (telemetry.cpp wifiServerBad, netlink.cpp nbUdpProbe). Modem odpovie = cesta cez WiFi zlá -> dáta na modem
+  („NET wifi-noserver modem-ok inet=<0/1> by <probe|silent|logins>“, potom „ERR NET wifi-nointernet“). Modem tiež mlčí =
+  server dole -> ostane na WiFi, dáta čakajú v rade („NET server-silent both inet=… - stays on WiFi“, platí 2 min).
+  inet = TCP 1.1.1.1/8.8.8.8:53 cez WiFi, len informácia. Prečo: WiFi môže mať internet a blokovať náš server (port,
+  captive portal, DNS); 15:49:49 b55 „wifi-nointernet“ na hotspote s internetom. NEOVERENÉ na boxe (ping cez PPP pri WiFi).
 - Stavové riadky (PID 0x399 = 921): statusLine()/otaLog() – idú v záznamoch, v DB čitateľné cez fn_db/st.sh.
 
 ### 3.2 WiFi – kedy hľadá (main.cpp wifiSearch, 207)
@@ -91,6 +98,8 @@ každých 200 ms, zobudí pri ≥ 12,8 V; každé 3 h hlásenie zo státia (GNSS
 ### 3.5 Sniff (sniff.cpp)
 - SNIFF=1,<min> (max 1440). Minúty v NVS → pokračuje po každom štarte, kým neuplynú. Každý štart = nový /SNIFF/S<n>.LOG.
 - Počas sniffu box posiela PID 0x393 (915) = zostávajúce minúty → v DB vidno každý sniff aj bez stiahnutia.
+- Build 20:53:21: po KAŽDOM príkaze SNIFF ide 0x393 raz aj bez sniffu (0) → FleetNest potvrdí aj SNIFF=0 na už vypnutý
+  sniff. Prečo: cmd 946 27.11. SNIFF=0 o 14:32 po samovypnutí 14:29:14 → poslané 50×, expired.
 - Nezačne pri SD ≥ 70 %. Súbory staršie 60 dní (podľa „# clock unix=“) sa mažú.
 - PG340 (build Nov 25 2026 00:17:18, na J0 od 25.11. 00:27 b28): CAN1 ticho 60 s a súbor má rámce → súbor sa zavrie („# split“),
   ďalší rámec CAN1 otvorí nový → 1 súbor = 1 jazda.
@@ -107,6 +116,8 @@ zaspal 5 min po stíchnutí CAN s S62 na 13 MB zo 79 MB (12:41:20, 12:58:41, „
 Prázdny otvorený súbor neblokuje (sniffIdleNow, sniff.cpp): posiela sa, keď nie je otvorený súbor ALEBO CAN1 je ticho ≥ 60 s;
 otvorený súbor sa sám nikdy neposiela. Prečo: J0 b50 13:34 po reštarte s tichým CAN S67 s 0 rámcami -> split nikdy -> S62 neodišiel.
 DNS: mená cez lwip_getaddrinfo (netlink.cpp lwipResolve), TLS connect(ip, port, host) - nie Arduino hostByName (PANIC b48, 6a). Nová SD karta (nižšie čísla) → done=0.
+Diagnostika (build 20:53:21, dočasná): „SNIFF-UP S<n> CAN1 ov sd=+a wifi=+b other=+c @<off>“ po každom POST s prírastkom
+CAN1 overrun (SD čítanie / WiFi zápis / zvyšok). Prečo: 27.11. overrun x54/x52/x13 presne v oknách uploadu (can_overrun/ROZBOR.md).
 Server nestbox-ota 2.8.0 (/home/claude/GitHub/NestBox-OTA ota_server.py _sniff_post): /home/nestbox-ota/sniffs/
 <box>_S<n>_<veľkosť>.LOG (.part/ rozpracované) → systemd path unit claude cardata-sniff.path → cardata/receive.py.
 

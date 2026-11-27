@@ -712,7 +712,8 @@ static void makeRecord(int event = 0, time_t when = 0)
   r.i32(PID_DEVICE_TEMP, (int32_t)((temprature_sens_read() - 32) / 1.8f));
   if (telemetryWifiForData()) r.i32(PID_CSQ, WiFi.RSSI());   // PG164: the signal of the link the data uses
   else if (s_cellUp && s_csq && millis() - s_csqAt < CSQ_FRESH_MS) r.i32(PID_CSQ, s_csq);   // PG-p19: cellTask's reading
-  if (sniffActive()) r.u32(PID_SNIFF_LEFT, sniffMinutesLeft());
+  bool snDue = sniffStateDue();               // 27.11.2026: answer to every SNIFF command, also "0" (sniff.cpp)
+  if (sniffActive() || snDue) r.u32(PID_SNIFF_LEFT, sniffMinutesLeft());
   static uint32_t lastFrames;
   Can1Stats cs = can1Stats();
   r.u32(PID_CAN_FRAMES, cs.frames - lastFrames);
@@ -1418,6 +1419,42 @@ static bool bssidNow(uint8_t out[6])
   return true;
 }
 
+// 27.11.2026 (Vojtech "1 áno"): the server is silent through WiFi - where do the data go? The question is not "is
+// there internet" (a network can have internet and still block our UDP port, a captive portal, its DNS without our
+// server, or the server itself is down) but "does the server answer through the modem". One ping packet (~100 B)
+// from the PPP address (nbUdpProbe, lwIP source routing as PG204). Answer over the modem = the way through this WiFi
+// is bad -> mark it (data on the modem, WiFi asked again every WIFI_PROBE_MS). No answer over the modem either = the
+// server is down, not the WiFi -> stay on WiFi, the data wait in the queue (kept, not lost). The internet test
+// (1.1.1.1 / 8.8.8.8 over WiFi) only goes into the status line: "WiFi dead" vs "only the way to the server".
+// Why: J0 27.11. 14:00 a slow sniff upload on uLTD_ext was taken for "no internet" (server silent 51 s) and the
+// first fix (internet decides) would have kept the data on a WiFi that blocks the server.
+// true = mark the WiFi. by = which place asks (probe / silent / logins), in the status line.
+static bool wifiServerBad(const char* by)
+{
+  if (!(s_cellUp && s_cell.up())) return false;   // nowhere else to go - WiFi stays
+  // a "both silent" answer holds WIFI_PROBE_MS: with the server down the logins (every ~20 s) and the silence check
+  // (30 s) would ask the modem + the internet (up to ~14 s of netTask) and write a status line every time
+  static uint32_t bothAt;
+  if (bothAt && millis() - bothAt < WIFI_PROBE_MS) return false;
+  bothAt = 0;
+  IPAddress me;
+  int got = 0;
+  static char ans[RECV_BUF_SIZE];
+  if (me.fromString(s_cell.ip())) {
+    char pkt[160];
+    int n = s_client.eventPacket(EVENT_PING, pkt, sizeof(pkt));
+    got = nbUdpProbe((uint32_t)me, SERVER_HOST, SERVER_PORT, pkt, n, ans, sizeof(ans) - 1);
+    if (got > 0) s_client.inboundData(ans, got);  // the answer may carry a waiting command
+  }
+  bool inet = WifiLink::internetOk();
+  char m[72];
+  if (got > 0) snprintf(m, sizeof(m), "NET wifi-noserver modem-ok inet=%d by %s", inet ? 1 : 0, by);
+  else snprintf(m, sizeof(m), "NET server-silent both inet=%d by %s - stays on WiFi", inet ? 1 : 0, by);
+  statusLine(m);
+  if (got <= 0) bothAt = millis();
+  return got > 0;
+}
+
 // netTask, every pass: a new join and the end of the 30 min
 static void wifiBadTick()
 {
@@ -1444,6 +1481,7 @@ static void wifiBadTick()
       int got = WifiLink::probe(SERVER_HOST, SERVER_PORT, pkt, n, ans, sizeof(ans) - 1);
       ok = got > 0;
       if (ok) s_client.inboundData(ans, got);   // the answer may carry a waiting command
+      else if (up && !wifiServerBad("probe")) ok = true;   // 27.11.2026: the modem is silent too = the server
     }
     if (ok) {
       s_wifiBad = false;
@@ -1477,6 +1515,11 @@ static void wifiLoginResult(bool ok)
     return;
   }
   if (++s_wifiLoginFails < WIFI_BAD_LOGINS || !s_cellUp || !s_cell.up()) return;
+  // 27.11.2026: 2 failed logins = the server is silent through WiFi - the modem decides (wifiServerBad)
+  if (!wifiServerBad("logins")) {
+    s_wifiLoginFails = 0;
+    return;
+  }
   wifiMarkBad();
 }
 
@@ -1528,22 +1571,17 @@ static void netTask(void*)
     if (cur == &s_wifi && s_cellUp && s_cell.up()) {   // PG228 + PG240
       uint32_t now = millis();
       uint32_t heard = (int32_t)(s_client.lastSyncTime - linkSince) > 0 ? s_client.lastSyncTime : linkSince;
-      static uint32_t inetOkAt;                    // the last silence the internet check answered
-      // signed: inetOkAt is set after the check, later than "now" - unsigned "now - inetOkAt" wrapped and the check
+      static uint32_t askedAt;                     // the last silence the modem was asked about
+      // signed: askedAt is set after the check, later than "now" - unsigned "now - askedAt" wrapped and the check
       // ran on every pass (J0 b53 27.11.2026 14:27: "NET wifi-silent internet-ok" 5x in 7 s)
-      if (now - heard >= WIFI_SILENT_MS && txqInflight() > 0 && (!inetOkAt || (int32_t)(now - inetOkAt) >= (int32_t)WIFI_SILENT_MS)) {
-        // 27.11.2026 (Vojtech „1 áno“: „detekcia či je internet má byť overená internetom“): no server answer is
-        // not "no internet" - first a TCP connection over WiFi to 1.1.1.1:53 / 8.8.8.8:53 (5 s each). Why: J0
-        // 27.11. 14:00 at the depot, a sniff upload running on the weak uLTD_ext (the TCP upload got through),
-        // "WiFi silent 51 s" marked it no internet and moved the data to the modem. Only when both fail = marked.
-        WifiLink::makeDefault();                   // the check must go through WiFi, not through PPP
-        bool inet = tcpOk("1.1.1.1", 53) || tcpOk("8.8.8.8", 53);
-        if (inet) {
-          inetOkAt = millis();
-          nbout.printf("[NET] WiFi silent %lu s, internet ok - stays on WiFi\n", (unsigned long)((now - heard) / 1000));
-          statusLine("NET wifi-silent internet-ok");
-        } else {
-          nbout.printf("[NET] WiFi silent %lu s, no internet - back to the modem\n", (unsigned long)((now - heard) / 1000));
+      if (now - heard >= WIFI_SILENT_MS && txqInflight() > 0 && (!askedAt || (int32_t)(now - askedAt) >= (int32_t)WIFI_SILENT_MS)) {
+        // 27.11.2026 (Vojtech „1 áno“): no server answer through WiFi - the server is asked through the modem
+        // (wifiServerBad). Why: J0 27.11. 14:00 at the depot, a sniff upload running on the weak uLTD_ext (the TCP
+        // upload got through), "WiFi silent 51 s" marked it no internet and moved the data to the modem.
+        nbout.printf("[NET] WiFi silent %lu s - asking the server through the modem\n", (unsigned long)((now - heard) / 1000));
+        bool bad = wifiServerBad("silent");
+        askedAt = millis();
+        if (bad) {
           wifiMarkBad();
           continue;                                // the next pass picks the modem
         }

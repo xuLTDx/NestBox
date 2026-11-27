@@ -153,14 +153,22 @@ void WifiLink::close()
 #include <lwip/sockets.h>
 int WifiLink::probe(const char* host, uint16_t port, const char* pkt, int len, char* rx, int cap)
 {
-  if (WiFi.status() != WL_CONNECTED || len <= 0) return 0;
+  if (WiFi.status() != WL_CONNECTED) return 0;
+  return nbUdpProbe((uint32_t)WiFi.localIP(), host, port, pkt, len, rx, cap);
+}
+
+// the same packet out of any interface: src = that interface's own address (WiFi, or PPP for the modem - 27.11.2026
+// server via WiFi vs via the modem, telemetry.cpp serverViaCell)
+int nbUdpProbe(uint32_t src, const char* host, uint16_t port, const char* pkt, int len, char* rx, int cap)
+{
+  if (!src || len <= 0) return 0;
   IPAddress srv;
   if (!nbResolve(host, srv)) return 0;        // PG249
   int fd = lwip_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
   if (fd < 0) return 0;
   struct sockaddr_in me = {};
   me.sin_family = AF_INET;
-  me.sin_addr.s_addr = (uint32_t)WiFi.localIP();
+  me.sin_addr.s_addr = src;
   struct sockaddr_in to = {};
   to.sin_family = AF_INET;
   to.sin_port = htons(port);
@@ -179,4 +187,48 @@ int WifiLink::probe(const char* host, uint16_t port, const char* pkt, int len, c
   }
   lwip_close(fd);
   return got;
+}
+
+// 27.11.2026 (Vojtech "2 áno": "detekcia či je internet má byť overená internetom"): is there internet behind this
+// WiFi - a TCP connection to 1.1.1.1:53, else 8.8.8.8:53 (5 s each), from a socket bound to WiFi's address, so it
+// goes out of WiFi whatever the default route is (same source routing as probe() above). Used before a WiFi is
+// marked "no internet" on a silent server (PG204 probe, 2 failed logins): the server may be down or elsewhere while
+// the internet works. Why: J0 27.11. 15:49:49 b55 "wifi-nointernet" on the hotspot Pocof7ultra with internet.
+static bool tcpViaWifi(const char* ip)
+{
+  struct sockaddr_in me = {};
+  me.sin_family = AF_INET;
+  me.sin_addr.s_addr = (uint32_t)WiFi.localIP();
+  struct sockaddr_in to = {};
+  to.sin_family = AF_INET;
+  to.sin_port = htons(53);
+  if (!inet_aton(ip, &to.sin_addr)) return false;
+  int fd = lwip_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (fd < 0) return false;
+  bool ok = false;
+  if (lwip_bind(fd, (struct sockaddr*)&me, sizeof(me)) == 0) {
+    int fl = lwip_fcntl(fd, F_GETFL, 0);
+    lwip_fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    int r = lwip_connect(fd, (struct sockaddr*)&to, sizeof(to));
+    if (r == 0) ok = true;
+    else if (errno == EINPROGRESS) {
+      fd_set w;
+      FD_ZERO(&w);
+      FD_SET(fd, &w);
+      struct timeval tv = {5, 0};
+      if (lwip_select(fd + 1, nullptr, &w, nullptr, &tv) > 0) {
+        int err = 0;
+        socklen_t el = sizeof(err);
+        ok = lwip_getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el) == 0 && err == 0;
+      }
+    }
+  }
+  lwip_close(fd);
+  return ok;
+}
+
+bool WifiLink::internetOk()
+{
+  if (WiFi.status() != WL_CONNECTED) return false;
+  return tcpViaWifi("1.1.1.1") || tcpViaWifi("8.8.8.8");
 }

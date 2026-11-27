@@ -27,6 +27,7 @@ int sniffTick();                         // loop(): requests, speed probe, auto-
 void sniffStopNow();
 bool sniffActive();
 uint16_t sniffMinutesLeft();
+bool sniffStateDue();                    // 27.11.2026: a SNIFF command was applied - true once (record sends 0x393)
 uint32_t sniffFileNo();
 bool sniffWriting();                     // PG340: the file sniffFileNo() is open (being written)
 bool sniffIdleNow();                     // 27.11.2026: no file open or CAN1 quiet >= 60 s (upload may run)

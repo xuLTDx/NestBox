@@ -67,6 +67,7 @@ static SemaphoreHandle_t s_canMux;
 static volatile bool s_active;
 static volatile int8_t s_req = -1;
 static volatile uint16_t s_reqMin;
+static volatile bool s_stateDue;              // a SNIFF command was applied - send 0x393 once (sniffStateDue)
 static uint16_t s_minLeft;
 static uint32_t s_minuteMs;
 static uint8_t s_sinceSave;
@@ -578,6 +579,10 @@ int sniffTick()
       sniffStopNow();
       ev = SNIFF_EV_STOPPED;
     }
+    // 27.11.2026 (Vojtech "1 áno"): every SNIFF command is answered with the state in the next record, also when
+    // nothing changed. Why: J0 b54 cmd 946 SNIFF=0 at 14:32 came after the sniff had ended by itself (14:29:14,
+    // 0x393 = 0 sent once); without a sniff 0x393 is not sent, FleetNest waits for 0x393 = 0 -> sent 50x, expired.
+    s_stateDue = true;
   }
   if (!s_active) return ev;
   speedTick();
@@ -612,6 +617,7 @@ int sniffTick()
 
 bool sniffActive() { return s_active; }
 uint16_t sniffMinutesLeft() { return s_active ? s_minLeft : 0; }
+bool sniffStateDue() { bool d = s_stateDue; s_stateDue = false; return d; }
 uint32_t sniffFileNo() { return s_fileNo; }
 bool sniffWriting() { return s_active && s_fileOk; }   // PG340: S<sniffFileNo()> is open now - not to be sent
 // 27.11.2026: nothing is being written now = no file open, or CAN1 quiet >= SNIFF_SPLIT_QUIET_MS (also no frame at all

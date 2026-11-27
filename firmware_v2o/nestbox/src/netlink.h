@@ -41,4 +41,9 @@ public:
   // PG204: one packet to the server through WiFi while the modem stays the link in use; returns the bytes of the
   // server's answer in rx (0 = no answer)
   static int probe(const char* host, uint16_t port, const char* pkt, int len, char* rx, int cap);
+  static bool internetOk();          // 27.11.2026: TCP 1.1.1.1/8.8.8.8:53 out of WiFi (bound), any default route
 };
+
+// 27.11.2026: one UDP packet to the server from the interface owning address src (lwIP source routing), the answer
+// into rx; 0 = no answer in 2 x 2 s. WifiLink::probe = src WiFi; telemetry.cpp serverViaCell = src PPP.
+int nbUdpProbe(uint32_t src, const char* host, uint16_t port, const char* pkt, int len, char* rx, int cap);

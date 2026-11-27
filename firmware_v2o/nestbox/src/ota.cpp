@@ -19,6 +19,7 @@
 #include "cellmodem.h"
 #include "netlog.h"
 #include <errno.h>
+#include "canbus1.h"
 
 extern const char FW_BUILD_STR[];
 #include "wifiplaces.h"
@@ -845,8 +846,15 @@ static uint32_t sniffUpPick(uint32_t* size)
 }
 
 // one POST: probe (n = 0) or up to SNUP_POST_MAX bytes from s_snOff streamed from SD; -1 no connection
+// 27.11.2026 (Vojtech "3 áno"): CAN1 overrun during the upload - where? J0 b54 27.11.: "ERR CAN1 overrun x54/x52/x13"
+// in exactly the 10-min windows of the S66/S68/S69-S70 uploads (sniff off). The HW counter is read around every SD
+// read and every WiFi write of a POST; the rest (connect, header, server answer) = "other". One status line per POST
+// with an increase: "SNIFF-UP S<n> CAN1 ov sd=+a wifi=+b other=+c @<off>". Diagnostics - remove when the cause is known.
+static uint32_t s_ovSd, s_ovNet, s_ovAll;
 static int sniffUpPost(uint32_t n, String* answer)
 {
+  uint32_t ov0 = can1Stats().rxOverrun;
+  s_ovSd = s_ovNet = 0;
   OtaConn& c = s_wc;
   c.rn = c.rp = 0;
   if (!c.connect(s_host, s_port)) return -1;
@@ -866,12 +874,16 @@ static int sniffUpPost(uint32_t n, String* answer)
     int fail = ok ? 0 : -2;
     while (!fail && sent < n) {
       uint32_t want = n - sent < SNUP_PIECE ? n - sent : SNUP_PIECE;
+      uint32_t o1 = can1Stats().rxOverrun;
       sdLock();                               // only around the read: the record / sniff writers go between pieces
       int got = f.read(s_snBuf, want);
       sdUnlock();
+      uint32_t o2 = can1Stats().rxOverrun;
+      s_ovSd += o2 - o1;
       if (got <= 0) fail = -2;                // SD read: the server keeps what it got
       else if (c.writeRaw(s_snBuf, got) != got) fail = -3;   // connection lost: the server keeps what it got
       else sent += got;
+      s_ovNet += can1Stats().rxOverrun - o2;
     }
     sdLock();
     if (f) f.close();
@@ -886,6 +898,7 @@ static int sniffUpPost(uint32_t n, String* answer)
   }
   if (answer) *answer = readAll(c);
   c.stop();
+  s_ovAll = can1Stats().rxOverrun - ov0;
   return code;
 }
 
@@ -924,6 +937,11 @@ static void sniffUpTick()
   uint32_t n = s_snProbe ? 0 : (s_snSize - s_snOff < SNUP_POST_MAX ? s_snSize - s_snOff : SNUP_POST_MAX);
   String answer;
   int code = sniffUpPost(n, &answer);
+  if (s_ovAll) {                              // 27.11.2026 diagnostics (sniffUpPost)
+    snprintf(m, sizeof(m), "SNIFF-UP S%u CAN1 ov sd=+%u wifi=+%u other=+%u @%u", (unsigned)s_snFile, (unsigned)s_ovSd,
+             (unsigned)s_ovNet, (unsigned)(s_ovAll - s_ovSd - s_ovNet), (unsigned)s_snOff);
+    otaLog(m);
+  }
   int k = answer.indexOf("next=");
   if (code == 200 && k >= 0) {
     uint32_t next = (uint32_t)answer.substring(k + 5).toInt();
