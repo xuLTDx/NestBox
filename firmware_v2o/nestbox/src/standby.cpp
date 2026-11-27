@@ -493,7 +493,9 @@ void standbyTick()
   }
   // PG340: a sniff file being sent on WiFi (ota.cpp sniffUpTick) - at most STANDBY_SNIFFUP_WAIT_MS, then sleep anyway;
   // the rest goes at the next WiFi. Why: Vojtech 24.11.2026 - a drive's sniff (50-75 MB, ~5-8 min) must arrive.
-  if (otaSniffUpBusy()) {
+  // Not with a low battery (s_battLvl, PG260): the sniff waits for the next parking - Vojtech 27.11.2026 "1 oprav"
+  // after J0 "ERR BATT low 12.10V parked 44h" the same day (20 min awake = 0,03-0,06 Ah, MERANIA.md 0,1-0,17 A).
+  if (otaSniffUpBusy() && !s_battLvl) {
     if (!s_snupWaitSince) s_snupWaitSince = millis();
     if (millis() - s_snupWaitSince < STANDBY_SNIFFUP_WAIT_MS) return;
   }

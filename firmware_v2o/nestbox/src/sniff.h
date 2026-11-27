@@ -29,6 +29,7 @@ bool sniffActive();
 uint16_t sniffMinutesLeft();
 uint32_t sniffFileNo();
 bool sniffWriting();                     // PG340: the file sniffFileNo() is open (being written)
+bool sniffIdleNow();                     // 27.11.2026: no file open or CAN1 quiet >= 60 s (upload may run)
 void sniffCloseForRestart();
 int sniffPurgeOld(time_t now);
 void sniffSetSdLimit(int pct);

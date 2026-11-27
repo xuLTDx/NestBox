@@ -20,6 +20,7 @@ bool WifiLink::up() { return WiFi.status() == WL_CONNECTED; }
 #include <esp_netif.h>
 #include <lwip/dns.h>
 #include <lwip/tcpip.h>
+#include <lwip/netdb.h>
 static uint32_t s_wifiDns[2];
 
 void WifiLink::saveDns()
@@ -64,12 +65,34 @@ static IPAddress s_resIp;
 static char s_resHost[64];
 static uint32_t s_resAt;
 static bool s_resFresh;                       // the remembered address may be used without DNS
+// 27.11.2026: the name -> IPv4 through lwIP's own getaddrinfo (thread safe: the lookup runs in the tcpip thread),
+// NOT Arduino WiFi/Network.hostByName. Why: hostByName calls dns_clear_cache() without the lwIP core lock whenever an
+// interface got / lost its IP (NetworkManager.cpp:84, Arduino 3.3.11); with an SNTP DNS query pending its callback
+// asserts "Required to lock TCPIP core" -> PANIC (J0 b48 27.11.2026 13:03, coredump K48; b85 16.11. the same chain,
+// PG263). getaddrinfo never clears the cache. Removing it = that panic again on every WiFi / modem change.
+static bool lwipResolve(const char* host, IPAddress& out)
+{
+  if (out.fromString(host)) return true;
+  struct addrinfo hints;
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_STREAM;
+  struct addrinfo* res = nullptr;
+  if (lwip_getaddrinfo(host, "0", &hints, &res) != 0 || !res) return false;
+  bool ok = false;
+  if (res->ai_family == AF_INET) {
+    uint32_t a = ((struct sockaddr_in*)res->ai_addr)->sin_addr.s_addr;
+    if (a) { out = IPAddress(a); ok = true; }
+  }
+  lwip_freeaddrinfo(res);
+  return ok;
+}
 bool nbResolve(const char* host, IPAddress& ip)
 {
   bool same = s_resAt && !strcmp(host, s_resHost);
   if (same && s_resFresh && millis() - s_resAt < RESOLVE_KEEP_MS) { ip = s_resIp; return true; }
   IPAddress got;
-  if (WiFi.hostByName(host, got) && (uint32_t)got != 0) {
+  if (lwipResolve(host, got)) {
     s_resIp = got;
     snprintf(s_resHost, sizeof(s_resHost), "%s", host);
     s_resAt = millis() | 1;
@@ -81,6 +104,7 @@ bool nbResolve(const char* host, IPAddress& ip)
   return false;
 }
 void nbResolveForget() { s_resFresh = false; }
+bool nbResolveNow(const char* host, IPAddress& ip) { return lwipResolve(host, ip); }   // no cache (NETCHK)
 
 bool WifiLink::open(const char* host, uint16_t port)
 {

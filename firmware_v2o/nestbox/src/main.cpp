@@ -508,7 +508,11 @@ static void wifiScanDone(int n)
     String ssid = WiFi.SSID(i);
     bool hit = false;
     for (int k = 0; !hit && wifiPlaceGet(k, &cand); k++)
-      hit = ssid == cand.ssid && (nets == 2 || wifiPlaceHolds(cand, lat, lng));
+      // 27.11.2026 (Vojtech „2 áno“): at a place (nets 1) every known network may win, the strongest one - not only
+      // the place's own. Why: J0 in the Toyota at the depot saw uLTD_ext -82..-88 dBm (sniff upload 46 kB/s, TLS
+      // fails) and the phone hotspot Pocof7ultra of the list at -31..-55 dBm, but tried only uLTD_ext. Away from
+      // every place (nets 0) the box still does not search at all.
+      hit = ssid == cand.ssid && (nets == 2 || nets == 1);
     if (!hit) continue;
     bool skip = telemetryWifiSkip(WiFi.BSSID(i)) || wifiSkipped(cand.ssid);   // PG239 / PG241
     // PG257 (15.11.2026, Vojtech "257 ano"): never "another" network = the access point the box is on. Why: bench

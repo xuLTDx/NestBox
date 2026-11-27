@@ -4,7 +4,7 @@ Vojtech 24.11.2026: „Ako nechceš si takéto informácie niekde popísať? Čo
 odbočkami, podmienkami + čo máme zistené, čo sa rieši.“ Toto je JEDINÝ popis aktuálneho správania (NAVRH.md = história
 návrhov, LOGIKA.mmd = stav 18.10., zastaraný). Pri každej zmene firmvéru sa upraví TU, v tom istom commite.
 Zdroj: vetva v2o-arduino3, worktree /home/claude/Claude/nestbox_a3, súbory firmware_v2o/nestbox/src/. Riadky = stav 24.11.2026.
-Na J0 beží build Nov 25 2026 00:17:18 (OTA VALID 25.11. 00:27:17, b28; kód 1c6fae6 + PG340 necommitnuté).
+Na J0 beží build Nov 27 2026 14:28:13 (OTA VALID 27.11. 14:35:59, b54; kód = tento commit).
 
 Súvisiace (čítať pred tvrdením):
 - merania (odber, napätia, časy): /home/claude/notes/MERANIA.md
@@ -99,7 +99,14 @@ každých 200 ms, zobudí pri ≥ 12,8 V; každé 3 h hlásenie zo státia (GNSS
 ota.cpp sniffUpTick (v otaTask): podmienky = WiFi s internetom, OTA token, nebeží OTA sťahovanie ani LOG, sniff práve
 nezapisuje. Vyberie najstarší S<n> nad NVS snup/done (rozpracovaný je vždy ten najstarší). Prázdny POST = „čo máš“
 (next=), potom POST po 1 MB od next (zo SD po 16 KB). Server nechá všetko, čo prišlo (aj prerušené). Celý → done=n,
-„SNIFF-UP S<n> OK <B> <s> s“. Chyba → za 30 s znova sa spýta. Nová SD karta (nižšie čísla) → done=0.
+„SNIFF-UP S<n> OK <B> <s> s“. Chyba → za 30 s znova sa spýta.
+Oprava 27.11. (Vojtech „1 oprav“; build Nov 27 2026 13:42:14 na v2o_a3, spolu s DNS a prázdnym súborom nižšie): rozposlaný súbor drží „posielam“ (spánok čaká) aj keď WiFi chvíľu vypadne
+alebo je označená bez internetu, najviac 5 min od posledného pokusu (SNUP_HOLD_MS; mimo WiFi box nečaká); medzi dvoma
+súbormi sa „posielam“ nezruší; pri nízkej batérii (s_battLvl) spánok na posielanie nečaká. Prečo: J0 27.11. b46/b47
+zaspal 5 min po stíchnutí CAN s S62 na 13 MB zo 79 MB (12:41:20, 12:58:41, „WiFi silent -> back to the modem“).
+Prázdny otvorený súbor neblokuje (sniffIdleNow, sniff.cpp): posiela sa, keď nie je otvorený súbor ALEBO CAN1 je ticho ≥ 60 s;
+otvorený súbor sa sám nikdy neposiela. Prečo: J0 b50 13:34 po reštarte s tichým CAN S67 s 0 rámcami -> split nikdy -> S62 neodišiel.
+DNS: mená cez lwip_getaddrinfo (netlink.cpp lwipResolve), TLS connect(ip, port, host) - nie Arduino hostByName (PANIC b48, 6a). Nová SD karta (nižšie čísla) → done=0.
 Server nestbox-ota 2.8.0 (/home/claude/GitHub/NestBox-OTA ota_server.py _sniff_post): /home/nestbox-ota/sniffs/
 <box>_S<n>_<veľkosť>.LOG (.part/ rozpracované) → systemd path unit claude cardata-sniff.path → cardata/receive.py.
 
@@ -114,6 +121,14 @@ Zaradiť príkaz: /home/claude/Claude/fn_db/cmd.sh <box> '<príkaz>'.
 - Údaje K0 zo zbernice / čítania: K0_TABULKA.md (overené, kandidáti, vyradené).
 - Odber: prevádzka 0,1–0,17 A; spánok na 12 V 0,017–0,020 A = 17–20 mA (Vojtech 25.11.; MERANIA.md).
 - Sťahovanie sniffu cez WiFi z boxu: ~170 kB/s (fetch.py 24.11., J0 na NTLIRIS).
+- J0 v Toyote na firme (27.11.): uLTD_ext len −81 až −88 dBm, box ho pod prahom preskakuje („-skip“), pripojí pri −86;
+  posielanie sniffu 46 kB/s, keď ide (12:38–12:41), potom TLS na ultd.mooo.com:6001 zlyhá po 32 s; UDP prihlásenie ide.
+  Bližšie parkovať ani ďalší AP NEDÁ (Vojtech 27.11. „Nie nedá“) -> s týmto signálom treba počítať.
+- K0: CAN1 (OBD 6/14) po vypnutí motora beží naplno (~900–3600 rámcov/s), kým auto nie je zamknuté; ticho až po zamknutí
+  (riešené skôr v chate: Peugeot motor vyp. 11:20:58, zamknuté, CAN ticho od 11:24:15; Vojtech 27.11. „to už sme riešili“).
+  ROZPOR 27.11.: J0 v Toyote, motor vyp. ~12:36:40, auto NEzamknuté (Vojtech) -> SNIFF-UP S62 start 12:38:13, t. j. CAN1 ticho
+  60 s už ~30 s po vypnutí motora bez zamknutia. Staršie sniffy J0 S30/S38/S42: posledný rámec CAN1 64-113 s po otáčkach 0.
+  Kedy K0 CAN1 stíchne (motor vyp. / zamknutie / čas) NEOVERENÉ - overiť z S62 (# split, posledné rámce) - Peugeot vs Toyota?
 
 ## 6. Čo ešte box / FleetNest NEROBÍ alebo robí len čiastočne (stav 25.11.; zdroj K0_TABULKA.md)
 | čo | dnes | čo chýba |
@@ -133,6 +148,7 @@ Zaradiť príkaz: /home/claude/Claude/fn_db/cmd.sh <box> '<príkaz>'.
 |---|---|---|---|
 | CAN1 overrun PG307/PG308 | 23.11.: rozbor Claude/can_overrun/ROZBOR.md – HW RX FIFO TWAI (~5 rámcov) sa plní, keď je cache vypnutá pri zápise do flash (ISR nie je v IRAM); najviac pri OTA zápise (+211, +187). PG308 (5714041, build 23.11. 14:43:42): LASTPOS do NVS max raz za 5 min za jazdy (predtým každých 50 m). Na J0 od 24.11. 09:19 (b22). | DB 0x399: pred PG308 po štarte +14..+29, potom x1–x4 / 10 min; po PG308 (b24–b26) po štarte +23..+30, potom x1 / 10 min; počas OTA x22; missed +144 raz (b25). Menej, nezmizlo. | čiastočne – otvorené PG308 |
 | PG340 sniffy posiela box sám | firmvér 430a503 (build Nov 25 2026 00:17:18), nestbox-ota 2.8.0 d85c0ee, cardata receive.py (oprava „už máme“ 25.11.), sniffy.py (párovanie b73) | 25.11. 12:05–12:09 J0 poslal 32 chýbajúcich sniffov, 14:29–14:30 2Z S1–S10; všetky na serveri, u mňa, na NAS; na J0 aj 2Z SD nič neposlané neostalo | funguje na malých súboroch; veľký súbor z jazdy NEOVERENÝ |
+| PANIC lwIP DNS/SNTP (PG263 a znova 27.11.) | 16.11. PG263: dns_setserver len pod LOCK_TCPIP_CORE (J0 b85, úloha net) | 27.11. 13:03–13:04 J0 b48 (build Nov 25 00:17:18, Toyota na firme, hneď po pripojení uLTD_ext pri slabom signále): ERR SYS panic IllegalInstruction ota, bt = __assert_func <- sys_untimeout <- sntp_retry <- sntp_dns_found <- dns_call_found <- dns_clear_cache (ten istý reťazec ako b85, ale úloha ota); COREDUMP 36068 + crash log C48 na SD boxu | OTVORENÉ – PRÍČINA NÁJDENÁ (coredump K48, gdb): Arduino 3.3.11 NetworkManager::hostByName (libraries/Network/src/NetworkManager.cpp:84) volá dns_clear_cache() BEZ zámku jadra lwIP, keď sa zmení „má IPv4 / IPv6“ (pripojenie / výpadok WiFi alebo PPP); ak práve čaká DNS dopyt SNTP, jeho callback -> sntp_retry -> sys_untimeout -> assert „Required to lock TCPIP core“. Volané z ota.cpp:844 sniffUpPost -> WifiConn::connect (ota.cpp:202) -> NetworkClientSecure::connect(host). Spoločná príčina s b85 (16.11.): dns_clear_cache bez zámku pri čakajúcom SNTP; PG263 opravil len naše volania. Ďalšie cesty cez hostByName: netlink.cpp:72 nbResolve, telemetry.cpp:921-922. Napätie nie (C48: bez štartu, 12 V OK; ENGINE START až v b49). Návrh opravy čaká na Vojtecha. |
 
 ## 7. Plán (poradie podľa dohody; uzatvára len Vojtech)
 1. PG340: inštalácia nestbox-ota 2.8.0 (sudo ultd) → príjem sniffov na serveri (cardata-sniff.path, seed) → OTA J0 (PG342, vlastné áno) → prvý príchod na uLTD_ext overí posielanie.

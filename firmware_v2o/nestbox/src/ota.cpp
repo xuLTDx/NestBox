@@ -199,7 +199,13 @@ struct WifiConn : OtaConn {
     c.setInsecure();
     c.setTimeout(OTA_TIMEOUT_MS / 1000);
     uint32_t t0 = millis();
-    if (c.connect(host, port)) return true;
+    // 27.11.2026: the name through nbResolve (lwIP getaddrinfo), then connect(ip, port, host = SNI) - never
+    // NetworkClientSecure::connect(host): it calls Arduino Network.hostByName, which runs dns_clear_cache() WITHOUT the
+    // lwIP core lock (NetworkManager.cpp:84) when an interface gets / loses its IP. A pending SNTP DNS query then
+    // asserts in sys_untimeout -> PANIC. J0 b48 27.11. 13:03 (coredump K48: sniffUpPost -> here -> hostByName ->
+    // dns_clear_cache -> sntp_retry), the same chain as b85 16.11. (PG263). Removing it = that panic again.
+    IPAddress ip;
+    if (nbResolve(host, ip) && c.connect(ip, port, host, nullptr, nullptr, nullptr)) return true;
     // PG270 (18.11.2026): why the HTTPS connection failed, always (an error line). Why: 2Z 18.11. 'META_HTTP-1'
     // within 55-300 ms, nothing on the OTA server, nothing in the log - the library's own log_e is compiled out
     // (CORE_DEBUG_LEVEL=0, platformio.ini). lastError = the mbedTLS / socket code of the last connect.
@@ -800,6 +806,8 @@ static void logTick()
 #define SNUP_PIECE     16384               // one SD read
 #define SNUP_RETRY_MS  30000UL
 #define SNUP_SCAN_MS   300000UL            // nothing to send: look at /SNIFF again after this (or at a split)
+#define SNUP_HOLD_MS   300000UL            // WiFi gone: still "busy" (sleep waits) this long after the last try (27.11.2026)
+                                           // 5 min: J0 b47 "wifi-nointernet" mark 316 s -> "OK NET wifi" 437 s = 2 min
 static Preferences s_snPrefs;
 static uint8_t* s_snBuf;
 static uint32_t s_snFile, s_snSize, s_snOff, s_snAt, s_snWait, s_snT0, s_snDone, s_snSeenNo;
@@ -885,7 +893,17 @@ static void sniffUpTick()
 {
   if (!s_snPrefsOk) { s_snPrefsOk = s_snPrefs.begin("snup", false); s_snDone = s_snPrefs.getUInt("done", 0); }
   bool can = telemetryWifiForData() && s_token[0] && !s_retryAt && !s_staged && !s_logReq;
-  if (!can || sniffWriting()) { s_snBusy = false; return; }   // not while the sniff writes (SD load); its split ends that
+  // not while the sniff writes (SD load); its split ends that. A file begun stays "busy" (the sleep waits, standby.cpp)
+  // also while WiFi is gone for a moment - Why (J0 27.11.2026 b46/b47, Toyota at the depot, uLTD_ext -83..-88 dBm):
+  // "WiFi silent -> back to the modem" cleared the flag, the box slept 5 min after the CAN went quiet with S62 at
+  // 13 of 79 MB (12:41:20, 12:58:41) instead of waiting the 20 min. Removing it = the same early sleep again.
+  // Only within SNUP_HOLD_MS of the last try (s_snAt): parked away from any WiFi (no try this boot) the box must not
+  // wait 20 min for a half-sent file.
+  bool idle = sniffIdleNow();                  // 27.11.2026: an open but quiet (empty) file no longer blocks (sniff.cpp)
+  if (!can || !idle) {
+    s_snBusy = s_snFile && idle && s_snAt && millis() - s_snAt < SNUP_HOLD_MS;
+    return;
+  }
   uint32_t openNo = sniffWriting() ? sniffFileNo() : 0;   // a split (file closed) or a new file = look again at once
   if (s_snAt && millis() - s_snAt < s_snWait && !(!s_snFile && openNo != s_snSeenNo)) return;
   s_snAt = millis();
@@ -926,7 +944,8 @@ static void sniffUpTick()
       s_snDone = s_snFile;
       s_snPrefs.putUInt("done", s_snDone);
       s_snFile = 0;
-      s_snBusy = false;
+      // s_snBusy stays: the next tick (2 s) picks the next file or clears it (nothing left). Why (27.11.2026, code
+      // review of the early sleep): cleared here, standbyTick (every 1 s) could sleep in that gap between two files.
     }
     return;
   }

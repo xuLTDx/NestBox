@@ -10,6 +10,7 @@
 // home line's address can change, ultd.mooo.com is a dynamic name).
 bool nbResolve(const char* host, IPAddress& ip);
 void nbResolveForget();
+bool nbResolveNow(const char* host, IPAddress& ip);   // 27.11.2026: DNS now, no cache, no Arduino hostByName (NETCHK)
 
 class NetLink {
 public:

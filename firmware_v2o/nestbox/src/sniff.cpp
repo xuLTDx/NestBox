@@ -614,6 +614,17 @@ bool sniffActive() { return s_active; }
 uint16_t sniffMinutesLeft() { return s_active ? s_minLeft : 0; }
 uint32_t sniffFileNo() { return s_fileNo; }
 bool sniffWriting() { return s_active && s_fileOk; }   // PG340: S<sniffFileNo()> is open now - not to be sent
+// 27.11.2026: nothing is being written now = no file open, or CAN1 quiet >= SNIFF_SPLIT_QUIET_MS (also no frame at all
+// since the boot for that long). Why: J0 b50 27.11. 13:34 restarted (OTA) with the CAN already quiet - S67 opened with
+// 0 frames, the split needs frames (above), so sniffWriting() stayed true and the upload of S62 never began; the box
+// slept 5 min later. The open file itself is still never sent (ota.cpp sniffUpPick skips sniffFileNo()).
+bool sniffIdleNow()
+{
+  if (!sniffWriting()) return true;
+  Can1Stats cs = can1Stats();
+  uint32_t quiet = millis() - (cs.lastFrameMs ? cs.lastFrameMs : 0);
+  return quiet >= SNIFF_SPLIT_QUIET_MS;
+}
 
 // ----------------------------------------------------------------- web ---
 int sniffStatus(char* buf, int size)

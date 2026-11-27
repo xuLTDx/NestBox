@@ -907,7 +907,8 @@ static char s_cellRestartWhy[40];
 static bool tcpOk(const char* ip, uint16_t port)
 {
   NetworkClient c;
-  bool ok = c.connect(ip, port, 5000);
+  IPAddress a;                                   // 27.11.2026: an IP literal, never through Arduino hostByName (netlink.cpp)
+  bool ok = a.fromString(ip) && c.connect(a, port, 5000);
   c.stop();
   return ok;
 }
@@ -918,8 +919,9 @@ static bool netCheck()
   bool t8 = tcpOk("8.8.8.8", 53);
   bool t1 = tcpOk("1.1.1.1", 53);
   IPAddress a;
-  bool dns = WiFi.hostByName("google.com", a);
-  bool sdns = WiFi.hostByName(SERVER_HOST, a);
+  // 27.11.2026: nbResolveNow (lwIP getaddrinfo), not WiFi.hostByName - see netlink.cpp lwipResolve (PANIC J0 b48)
+  bool dns = nbResolveNow("google.com", a);
+  bool sdns = nbResolveNow(SERVER_HOST, a);
   char m[57];
   snprintf(m, sizeof(m), "NETCHK tcp8=%d tcp1=%d dns=%s srv_dns=%s ppp=%d", t8 ? 1 : 0, t1 ? 1 : 0,
            dns ? "ok" : "err", sdns ? "ok" : "err", s_cell.up() ? 1 : 0);
@@ -1526,10 +1528,25 @@ static void netTask(void*)
     if (cur == &s_wifi && s_cellUp && s_cell.up()) {   // PG228 + PG240
       uint32_t now = millis();
       uint32_t heard = (int32_t)(s_client.lastSyncTime - linkSince) > 0 ? s_client.lastSyncTime : linkSince;
-      if (now - heard >= WIFI_SILENT_MS && txqInflight() > 0) {
-        nbout.printf("[NET] WiFi silent %lu s - back to the modem\n", (unsigned long)((now - heard) / 1000));
-        wifiMarkBad();
-        continue;                                  // the next pass picks the modem
+      static uint32_t inetOkAt;                    // the last silence the internet check answered
+      // signed: inetOkAt is set after the check, later than "now" - unsigned "now - inetOkAt" wrapped and the check
+      // ran on every pass (J0 b53 27.11.2026 14:27: "NET wifi-silent internet-ok" 5x in 7 s)
+      if (now - heard >= WIFI_SILENT_MS && txqInflight() > 0 && (!inetOkAt || (int32_t)(now - inetOkAt) >= (int32_t)WIFI_SILENT_MS)) {
+        // 27.11.2026 (Vojtech „1 áno“: „detekcia či je internet má byť overená internetom“): no server answer is
+        // not "no internet" - first a TCP connection over WiFi to 1.1.1.1:53 / 8.8.8.8:53 (5 s each). Why: J0
+        // 27.11. 14:00 at the depot, a sniff upload running on the weak uLTD_ext (the TCP upload got through),
+        // "WiFi silent 51 s" marked it no internet and moved the data to the modem. Only when both fail = marked.
+        WifiLink::makeDefault();                   // the check must go through WiFi, not through PPP
+        bool inet = tcpOk("1.1.1.1", 53) || tcpOk("8.8.8.8", 53);
+        if (inet) {
+          inetOkAt = millis();
+          nbout.printf("[NET] WiFi silent %lu s, internet ok - stays on WiFi\n", (unsigned long)((now - heard) / 1000));
+          statusLine("NET wifi-silent internet-ok");
+        } else {
+          nbout.printf("[NET] WiFi silent %lu s, no internet - back to the modem\n", (unsigned long)((now - heard) / 1000));
+          wifiMarkBad();
+          continue;                                // the next pass picks the modem
+        }
       }
     }
     // PG164 + PG197: while the modem is the link, PPP is made lwIP's default route again every 10 s. Why: our PPP is a
