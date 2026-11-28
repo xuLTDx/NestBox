@@ -1742,33 +1742,65 @@ void telemetryBeforeRestart()
 // gets 22 F0FE, on silence 22 F080; an answer or a refusal (NRC) = present. Web: PROBE=<bus>, PROBE?
 static const uint16_t K0_ADDR[][2] = {{0x590,0x58F}, {0x5B0,0x5AF}, {0x5CA,0x5AA}, {0x6A1,0x681}, {0x6A2,0x682}, {0x6A6,0x686}, {0x6A8,0x688}, {0x6A9,0x689}, {0x6AA,0x68A}, {0x6AC,0x68C}, {0x6AD,0x68D}, {0x6AF,0x68F}, {0x6B4,0x694}, {0x6B5,0x695}, {0x6B6,0x696}, {0x6BA,0x69A}, {0x6BC,0x69C}, {0x6BD,0x69D}, {0x6C4,0x604}, {0x6C8,0x628}, {0x6E5,0x625}, {0x6E6,0x626}, {0x730,0x710}, {0x731,0x711}, {0x732,0x712}, {0x736,0x716}, {0x737,0x717}, {0x73C,0x71C}, {0x742,0x642}, {0x743,0x643}, {0x744,0x644}, {0x747,0x647}, {0x748,0x648}, {0x74A,0x64A}, {0x74D,0x64D}, {0x74F,0x64F}, {0x752,0x652}, {0x755,0x655}, {0x756,0x656}, {0x75D,0x65D}, {0x75F,0x65F}, {0x760,0x660}, {0x764,0x664}, {0x765,0x665}, {0x766,0x666}, {0x76C,0x66C}, {0x76D,0x66D}, {0x770,0x670}, {0x778,0x678}, {0x77B,0x67B}, {0x77C,0x67C}, {0x77F,0x67F}};
 #define K0_ADDR_N (sizeof(K0_ADDR) / sizeof(K0_ADDR[0]))
+// CD1 (28.11.2026, Vojtech "cd1 áno"): VW - every 11-bit UDS request address 0x700-0x77F (answer = request + 0x6A,
+// verified: cluster 0x714 -> 0x77E Caddy 20.11., gateway 0x710 -> 0x77A Passat) and the OBD engine/gearbox range
+// 0x7E0-0x7E7 (answer + 8). Asked 22 F187 (VW spare part number). Each ECU that answers (or refuses = NRC) gets a
+// status line "PROBE VW <tx> <part no.>" / "PROBE VW <tx> nrc=<code>" - the car is on the modem, the web is out of
+// reach (Caddy). 136 addresses, 1 s each without an answer (nbread.h TMO) = about 2.5 min with the ignition on.
+#define VW_N 136
+static bool s_probeVw;
+static int probeCount() { return s_probeVw ? VW_N : (int)K0_ADDR_N; }
+static void probeAddr(int i, uint32_t* tx, uint32_t* rx)
+{
+  if (!s_probeVw) { *tx = K0_ADDR[i][0]; *rx = K0_ADDR[i][1]; return; }
+  if (i < 128) { *tx = 0x700 + i; *rx = *tx + 0x6A; }
+  else { *tx = 0x7E0 + (i - 128); *rx = *tx + 8; }
+}
 static volatile int s_probeBus, s_probeIdx = -1;
 static char s_probeOut[1400];
 static int s_probeLen, s_probeFound;
-void probeStart(int bus) { s_probeLen = 0; s_probeOut[0] = 0; s_probeFound = 0; s_probeBus = bus; s_probeIdx = 0; }
+void probeStart(int bus, bool vw)
+{
+  s_probeLen = 0; s_probeOut[0] = 0; s_probeFound = 0; s_probeBus = bus; s_probeVw = vw; s_probeIdx = 0;
+}
+void probeStart(int bus) { probeStart(bus, false); }
 int probeStatus(char* buf, int cap)
 {
-  return snprintf(buf, cap, "%s %d/%d found=%d: %s", s_probeIdx < 0 ? "done" : "running",
-                  s_probeIdx < 0 ? (int)K0_ADDR_N : s_probeIdx, (int)K0_ADDR_N, s_probeFound, s_probeOut);
+  return snprintf(buf, cap, "%s %s %d/%d found=%d: %s", s_probeVw ? "VW" : "K0", s_probeIdx < 0 ? "done" : "running",
+                  s_probeIdx < 0 ? probeCount() : s_probeIdx, probeCount(), s_probeFound, s_probeOut);
 }
 static bool probeTick()
 {
   if (s_probeIdx < 0) return false;
-  if (s_probeIdx >= (int)K0_ADDR_N) {
+  if (s_probeIdx >= probeCount()) {
     s_probeIdx = -1;
     char m[56];
-    snprintf(m, sizeof(m), "PROBE done bus=%d found=%d", s_probeBus, s_probeFound);
+    snprintf(m, sizeof(m), "PROBE %s done bus=%d found=%d", s_probeVw ? "VW" : "K0", s_probeBus, s_probeFound);
     statusLine(m);
     s_log.logEvent(s_probeOut);
     return true;
   }
   NbRead r = {};
-  r.bus = s_probeBus; r.txId = K0_ADDR[s_probeIdx][0]; r.rxId = K0_ADDR[s_probeIdx][1];
-  r.req[0] = 0x22; r.req[1] = 0xF0; r.req[2] = 0xFE; r.reqLen = 3;
+  r.bus = s_probeBus;
+  probeAddr(s_probeIdx, &r.txId, &r.rxId);
+  if (s_probeVw) { r.req[0] = 0x22; r.req[1] = 0xF1; r.req[2] = 0x87; }
+  else { r.req[0] = 0x22; r.req[1] = 0xF0; r.req[2] = 0xFE; }
+  r.reqLen = 3;
   static uint8_t resp[NB_READ_MAX];
   int len = 0; uint8_t nrc = 0;
   int res = busExchange(&r, resp, sizeof(resp), &len, &nrc);
-  if (res != NBR_OK && res != NBR_NRC) { r.req[2] = 0x80; res = busExchange(&r, resp, sizeof(resp), &len, &nrc); }
+  if (!s_probeVw && res != NBR_OK && res != NBR_NRC) { r.req[2] = 0x80; res = busExchange(&r, resp, sizeof(resp), &len, &nrc); }
+  if (s_probeVw && (res == NBR_OK || res == NBR_NRC)) {   // CD1: one status line per ECU found
+    char pn[20] = "";
+    int k = 0;
+    for (int j = 3; res == NBR_OK && j < len && k < (int)sizeof(pn) - 1; j++)
+      if (resp[j] >= 0x20 && resp[j] < 0x7F) pn[k++] = (char)resp[j];
+    pn[k] = 0;
+    char m[56];
+    if (res == NBR_OK) snprintf(m, sizeof(m), "PROBE VW %X %s", (unsigned)r.txId, pn[0] ? pn : "-");
+    else snprintf(m, sizeof(m), "PROBE VW %X nrc=%02X", (unsigned)r.txId, (unsigned)nrc);
+    statusLine(m);
+  }
   if ((res == NBR_OK || res == NBR_NRC) && s_probeLen < (int)sizeof(s_probeOut) - 16) {
     s_probeFound++;
     s_probeLen += snprintf(s_probeOut + s_probeLen, sizeof(s_probeOut) - s_probeLen, "%X%s ",

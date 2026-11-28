@@ -268,6 +268,17 @@ void TeleClientUDP::onMessage(char* msg, UdpRx* rx)
     }
     // PG233: INST=0 (FleetNest FN252, sent once the box is assigned to a car) ends install mode (install.h). Always
     // answered OK, also when it ended before - FleetNest waits for the line and sends the command again otherwise.
+#if NB_PROBE
+    // CD1 (28.11.2026): PROBE=<bus>[,VW] from FleetNest - the car box is on the modem, the web is out of reach
+    if (cmdp && !strncmp(cmdp + 4, "PROBE=", 6) && cmdp[10] >= '1' && cmdp[10] <= '3') {
+      extern void probeStart(int bus, bool vw);
+      bool vw = !strncmp(cmdp + 11, ",VW", 3);
+      probeStart(cmdp[10] - '0', vw);
+      char m[48];
+      snprintf(m, sizeof(m), "CMD PROBE=%c%s OK (~%s min)", cmdp[10], vw ? ",VW" : "", vw ? "2.5" : "1-2");
+      statusLine(m);
+    }
+#endif
     if (cmdp && !strcmp(cmdp + 4, "INST=0")) {
       instEnd("FleetNest INST=0");
       statusLine("CMD INST=0 OK");
