@@ -32,6 +32,8 @@ Možnosti k boxu: FleetNest DB (st.sh, len čítanie), príkazy cmd.sh (cez mode
 http://<IP>/api/... (zo servera aj NAS, keď je box na uLTD_ext alebo NTLIRIS), pull-OTA (kanál v2o_a3), USB na NAS.
 
 Build (28.11. CD5, premenované z ovms33): `pio run -e v2o` (bežný do áut), skúšobné `v2o_load/_crash/_fullq/_batt`; výstup `.pio/build/v2o/`.
+CD6 (28.11.): bežný `v2o` BEZ ladiacich príkazov (D1–D4, WDT_TEST, GPS_TEST, AT=) a bez PROBE/SCAN; tie sú len v `v2o_test`
+(-DNESTBOX_DIAG=1, stôl) a `v2o_probe` (-DNB_PROBE=1, nové auto). Ladiaci log DEBUG=1/0 ostáva v `v2o`. Pravidlo 17.
 
 ## 1. Moduly (súbor → čo robí)
 

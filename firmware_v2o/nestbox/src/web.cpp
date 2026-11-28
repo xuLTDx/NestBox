@@ -173,6 +173,7 @@ static int handlerControl(UrlHandlerParam* param)
     int r = nbReadSubmit(cmd + 5, &seq);
     n = snprintf(buf, bufsize, r ? "ERR %d (#%u; 10 syntax, 11 not a reading service)" : "OK #%u - result in the next record (PID 0x39D) and the SD log",
                  r ? r : (int)seq, (unsigned)seq);
+#if NB_PROBE                                         // CD6: env v2o_probe only
   } else if (!strncmp(cmd, "PROBE=", 6) && (cmd[6] == '1' || cmd[6] == '2' || cmd[6] == '3')) {   // p84
     probeStart(cmd[6] - '0');
     n = snprintf(buf, bufsize, "OK - PROBE? for the result (about 1-2 min)");
@@ -188,6 +189,7 @@ static int handlerControl(UrlHandlerParam* param)
     n = scanStatus(buf, bufsize);
   } else if (!strcmp(cmd, "PROBE?")) {
     n = probeStatus(buf, bufsize);
+#endif
   } else if (!strcmp(cmd, "OTA?")) {
     n = otaStatus(buf, bufsize);
   } else if (!strncmp(cmd, "SMS_ALLOW=", 10) || !strncmp(cmd, "SMS_PIN=", 8) || !strncmp(cmd, "SMS=", 4) ||
