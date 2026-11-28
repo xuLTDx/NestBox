@@ -14,6 +14,7 @@
 // (system clock from NTP / the server's login reply, as v1F does for engine
 // event records - addTimeOf), the 12 V level, the chip temperature, the WiFi
 // signal, and the SD fingerprint (PID 0x398) every 10 min.
+#include "crashloop.h"
 #include "wdt.h"
 #include "errreport.h"
 #include <Arduino.h>
@@ -1268,7 +1269,7 @@ static void cellTask(void*)
       prepareRestart("SMS RESTART");
       esp_restart();
     }
-    if (s_cellOn && !s_cellUp && !s_standby && (!lastTry || millis() - lastTry > 300000UL)) {
+    if (s_cellOn && !crashLoopCellOff() && !s_cellUp && !s_standby && (!lastTry || millis() - lastTry > 300000UL)) {
       wdtFeed(WDT_CELL, "start");
       lastTry = millis();
       logNetEvent("CELL START");
@@ -1285,7 +1286,7 @@ static void cellTask(void*)
       statusLine(m);                             // p69: visible in FleetNest (Stav zariadenia)
       cellStartErr(s_cellUp, s_cell.status());   // PG149
     }
-    if (!s_cellOn && s_cellUp) { s_cellUp = false; s_cell.stop(); logNetEvent("CELL OFF"); }
+    if ((!s_cellOn || crashLoopCellOff()) && s_cellUp) { s_cellUp = false; s_cell.stop(); logNetEvent("CELL OFF"); }   // PG358
     if (s_cellUp && s_cell.muxDead()) {           // p69: no good CMUX frame for 3 min (OVMS) -> restart
       s_cellUp = false;
       logNetEvent("CELL CMUX dead - restart");

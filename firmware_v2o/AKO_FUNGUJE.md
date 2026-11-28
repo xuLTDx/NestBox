@@ -133,6 +133,17 @@ Počas jazdy sa neposiela (build Nov 28 2026 12:05:02, Vojtech 28.11. „sprav t
 Server nestbox-ota 2.8.0 (/home/claude/GitHub/NestBox-OTA ota_server.py _sniff_post): /home/nestbox-ota/sniffs/
 <box>_S<n>_<veľkosť>.LOG (.part/ rozpracované) → systemd path unit claude cardata-sniff.path → cardata/receive.py.
 
+### 3.7 PG358 ochrana proti slučke pádov (crashloop.cpp/.h, Vojtech 28.11. „358 áno“)
+- 5 reštartov pádom (PANIC, TASK_WDT, INT_WDT, WDT, vlastný watchdog) za 10 min = slučka (počíta RTC pamäť, nie POWERON).
+- Prvá slučka: návrat na druhú partíciu, ak má build označený „dobrý“ (24 h po OTA VALID bez slučky, NVS CL_GOOD) a sha
+  padajúceho buildu je známe (z OTA) → sha do OTAV_REJ (OTA ho znova neinštaluje, kým nepríde novší).
+  Riadok „CRASHLOOP rollback sha=… -> <partícia> <dátum> <čas>“. Sťahovanie do partície s dobrým buildom značku zmaže.
+- Inak vypne jednu časť na 30 min / 2 h / 6 h: modem (pád v cell/CMUX/PPP; len kým WiFi nesie dáta), WiFi (krok WIFI…),
+  inak sniff + čítania z auta. Nikdy obe siete. Záznamy na SD stále. „CRASHLOOP n=5 10min last=<úloha>/<krok> -> <časť> off <min>min“,
+  na konci „CRASHLOOP <časť> on again“. Úroveň sa vynuluje po 24 h bez slučky.
+- 2 pády za 10 min alebo vypnutá časť → OTA kontrola hneď po sieti (nie po 60 s), „OTA-PULL CHECK crash loop“.
+- Obmedzenie: pád ešte pred crashLoopBegin (setup pred otaBegin) sa nezaráta. Build označený dobrý: „CRASHLOOP build marked good (24 h)“.
+
 ## 4. Príkazy (FleetNest commands / web /api/control)
 SNIFF=1[,min] | SNIFF=0 | SNIFF? | SNIFF_BUSES= | SNIFF_LIMIT= | SNIFF_PURGE | SNIFF_VEH= ; OTA_READY | OTA_CHECK | OTA? |
 OTA_TOKEN= | OTA_HOST= | OTA_PORT= ; WIFI_SYNC | WIFI=1/0 ; LOG=<n|D<boot>|C<boot>>[,od] ; DEBUG=1/0 | DEBUG? ;

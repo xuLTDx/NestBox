@@ -20,6 +20,7 @@
 #include "netlog.h"
 #include <errno.h>
 #include "canbus1.h"
+#include "crashloop.h"
 
 extern const char FW_BUILD_STR[];
 #include "wifiplaces.h"
@@ -498,6 +499,7 @@ static void check()
 
   const esp_partition_t* part = esp_ota_get_next_update_partition(nullptr);
   if (!part || size > part->size) { otaLog("OTA-PULL ERR=PARTITION"); return; }
+  crashLoopPartitionWritten(part->label);     // PG358: a good build there is being overwritten
   // resume: the bytes already in the partition belong to this target when size and sha256 match the NVS note
   size_t from = 0;
   {
@@ -1015,6 +1017,14 @@ static void otaTask(void*)
     }
     while (standbyParkedBoot()) vTaskDelay(pdMS_TO_TICKS(2000));   // driven off during the report: a normal boot
     last = millis();
+  } else if (crashLoopEarlyOta()) {
+    // PG358 (crashloop.h): crashes repeating - the check as soon as a network is up, not after 60 s (a box that
+    // crashes within a minute of the start would never get the fixed build)
+    uint32_t t0 = millis();
+    while (millis() - t0 < 60000 && !telemetryWifiForData() && !(telemetryCellLink() && telemetryCellLink()->up()))
+      vTaskDelay(pdMS_TO_TICKS(1000));
+    otaLog("OTA-PULL CHECK crash loop");
+    s_req = true;
   } else {
     vTaskDelay(pdMS_TO_TICKS(60000));        // after the boot: network and clock first
   }

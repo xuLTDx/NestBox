@@ -1,6 +1,7 @@
 // NestBox_v2O - main. Step 1 of ../NAVRH.md: hardware (MAX7317, SD over
 // SDMMC, CAN1 TWAI + CAN2/CAN3 MCP2515), sniff on all buses, WiFi, local HTTP
 // API with OTA. Step 2a: records to FleetNest over WiFi (telemetry.cpp).
+#include "crashloop.h"
 #include "part.h"
 #include "crash.h"
 #include "dbglog.h"
@@ -647,6 +648,7 @@ void setup()
   wifiPlacesBegin();                         // PG205: the stored place list (NVS)
   instBegin();                               // PG233: install mode (install.h)
   otaBegin();                                // pull-OTA (needs the NVS handle opened by telemetryBegin)
+  crashLoopBegin(s_prevStep);                // PG358 (crashloop.h): after otaVerifyBegin + wdtReportLast; may roll back
   telemetrySmsCfgReport(3);                  // PG214: the SMS settings after every boot / wake (needs the OTA token)
 #ifdef TEST_OTA_CRASH
   // PG147 bench only: this build crashes 20 s after start, before any server login - the bootloader must boot
@@ -673,6 +675,7 @@ void loop()
 {
   wdtTestPoint(WDT_LOOP);
   wdtFeed(WDT_LOOP, "loop");
+  crashLoopTick();                           // PG358
   webProcess(20);
   can1Tick();
   readTick();                                 // READ command: the request waiting for the bus

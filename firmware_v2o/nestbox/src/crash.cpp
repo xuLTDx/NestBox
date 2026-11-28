@@ -50,6 +50,7 @@ static IRAM_ATTR void onPanic(arduino_panic_info_t* info, void*)
   esp_psram_extram_writeback_cache();
 }
 
+const char* crashLastTask() { return s_crash.task; }   // PG358 crashloop.cpp (only after a crash reset)
 void crashBegin() { set_arduino_panic_handler(onPanic, nullptr); }
 
 void crashReportLast()

@@ -1,6 +1,7 @@
 // Sniff mode - see sniff.h. Carried over from NestBox_v1F sniff.cpp (queue,
 // line format, stats, SD writer hand-off, 60-day purge, auto-off); new here:
 // three buses (TWAI + 2x MCP2515), a bus column, per-bus speed probe and stats.
+#include "crashloop.h"
 #include "sniff.h"
 #include "netlog.h"                  // PG101: nbout = Serial + /api/serial
 #include <SD_MMC.h>
@@ -431,6 +432,7 @@ static void makeTasks()
 
 static bool startNow(uint16_t minutes)
 {
+  if (crashLoopSniffOff()) { nbout.println("[SNIFF] refused - crash loop (crashloop.h)"); return false; }   // PG358
   int used = sdUsedPct();
   if (used >= s_sdLimitPct) {
     s_refused = true;
@@ -818,6 +820,7 @@ static bool mRecv(void* c, uint32_t id, uint8_t d[8], uint8_t* dlc, uint32_t t) 
 
 int busExchange(const NbRead* r, uint8_t* resp, int cap, int* respLen, uint8_t* nrc)
 {
+  if (crashLoopSniffOff()) return NBR_NOT_READY;   // PG358: reads into the car off during a crash-loop period
   if (r->bus == 1) return can1Exchange(r, resp, cap, respLen, nrc);
   Mcp2515* m = (r->bus == 2 || r->bus == 3) ? mcpFor(r->bus - 1) : nullptr;
   if (!m || !s_bus[r->bus - 1].present) return NBR_BAD_BUS;

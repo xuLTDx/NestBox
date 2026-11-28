@@ -10,6 +10,7 @@
 extern nvs_handle_t nvs;                     // telemetry.cpp
 void statusLine(const char* text);           // ota.cpp
 #include "laststep.h"
+#include "crashloop.h"
 
 // 15 min for the first login after an update. Why: on the modem the first PPP + login can take minutes (cell
 // OTA ~3 min, PG-p1 restart of the modem after 15 min without an answer is the outer limit); longer = more battery
@@ -111,6 +112,12 @@ void otaVerifyLoggedIn()
   s_pending = false;
   if (s_timer) esp_timer_stop(s_timer);
   esp_ota_mark_app_valid_cancel_rollback();
+  {
+    char sha[65] = "";                        // PG358: the image's sha for a later crash-loop rollback (crashloop.cpp)
+    size_t l = sizeof(sha);
+    nvs_get_str(nvs, KEY_FL_SHA, sha, &l);
+    crashLoopValid(sha);
+  }
   nvs_erase_key(nvs, KEY_FL_PART);
   nvs_erase_key(nvs, KEY_FL_SHA);
   nvs_erase_key(nvs, KEY_WHY);
