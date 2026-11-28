@@ -39,6 +39,7 @@
 
 void standbyEarly();          // first in setup(): a deep-sleep wake - confirm or sleep again (no return)
 bool standbyParkedBoot();     // this boot is the 3-hour parked report
+bool standbyBattLow();                  // 28.11.2026: parked battery alert level != 0 (low / critical)
 const char* standbyUlpStats(); // p62: counters of the last ULP sleep ("" = none) - one PID 0x399 line
 const char* standbyWakeName();// why this boot: "-", "VOLTAGE", "REPORT", "TEST"
 void standbyTick();           // loop()

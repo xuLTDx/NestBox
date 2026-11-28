@@ -4,7 +4,7 @@ Vojtech 24.11.2026: „Ako nechceš si takéto informácie niekde popísať? Čo
 odbočkami, podmienkami + čo máme zistené, čo sa rieši.“ Toto je JEDINÝ popis aktuálneho správania (NAVRH.md = história
 návrhov, LOGIKA.mmd = stav 18.10., zastaraný). Pri každej zmene firmvéru sa upraví TU, v tom istom commite.
 Zdroj: vetva v2o-arduino3, worktree /home/claude/Claude/nestbox_a3, súbory firmware_v2o/nestbox/src/. Riadky = stav 24.11.2026.
-Na J0 beží build Nov 27 2026 14:28:13 (OTA VALID 27.11. 14:35:59, b54; commit 623cc07). Na v2o_a3: build Nov 27 2026 20:53:21.
+Na J0 beží build Nov 27 2026 14:28:13 (OTA VALID 27.11. 14:35:59, b54; commit 623cc07). Na v2o_a3: build Nov 28 2026 11:57:24.
 
 Súvisiace (čítať pred tvrdením):
 - merania (odber, napätia, časy): /home/claude/notes/MERANIA.md
@@ -86,12 +86,16 @@ webStart → wdt. loop(): web, can1Tick, readTick, sniffTick, wifiTick, instTick
 Zaspí, keď VŠETKO platí: STANDBY_AUTO; 12 V pod 12,8 V nepretržite 10 s (PG148) a nie pod 7 V (stôl); CAN1 ticho 5 min
 (STANDBY_QUIET_MS, pri hlásení zo státia 10 s); hlásenie zo státia doručené; nový build nečaká na overenie; SMS o batérii
 odoslaná; OTA sťahovanie beží najviac 3 min navyše (STANDBY_OTA_WAIT_MS); PG340: posielanie sniffu najviac 20 min navyše
-(STANDBY_SNIFFUP_WAIT_MS). Pred spánkom: sniff súbor a rad zavreté, modem + WiFi vypnuté. Hlboký spánok: ULP meria 12 V
+(STANDBY_SNIFFUP_WAIT_MS); obe čakania začínajú odznova pri každom novom parkovaní (build Nov 28 11:57:24, predtým raz za boot). Pred spánkom: sniff súbor a rad zavreté, modem + WiFi vypnuté. Hlboký spánok: ULP meria 12 V
 každých 200 ms, zobudí pri ≥ 12,8 V; každé 3 h hlásenie zo státia (GNSS max 150 s, 1 záznam, doručenie max 60 s).
 
 ### 3.4 OTA, WiFi zoznam, profil (ota.cpp otaTask, slučka každé 2 s)
 - Kontrola buildu: každých 6 h (OTA_PERIODIC_MS) alebo OTA_READY / OTA_CHECK. Sťahuje s pokračovaním (Range), flash až pri
   vypnutom motore a ≥ 11,5 V. Nikdy nižšia verzia.
+- Hlásenie zo státia (build Nov 28 2026 11:57:24, Vojtech 28.11. „3 áno“): hneď po sieti len kontrola buildu + sťahovanie
+  (nie WiFi zoznam, LOG, sniff, flash); nie pri nízkej batérii; sťahovanie pokračuje pri ďalšom prebudení (OTAD_OFF, 64 KB).
+  Prečo: J0 27.11. 20:54 OTA_READY v státí, do 28.11. 09:31 (5 prebudení) build nestiahol (otaTask čakal 60 s).
+- Čakajúci build (STAGED) blokuje posielanie sniffu len keď sa dá hneď flashnúť (motor vyp. + napätie), build 11:57:24.
 - WiFi zoznam + profil: každé 2 h (PLACES_EVERY_S 7200, ota.cpp:277) alebo WIFI_SYNC. Profil platí od ďalšieho štartu.
 - LOG=<súbor>[,<od>]: súbor z SD na server po 8 KB s pokračovaním (PG49) – WiFi alebo modem.
 

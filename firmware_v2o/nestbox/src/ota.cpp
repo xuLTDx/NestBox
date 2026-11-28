@@ -905,7 +905,9 @@ static int sniffUpPost(uint32_t n, String* answer)
 static void sniffUpTick()
 {
   if (!s_snPrefsOk) { s_snPrefsOk = s_snPrefs.begin("snup", false); s_snDone = s_snPrefs.getUInt("done", 0); }
-  bool can = telemetryWifiForData() && s_token[0] && !s_retryAt && !s_staged && !s_logReq;
+  // 28.11.2026 (Vojtech "3 áno"): a staged build blocks the upload only while it may be flashed now (it goes first, as
+  // logTick). Why: waiting for the engine off / >= 11.5 V the sniffs were not sent at all (code review 27.11.).
+  bool can = telemetryWifiForData() && s_token[0] && !s_retryAt && !(s_staged && flashAllowed()) && !s_logReq;
   // not while the sniff writes (SD load); its split ends that. A file begun stays "busy" (the sleep waits, standby.cpp)
   // also while WiFi is gone for a moment - Why (J0 27.11.2026 b46/b47, Toyota at the depot, uLTD_ext -83..-88 dBm):
   // "WiFi silent -> back to the modem" cleared the flag, the box slept 5 min after the CAN went quiet with S62 at
@@ -981,7 +983,27 @@ static void sniffUpTick()
 static void otaTask(void*)
 {
   uint32_t last = 0;
-  vTaskDelay(pdMS_TO_TICKS(60000));          // after the boot: network and clock first
+  // 28.11.2026 (Vojtech "3 áno": "počas státia (3 hod interval) len OTA"): the parked report boot (40-70 s awake) did
+  // nothing here - this task waited 60 s first, the box slept before. J0 27.11. 20:54 got OTA_READY for build
+  // 20:53:21 while parked and still had not looked by 28.11. 09:31 (5 report wakes). Now a parked boot only checks
+  // for a build as soon as a network is up (one HTTPS request) and downloads it; no WiFi list, LOG, sniff upload,
+  // no flash (it waits for the next parking of a normal boot). Not with a low battery. A download longer than the
+  // sleep wait (STANDBY_OTA_WAIT_MS 3 min) goes on at the next wake from the NVS point (OTAD_OFF, every 64 KB).
+  if (standbyParkedBoot()) {
+    uint32_t t0 = millis();
+    while (millis() - t0 < 60000 && !telemetryWifiForData() && !(telemetryCellLink() && telemetryCellLink()->up()))
+      vTaskDelay(pdMS_TO_TICKS(1000));
+    if (s_token[0] && !standbyBattLow() && standbyParkedBoot()) {
+      otaLog("OTA-PULL CHECK parked");
+      s_busy = true;
+      check();
+      s_busy = false;
+    }
+    while (standbyParkedBoot()) vTaskDelay(pdMS_TO_TICKS(2000));   // driven off during the report: a normal boot
+    last = millis();
+  } else {
+    vTaskDelay(pdMS_TO_TICKS(60000));        // after the boot: network and clock first
+  }
   for (;;) {
     if (s_staged && flashAllowed() && !otaVerifyPending()) flashStaged();   // PG147: not over an unconfirmed build
     if (s_retryAt && millis() - s_retryAt > 60000) {   // p74: resume the broken download

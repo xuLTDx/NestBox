@@ -101,6 +101,7 @@ static void standbyTestNow(uint32_t seconds, bool ulp);
 static bool ulpMeasure(unsigned* sum, uint32_t* raw);
 
 bool standbyParkedBoot() { return s_parked; }
+bool standbyBattLow() { return s_battLvl != 0; }   // 28.11.2026: ota.cpp parked OTA check skips a low battery
 const char* standbyWakeName() { return s_wake; }
 const char* standbyUlpStats() { return s_ulpStats; }
 
@@ -456,6 +457,7 @@ void standbyTick()
   }
   if (v < 7.0f || telemetryEngineOn() || v >= ENGINE_OFF_VOLTAGE) {   // bench / engine / charging
     s_lowOn = false;                  // PG148: one reading at or above = the 10 s start again
+    s_otaWaitSince = s_snupWaitSince = 0;   // 28.11.2026: a new parking = the full OTA / sniff-upload wait again
     return;
   }
   if (!s_lowOn) { s_lowOn = true; s_lowSince = millis(); s_lowMin = s_lowMax = v; }
@@ -463,7 +465,13 @@ void standbyTick()
   if (v > s_lowMax) s_lowMax = v;
   if (millis() - s_lowSince < STANDBY_LOW_MS) return;   // PG148: a single low reading is not a sleep (standby.h)
   uint32_t need = s_parked ? 10000UL : STANDBY_QUIET_MS;   // the parked report: the car is asleep anyway
-  if (canQuietMs() < need) return;
+  if (canQuietMs() < need) {
+    // 28.11.2026 (Vojtech "1 áno", code review 27.11.): the waits below started once per boot and were never cleared -
+    // after a drive in the same boot (no sleep between) the next parking slept at once in the middle of an OTA
+    // download / sniff upload. Removing this = the same.
+    s_otaWaitSince = s_snupWaitSince = 0;
+    return;
+  }
   if (s_parked) {
     uint32_t up = millis() / 1000;
     if (!s_reportFix && up < STANDBY_REPORT_GPS_S) {
@@ -490,6 +498,8 @@ void standbyTick()
   if (otaBusy()) {
     if (!s_otaWaitSince) s_otaWaitSince = millis();
     if (millis() - s_otaWaitSince < STANDBY_OTA_WAIT_MS) return;
+  } else {
+    s_otaWaitSince = 0;
   }
   // PG340: a sniff file being sent on WiFi (ota.cpp sniffUpTick) - at most STANDBY_SNIFFUP_WAIT_MS, then sleep anyway;
   // the rest goes at the next WiFi. Why: Vojtech 24.11.2026 - a drive's sniff (50-75 MB, ~5-8 min) must arrive.
