@@ -1,6 +1,7 @@
 // Sniff mode - see sniff.h. Carried over from NestBox_v1F sniff.cpp (queue,
 // line format, stats, SD writer hand-off, 60-day purge, auto-off); new here:
 // three buses (TWAI + 2x MCP2515), a bus column, per-bus speed probe and stats.
+#include "dbglog.h"                  // CD7: detail lines only with DEBUG=1
 #include "crashloop.h"
 #include "sniff.h"
 #include "netlog.h"                  // PG101: nbout = Serial + /api/serial
@@ -248,6 +249,10 @@ int sniffFill(char* buf, int cap, uint32_t* frames, bool* last)
   char line[400];
   if (millis() - s_lastStats >= STATS_EVERY_MS && n + (int)sizeof(line) < cap) {
     s_lastStats = millis();
+    // CD7 I: the counters also on the serial log with DEBUG=1 (frames, written, dropped = queue full, SD errors)
+    dbgout.printf("[SNIFF] S%lu frames=%lu written=%lu dropped=%lu sd_err=%lu sd_lost=%lu\n", (unsigned long)s_fileNo,
+                  (unsigned long)s_frames, (unsigned long)s_written, (unsigned long)s_dropped, (unsigned long)s_sdErrors,
+                  (unsigned long)s_sdLost);
     statsLine(line, sizeof(line));
     nbout.println(line);
     int l = strlen(line);
@@ -818,7 +823,23 @@ int sniffCheck(uint32_t fileNo, char* out, int cap)
 static bool mSend(void* c, uint32_t id, const uint8_t d[8]) { return ((Mcp2515*)c)->sendFrame(id, d); }
 static bool mRecv(void* c, uint32_t id, uint8_t d[8], uint8_t* dlc, uint32_t t) { return ((Mcp2515*)c)->waitFrame(id, d, dlc, t); }
 
+static int busExchangeRaw(const NbRead* r, uint8_t* resp, int cap, int* respLen, uint8_t* nrc);
+// CD7 A (28.11.2026, Vojtech "cd7 áno"): with DEBUG=1 every read into the car - bus, tx/rx, request, result, answer
+// bytes, time. Why: the Caddy profile 2K (UDS 0x714) is not verified in the car; only the results reach the records.
 int busExchange(const NbRead* r, uint8_t* resp, int cap, int* respLen, uint8_t* nrc)
+{
+  uint32_t t0 = millis();
+  int res = busExchangeRaw(r, resp, cap, respLen, nrc);
+  if (dbglogOn()) {
+    char q[24] = "", a[40] = "";
+    for (int i = 0, k = 0; i < r->reqLen && k < (int)sizeof(q) - 3; i++) k += snprintf(q + k, sizeof(q) - k, "%02X", r->req[i]);
+    for (int i = 0, k = 0; res == NBR_OK && i < *respLen && k < (int)sizeof(a) - 3; i++) k += snprintf(a + k, sizeof(a) - k, "%02X", resp[i]);
+    dbgout.printf("[READ] b%d %X>%X %s res=%d nrc=%02X %ums %s\n", r->bus, (unsigned)r->txId, (unsigned)r->rxId, q, res,
+                  nrc ? *nrc : 0, (unsigned)(millis() - t0), a);
+  }
+  return res;
+}
+static int busExchangeRaw(const NbRead* r, uint8_t* resp, int cap, int* respLen, uint8_t* nrc)
 {
   if (crashLoopSniffOff()) return NBR_NOT_READY;   // PG358: reads into the car off during a crash-loop period
   if (r->bus == 1) return can1Exchange(r, resp, cap, respLen, nrc);

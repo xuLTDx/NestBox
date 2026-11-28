@@ -80,6 +80,12 @@ webStart → wdt. loop(): web, can1Tick, readTick, sniffTick, wifiTick, instTick
   Riadok len pri zmene výsledku (PG352). Meno servera ešte nezistené -> raz cez DNS modemu (PG354).
   inet = TCP 1.1.1.1/8.8.8.8:53 cez WiFi, len informácia. Prečo: WiFi môže mať internet a blokovať náš server (port,
   captive portal, DNS); 15:49:49 b55 „wifi-nointernet“ na hotspote s internetom. NEOVERENÉ na boxe (ping cez PPP pri WiFi).
+- CD7 (build Nov 28 2026 18:12:59): podrobné riadky len pri DEBUG=1 (sériový log + SD /DEBUG/D<boot>.LOG):
+  [READ] každé čítanie z auta (zbernica, adresy, otázka, výsledok, odpoveď, ms) | [CAN1] každú minútu rámce/overrun/
+  missed/buserr/ticho | [AT] každý AT príkaz modemu s odpoveďou, [CELL] signál pri každom meraní | [GPS] každých 10 s
+  NMEA/fix/satelity | [NET] skúšobný paket WiFi, [ACK] čas potvrdenia každého paketu | [STANDBY] pri zmene, čo drží box
+  hore (motor, napätie, CAN, OTA, sniff, nový build) alebo „sleep now“ | [WIFI] scan: každá sieť s dBm | [SNIFF-UP] každý POST
+  (B, ms, kB/s), [OTA] po 64 KB | [SNIFF] každú minútu rámce/zapísané/stratené.
 - PG357 (build po 12:34:31): krok úlohy record / net / loop (od wdtFeed po wdtFeed) > 20 s → „SLOW <úloha> <krok> <s>s“;
   OTA úloha: WiFi zoznam / LOG > 20 s, upload sniffu (1 POST) > 60 s → „SLOW ota <krok> <s>s“ (nie cell, nie sťahovanie buildu).
 - Rad (txqueue.h): 1 MB PSRAM (~1 h jazdy po 1 záznam/s), prežije reštart a pád, nie výpadok napájania ani hlboký spánok.

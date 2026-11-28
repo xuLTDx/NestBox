@@ -1,5 +1,6 @@
 // Delivery queue - see txqueue.h for the design. Copied from NestBox_v1F
 // (firmware_v5/telelogger) - only the SD include differs (nb_sd.h).
+#include "dbglog.h"                  // CD7: detail lines only with DEBUG=1
 #include <Arduino.h>
 #include "nb_sd.h"     // v2O: SD = SD_MMC
 #include "clocktrust.h"     // PG259
@@ -1167,6 +1168,7 @@ void txqOnAck(uint32_t packetNo)
   for (auto& f : s_flight) {
     if (!f.used || f.no != packetNo) continue;
     f.used = false;
+    dbgout.printf("[ACK] pkt=%u %lums\n", (unsigned)packetNo, (unsigned long)(millis() - f.sent));   // CD7 E
     if (f.sd) {
       ev("ACK sd pkt=%u done=%d eof=%d next=%u", (unsigned)packetNo, f.sdDone, f.sdEof, (unsigned)f.sdNextTs);
       for (int k = 0; k < s_sdPktN; k++) ackNote(s_sdPktFile, s_sdPktTs[k]);   // PG223

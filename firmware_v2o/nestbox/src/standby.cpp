@@ -1,4 +1,5 @@
 // Standby of NestBox_v2O - see standby.h.
+#include "dbglog.h"                  // CD7: detail lines only with DEBUG=1
 #include "otaverify.h"
 #include "standby.h"
 #include "netlog.h"                  // PG101: nbout = Serial + /api/serial
@@ -405,6 +406,16 @@ static void remoteTick()
   statusLine(m);
 }
 
+// CD7 F (28.11.2026, Vojtech "cd7 áno"): with DEBUG=1 which condition keeps the box awake - one line when it changes
+// (J0 27.11.: slept early during a sniff upload; which condition let it sleep was not in any log).
+static void sbWhy(const char* why, float v)
+{
+  static const char* last;
+  if (why == last) return;
+  last = why;
+  dbgout.printf("[STANDBY] %s v=%.2f quiet=%lus\n", why, v, (unsigned long)(canQuietMs() / 1000));
+}
+
 void standbyTick()
 {
   remoteTick();
@@ -458,21 +469,24 @@ void standbyTick()
   if (v < 7.0f || telemetryEngineOn() || v >= ENGINE_OFF_VOLTAGE) {   // bench / engine / charging
     s_lowOn = false;                  // PG148: one reading at or above = the 10 s start again
     s_otaWaitSince = s_snupWaitSince = 0;   // 28.11.2026: a new parking = the full OTA / sniff-upload wait again
+    sbWhy(telemetryEngineOn() ? "awake: engine" : v < 7.0f ? "awake: bench (<7 V)" : "awake: voltage >= 12.8", v);
     return;
   }
   if (!s_lowOn) { s_lowOn = true; s_lowSince = millis(); s_lowMin = s_lowMax = v; }
   if (v < s_lowMin) s_lowMin = v;
   if (v > s_lowMax) s_lowMax = v;
-  if (millis() - s_lowSince < STANDBY_LOW_MS) return;   // PG148: a single low reading is not a sleep (standby.h)
+  if (millis() - s_lowSince < STANDBY_LOW_MS) { sbWhy("awake: low < 10 s", v); return; }   // PG148: a single low reading is not a sleep (standby.h)
   uint32_t need = s_parked ? 10000UL : STANDBY_QUIET_MS;   // the parked report: the car is asleep anyway
   if (canQuietMs() < need) {
     // 28.11.2026 (Vojtech "1 áno", code review 27.11.): the waits below started once per boot and were never cleared -
     // after a drive in the same boot (no sleep between) the next parking slept at once in the middle of an OTA
     // download / sniff upload. Removing this = the same.
     s_otaWaitSince = s_snupWaitSince = 0;
+    sbWhy("awake: CAN not quiet", v);
     return;
   }
   if (s_parked) {
+    sbWhy("parked report", v);
     uint32_t up = millis() / 1000;
     if (!s_reportFix && up < STANDBY_REPORT_GPS_S) {
       static uint32_t lastPoll;
@@ -493,11 +507,11 @@ void standbyTick()
   }
   // PG147: no deep sleep while a new build waits for its server login - the wake would boot the previous build
   // (bootloader: reset in PENDING_VERIFY = ABORTED); otaverify.cpp goes back by itself after 15 min
-  if (otaVerifyPending()) return;
+  if (otaVerifyPending()) { sbWhy("awake: new build waits for login", v); return; }
   if (s_battSmsWait && s_parked && millis() - s_reportAt < BATT_SMS_WAIT_MS) return;   // PG260: the SMS first
   if (otaBusy()) {
     if (!s_otaWaitSince) s_otaWaitSince = millis();
-    if (millis() - s_otaWaitSince < STANDBY_OTA_WAIT_MS) return;
+    if (millis() - s_otaWaitSince < STANDBY_OTA_WAIT_MS) { sbWhy("awake: OTA download", v); return; }
   } else {
     s_otaWaitSince = 0;
   }
@@ -507,8 +521,9 @@ void standbyTick()
   // after J0 "ERR BATT low 12.10V parked 44h" the same day (20 min awake = 0,03-0,06 Ah, MERANIA.md 0,1-0,17 A).
   if (otaSniffUpBusy() && !s_battLvl) {
     if (!s_snupWaitSince) s_snupWaitSince = millis();
-    if (millis() - s_snupWaitSince < STANDBY_SNIFFUP_WAIT_MS) return;
+    if (millis() - s_snupWaitSince < STANDBY_SNIFFUP_WAIT_MS) { sbWhy("awake: sniff upload", v); return; }
   }
+  sbWhy("sleep now", v);
   goStandby();
 }
 

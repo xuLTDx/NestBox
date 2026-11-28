@@ -564,6 +564,7 @@ static void check()
       if (written / OTAD_SAVE != before / OTAD_SAVE) {   // the resume point, a multiple of 64 KB
         nvs_set_u32(nvs, KEY_D_OFF, (uint32_t)(written / OTAD_SAVE * OTAD_SAVE));
         nvs_commit(nvs);
+        dbgout.printf("[OTA] %u/%u B %lus\n", (unsigned)written, (unsigned)size, (unsigned long)((millis() - t0) / 1000));   // CD7 H
       }
       ovFlash += can1Stats().rxOverrun - o2;  // PG361: erase + write + NVS
       lastStep("OTA download %u/%u", (unsigned)written, (unsigned)size);
@@ -961,7 +962,13 @@ static void sniffUpTick()
   WifiLink::makeDefault();                    // PG96: WiFi only, never the modem
   uint32_t n = s_snProbe ? 0 : (s_snSize - s_snOff < SNUP_POST_MAX ? s_snSize - s_snOff : SNUP_POST_MAX);
   String answer;
+  uint32_t tp = millis();
   int code = sniffUpPost(n, &answer);
+  {                                           // CD7 H: every POST - bytes, time, rate (27.11.: stall at 13 MB, 46 kB/s)
+    uint32_t ms = millis() - tp;
+    dbgout.printf("[SNIFF-UP] S%u @%u %u B %ums %u kB/s code=%d\n", (unsigned)s_snFile, (unsigned)s_snOff, (unsigned)n,
+                  (unsigned)ms, ms ? (unsigned)(n / ms) : 0, code);
+  }
   if (s_ovAll) {                              // 27.11.2026 diagnostics (sniffUpPost)
     snprintf(m, sizeof(m), "SNIFF-UP S%u CAN1 ov sd=+%u wifi=+%u other=+%u @%u", (unsigned)s_snFile, (unsigned)s_ovSd,
              (unsigned)s_ovNet, (unsigned)(s_ovAll - s_ovSd - s_ovNet), (unsigned)s_snOff);

@@ -528,6 +528,8 @@ static void wifiScanDone(int n)
     best = i; bestRssi = WiFi.RSSI(i); bestScore = score; bestNet = cand;
   }
   if (sl) nbout.printf("[WIFI] listed in range:%s\n", seen);
+  if (dbglogOn())                             // CD7 G: every network in range with its signal (weak uLTD_ext 27.11.)
+    for (int i = 0; i < n && i < 20; i++) dbgout.printf("[WIFI] scan %s %d dBm ch%d\n", WiFi.SSID(i).c_str(), (int)WiFi.RSSI(i), (int)WiFi.channel(i));
   {                                            // PG243 (14.11.2026, Vojtech "pg243 ano"): every network the scan saw -
     char all[400];                             // the phone hotspot of the list was not among the listed ones (21:14-21:27)
     int al = 0;                                // and the box could not tell whether it saw it at all

@@ -14,6 +14,7 @@
 // (system clock from NTP / the server's login reply, as v1F does for engine
 // event records - addTimeOf), the 12 V level, the chip temperature, the WiFi
 // signal, and the SD fingerprint (PID 0x398) every 10 min.
+#include "dbglog.h"                  // CD7: detail lines only with DEBUG=1
 #include "crashloop.h"
 #include "wdt.h"
 #include "errreport.h"
@@ -682,7 +683,15 @@ static void makeRecord(int event = 0, time_t when = 0)
     }
   }
   GnssFix g;
-  if (s_cellOn && s_cell.gnssPushed(&g) == 1) { fixSet(g); ttffCheck(); }   // PG-p19: memory only, no AT
+  int gp = s_cellOn ? s_cell.gnssPushed(&g) : -1;
+  if (gp == 1) { fixSet(g); ttffCheck(); }   // PG-p19: memory only, no AT
+  static uint32_t gpsDbgAt;                   // CD7 D: GPS every 10 s with DEBUG=1 (Peugeot 28.11. 4 min without NMEA)
+  if (dbglogOn() && millis() - gpsDbgAt >= 10000) {
+    gpsDbgAt = millis();
+    GnssFix f = fixGet();
+    dbgout.printf("[GPS] push=%d nmea=%d fix=%d age=%lus sats=%u hdop=%.1f kph=%.0f\n", gp, s_cell.nmeaSeen() ? 1 : 0,
+                  f.valid ? 1 : 0, f.valid ? (unsigned long)((millis() - f.at) / 1000) : 0UL, (unsigned)f.sats, f.hdop, f.kph);
+  }
   GnssFix fx = fixGet();         // the NMEA fix above, or the AT reading of cellTask
   bool fresh = fx.valid && millis() - fx.at < 5000;
   // PG258 (15.11.2026, Vojtech "pg258 áno"): one GNSS reading goes into ONE regular record only. Why: J0 15.11.
@@ -1375,6 +1384,7 @@ static void cellTask(void*)
       lastCsq = millis();
       int q = s_cell.rssi();
       if (q) { s_csq = q; s_csqAt = millis(); }
+      dbgout.printf("[CELL] csq=%d dBm ppp=%d mux_err=%lu\n", q, s_cell.up() ? 1 : 0, (unsigned long)s_cell.muxErrors());   // CD7 C
     }
     wdtFeed(WDT_CELL, "sms");
     smsTick();                                       // PG-p8
@@ -1510,6 +1520,7 @@ static void wifiBadTick()
       int n = s_client.eventPacket(EVENT_PING, pkt, sizeof(pkt));
       int got = WifiLink::probe(SERVER_HOST, SERVER_PORT, pkt, n, ans, sizeof(ans) - 1);
       ok = got > 0;
+      dbgout.printf("[NET] wifi probe %s\n", ok ? "answered" : "silent");   // CD7 E
       if (ok) s_client.inboundData(ans, got);   // the answer may carry a waiting command
       else if (up && !wifiServerBad("probe")) ok = true;   // 27.11.2026: the modem is silent too = the server
     }

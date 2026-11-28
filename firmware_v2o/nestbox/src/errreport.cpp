@@ -1,4 +1,5 @@
 // Errors to the server - see errreport.h (PG149, 11.11.2026)
+#include "dbglog.h"                  // CD7: detail lines only with DEBUG=1
 #include "errreport.h"
 #include <Arduino.h>
 #include <string.h>
@@ -82,6 +83,14 @@ static void pollCounter(uint32_t now, uint32_t* base, const char* area, const ch
 
 void errTick()
 {
+  static uint32_t canDbgAt;                   // CD7 B: CAN1 every minute with DEBUG=1 (overrun PG346: when exactly)
+  if (dbglogOn() && millis() - canDbgAt >= 60000) {
+    canDbgAt = millis();
+    Can1Stats c = can1Stats();
+    dbgout.printf("[CAN1] run=%d kbit=%lu f=%lu ov=%lu missed=%lu buserr=%lu quiet=%lus\n", c.running ? 1 : 0,
+                  (unsigned long)c.kbit, (unsigned long)c.frames, (unsigned long)c.rxOverrun, (unsigned long)c.rxMissed,
+                  (unsigned long)c.busErr, c.lastFrameMs ? (unsigned long)((millis() - c.lastFrameMs) / 1000) : 0UL);
+  }
   static uint32_t lastPoll;
   if (millis() - lastPoll >= 10000) {
     lastPoll = millis();

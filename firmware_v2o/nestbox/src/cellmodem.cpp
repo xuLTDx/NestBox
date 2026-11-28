@@ -1,4 +1,5 @@
 // SIM7600G - see cellmodem.h (sources, NAVRH 9 PPP)
+#include "dbglog.h"                  // CD7: detail lines only with DEBUG=1
 #include "wdt.h"
 #include "cellmodem.h"
 #include "netlink.h"
@@ -88,7 +89,18 @@ bool CellLink::at(const char* cmd, unsigned int timeoutMs, const char* expect)
   m_urc[0] = 0;
   portEXIT_CRITICAL(&m_spin);
   if (cmd) linkWrite((const uint8_t*)cmd, strlen(cmd));
+  uint32_t t0 = millis();
   bool ok = waitFor(expect ? expect : "\r\nOK", "\r\nERROR", timeoutMs);
+  if (dbglogOn()) {                   // CD7 C: every AT command and its answer (Peugeot 28.11. CMUX dead, J0 PPP drop)
+    char a[100];
+    int k = 0;
+    for (int i = 0; i < m_len && k < (int)sizeof(a) - 1; i++) a[k++] = m_buf[i] == '\r' || m_buf[i] == '\n' ? '|' : m_buf[i];
+    a[k] = 0;
+    char c[40];
+    snprintf(c, sizeof(c), "%s", cmd ? cmd : "-");
+    for (char* p = c; *p; p++) if (*p == '\r' || *p == '\n') *p = 0;
+    dbgout.printf("[AT] %s -> %s %ums %s\n", c, ok ? "OK" : "FAIL", (unsigned)(millis() - t0), a);
+  }
   unlock();
   return ok;
 }
