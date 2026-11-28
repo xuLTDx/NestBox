@@ -102,6 +102,7 @@ každých 200 ms, zobudí pri ≥ 12,8 V; každé 3 h hlásenie zo státia (GNSS
   (nie WiFi zoznam, LOG, sniff, flash); nie pri nízkej batérii; sťahovanie pokračuje pri ďalšom prebudení (OTAD_OFF, 64 KB).
   Prečo: J0 27.11. 20:54 OTA_READY v státí, do 28.11. 09:31 (5 prebudení) build nestiahol (otaTask čakal 60 s).
 - Čakajúci build (STAGED) blokuje posielanie sniffu len keď sa dá hneď flashnúť (motor vyp. + napätie), build 11:57:24.
+- PG361 (diagnostika): na konci sťahovania buildu „OTA-PULL CAN1 ov recv=+a flash=+b other=+c“ (príjem / mazanie+zápis flash+NVS / zvyšok), ak pribudol overrun.
 - WiFi zoznam + profil: každé 2 h (PLACES_EVERY_S 7200, ota.cpp:277) alebo WIFI_SYNC. Profil platí od ďalšieho štartu.
 - LOG=<súbor>[,<od>]: súbor z SD na server po 8 KB s pokračovaním (PG49) – WiFi alebo modem.
 

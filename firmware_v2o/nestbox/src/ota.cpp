@@ -528,10 +528,17 @@ static void check()
   uint32_t t0 = millis();
   if (code == 200 && from) written = 0;       // no Range support: start over
   bool flashErr = false;
+  // PG361 (28.11.2026, Vojtech "361 áno"): CAN1 overrun during the download - from receiving or from the flash?
+  // J0 28.11. 14:31-14:35 "ERR CAN1 overrun x32" while downloading over the modem; the sniff upload (almost no flash
+  // write) had x54 on 27.11. One line at the end: "OTA-PULL CAN1 ov recv=+a flash=+b other=+c". Diagnostics.
+  uint32_t ovStart = can1Stats().rxOverrun, ovRecv = 0, ovFlash = 0;
   if (code == 200 || code == 206) {
     while (written < size) {
       int want = size - written < OTA_CHUNK ? size - written : OTA_CHUNK;
+      uint32_t o1 = can1Stats().rxOverrun;
       int n = c.body(s_buf, want, OTA_TIMEOUT_MS);
+      uint32_t o2 = can1Stats().rxOverrun;
+      ovRecv += o2 - o1;
       if (n <= 0) {                           // PG99: which side stopped - the network ...
         char d[64];
         snprintf(d, sizeof(d), "OTA download: network read %d at %u", n, (unsigned)written);
@@ -558,10 +565,19 @@ static void check()
         nvs_set_u32(nvs, KEY_D_OFF, (uint32_t)(written / OTAD_SAVE * OTAD_SAVE));
         nvs_commit(nvs);
       }
+      ovFlash += can1Stats().rxOverrun - o2;  // PG361: erase + write + NVS
       lastStep("OTA download %u/%u", (unsigned)written, (unsigned)size);
     }
   }
   c.stop();
+  {
+    uint32_t ovAll = can1Stats().rxOverrun - ovStart;
+    if (ovAll) {
+      snprintf(m, sizeof(m), "OTA-PULL CAN1 ov recv=+%u flash=+%u other=+%u", (unsigned)ovRecv, (unsigned)ovFlash,
+               (unsigned)(ovAll - ovRecv - ovFlash));
+      otaLog(m);
+    }
+  }
   lastStep("OTA download end %u/%u", (unsigned)written, (unsigned)size);
   if (written != size) {
     snprintf(m, sizeof(m), "OTA-PULL ERR=%s %u/%u http=%d in %ums", flashErr ? "FLASH_WR" : "RECV", (unsigned)written,
