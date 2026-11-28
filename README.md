@@ -67,13 +67,13 @@ pio run -t uploadfs      # web files in dashboard/ (live.html, …)
 NestBox_v2O, from `firmware_v2o/nestbox/`:
 
 ```
-pio run -e ovms33 -t upload   # build and flash over USB
+pio run -e v2o -t upload   # build and flash over USB
 ```
 
 - Uses the same `wifi_secrets.py` as v1F. The build never publishes anything; a build is
   published to `nestbox-ota` by type (`type:NestBox_v2O`, see NestBox-OTA `publish_receiver.py`)
   or pushed to the box's own `/api/ota` over WiFi.
-- `-e ovms33_load` = bench build that generates 3000 CAN frames/s itself (SD path test).
+- `-e v2o_load` = bench build that generates 3000 CAN frames/s itself (SD path test).
 
 ## Server side
 

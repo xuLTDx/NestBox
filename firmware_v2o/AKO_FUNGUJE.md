@@ -31,6 +31,8 @@ SD log boxu: /api/log/<n>. USB treba len na prvý flash / zamrznutý box.
 Možnosti k boxu: FleetNest DB (st.sh, len čítanie), príkazy cmd.sh (cez modem/WiFi pri ďalšom spojení), web boxu
 http://<IP>/api/... (zo servera aj NAS, keď je box na uLTD_ext alebo NTLIRIS), pull-OTA (kanál v2o_a3), USB na NAS.
 
+Build (28.11. CD5, premenované z ovms33): `pio run -e v2o` (bežný do áut), skúšobné `v2o_load/_crash/_fullq/_batt`; výstup `.pio/build/v2o/`.
+
 ## 1. Moduly (súbor → čo robí)
 
 | súbor | čo |
