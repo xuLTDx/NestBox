@@ -32,6 +32,7 @@ Možnosti k boxu: FleetNest DB (st.sh, len čítanie), príkazy cmd.sh (cez mode
 http://<IP>/api/... (zo servera aj NAS, keď je box na uLTD_ext alebo NTLIRIS), pull-OTA (kanál v2o_a3), USB na NAS.
 
 Build (28.11. CD5, premenované z ovms33): `pio run -e v2o` (bežný do áut), skúšobné `v2o_load/_crash/_fullq/_batt`; výstup `.pio/build/v2o/`.
+Postup opravy FW (Vojtech 28.11. „áno“): box s chybou -> kanál v2o_test (na ňom najprv stabilný FW, nič nové) -> opravy publikované len na v2o_test, test na tom boxe -> overená oprava do stabilného (v2o_a3, zostavený posledný = novší) -> box späť na v2o_a3.
 CD15 (28.11.): `v2o_probe` = PROBE/SCAN + skúšky spánku/ULP/GPS/watchdog + AT= (NB_PROBE + NESTBOX_DIAG); `v2o_test` = len oprava chyby FW (ako v2o). Sniff ostáva aj v stabilnom (CD16).
 CD6 (28.11.): bežný `v2o` BEZ ladiacich príkazov (D1–D4, WDT_TEST, GPS_TEST, AT=) a bez PROBE/SCAN; tie sú len v `v2o_test`
 (-DNESTBOX_DIAG=1, stôl) a `v2o_probe` (-DNB_PROBE=1, nové auto).
