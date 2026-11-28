@@ -222,6 +222,19 @@ bool telemetryPosition(float* lat, float* lng)
   return true;
 }
 
+// 28.11.2026 (Vojtech "sprav to takto"): the car is driving = speed > DRIVE_KMH - from CAN (cluster speed, fresh
+// CAR_FRESH_MS) first, else from a GPS fix of the last 10 s. Not "engine running": at the depot with the engine on the
+// car stands, the WiFi is strong. Used by the sniff upload (ota.cpp sniffUpTick).
+#define DRIVE_KMH 5.0f
+bool telemetryDriving()
+{
+  uint32_t ms = millis();
+  CarValues cv = carValues();
+  if (cv.speedAt && ms - cv.speedAt < CAR_FRESH_MS) return cv.speedKmh > DRIVE_KMH;
+  GnssFix fx = fixGet();
+  return fx.valid && ms - fx.at < 10000UL && fx.kph > DRIVE_KMH;
+}
+
 // PG232 (14.11.2026, Vojtech "PG232 ano"): the last position the box had, also over deep sleep (RTC) and a power
 // loss (NVS "LASTPOS", written when it moved > 50 m and before every restart / sleep). Why: without a fix the WiFi
 // search tried every network of the list (PG205 "nofix") - a car abroad in a garage or just woken tried the

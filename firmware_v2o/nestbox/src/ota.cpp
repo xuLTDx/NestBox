@@ -34,6 +34,7 @@ bool telemetryEngineOn();
 bool telemetryWifiForData();                 // PG164: WiFi joined and with internet (telemetry.cpp)
 class CellLink;
 CellLink* telemetryCellLink();
+bool telemetryDriving();                      // 28.11.2026: speed > 5 km/h (CAN, else GPS)
 float read12V();
 
 // Flash only with the engine off and a battery that is not weak (same rule as v1F,
@@ -907,7 +908,11 @@ static void sniffUpTick()
   if (!s_snPrefsOk) { s_snPrefsOk = s_snPrefs.begin("snup", false); s_snDone = s_snPrefs.getUInt("done", 0); }
   // 28.11.2026 (Vojtech "3 áno"): a staged build blocks the upload only while it may be flashed now (it goes first, as
   // logTick). Why: waiting for the engine off / >= 11.5 V the sniffs were not sent at all (code review 27.11.).
-  bool can = telemetryWifiForData() && s_token[0] && !s_retryAt && !(s_staged && flashAllowed()) && !s_logReq;
+  // 28.11.2026 (Vojtech "sprav to takto"): not while driving (telemetryDriving: speed > 5 km/h, CAN or GPS). Why: the
+  // upload goes with CAN1 overruns (J0 27.11. x54/x52/x13 in the upload windows, can_overrun/ROZBOR.md) = lost frames
+  // of the car values; leaving the depot the WiFi is still there for a while. A POST already running ends (<= 1 MB).
+  bool can = telemetryWifiForData() && s_token[0] && !s_retryAt && !(s_staged && flashAllowed()) && !s_logReq &&
+             !telemetryDriving();
   // not while the sniff writes (SD load); its split ends that. A file begun stays "busy" (the sleep waits, standby.cpp)
   // also while WiFi is gone for a moment - Why (J0 27.11.2026 b46/b47, Toyota at the depot, uLTD_ext -83..-88 dBm):
   // "WiFi silent -> back to the modem" cleared the flag, the box slept 5 min after the CAN went quiet with S62 at
