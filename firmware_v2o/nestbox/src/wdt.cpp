@@ -8,6 +8,7 @@
 #include <string.h>
 #include "errreport.h"
 #include "laststep.h"
+#include "ota.h"                     // PG357: statusLine
 
 static const char* const NAMES[WDT_COUNT] = {"record", "net", "cell", "loop"};
 
@@ -19,6 +20,7 @@ struct Slot {
   uint32_t limitMs;
   volatile uint32_t fedAt;
   const char* volatile step;
+  uint32_t stepAt;                            // PG357: millis() of the last wdtFeed (wdtFeedSelf does not move it)
 };
 static Slot s_slot[WDT_COUNT];
 
@@ -80,10 +82,25 @@ void wdtRegister(WdtTask t, uint32_t limitMs)
   s_slot[t].task = xTaskGetCurrentTaskHandle();
 }
 
+// PG357 (28.11.2026, Vojtech "357 áno": "nie je FW moc komplikovaný, že by sa niekde sám brzdil?"): a step of the
+// record / net / loop task (from one wdtFeed to the next) longer than WDT_SLOW_MS -> status line
+// "SLOW <task> <step> <s>s" when the task goes on. Not the cell task: its modem start legitimately takes minutes.
+// Measured instead of guessed - a normal pass is ~50 ms (net), 1 s (record).
+#define WDT_SLOW_MS 20000UL
 void wdtFeed(WdtTask t, const char* step)
 {
-  s_slot[t].step = step;
-  s_slot[t].fedAt = millis();
+  Slot& sl = s_slot[t];
+  uint32_t now = millis();
+  const char* prev = sl.step;
+  uint32_t took = sl.stepAt ? now - sl.stepAt : 0;
+  sl.step = step;
+  sl.fedAt = now;
+  sl.stepAt = now;
+  if (t != WDT_CELL && prev && took > WDT_SLOW_MS) {
+    char m[64];
+    snprintf(m, sizeof(m), "SLOW %s %s %lus", NAMES[t], prev, (unsigned long)(took / 1000));
+    statusLine(m);
+  }
 }
 
 void wdtFeedSelf()

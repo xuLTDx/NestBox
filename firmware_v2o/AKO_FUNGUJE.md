@@ -74,6 +74,11 @@ webStart → wdt. loop(): web, can1Tick, readTick, sniffTick, wifiTick, instTick
   Riadok len pri zmene výsledku (PG352). Meno servera ešte nezistené -> raz cez DNS modemu (PG354).
   inet = TCP 1.1.1.1/8.8.8.8:53 cez WiFi, len informácia. Prečo: WiFi môže mať internet a blokovať náš server (port,
   captive portal, DNS); 15:49:49 b55 „wifi-nointernet“ na hotspote s internetom. NEOVERENÉ na boxe (ping cez PPP pri WiFi).
+- PG357 (build po 12:34:31): krok úlohy record / net / loop (od wdtFeed po wdtFeed) > 20 s → „SLOW <úloha> <krok> <s>s“;
+  OTA úloha: WiFi zoznam / LOG > 20 s, upload sniffu (1 POST) > 60 s → „SLOW ota <krok> <s>s“ (nie cell, nie sťahovanie buildu).
+- Rad (txqueue.h): 1 MB PSRAM (~1 h jazdy po 1 záznam/s), prežije reštart a pád, nie výpadok napájania ani hlboký spánok.
+  Plný → najstarší von: so SD kópiou sa neskôr dohrá zo SD, bez nej sa počíta ako stratený (lost=). Bez SD: od 50 % len
+  čas/poloha/rýchlosť/smer, od 80 % 1 záznam za 10 s. Záznamy zo státia (SD vyp.) aj do SPIFFS.
 - Stavové riadky (PID 0x399 = 921): statusLine()/otaLog() – idú v záznamoch, v DB čitateľné cez fn_db/st.sh.
 
 ### 3.2 WiFi – kedy hľadá (main.cpp wifiSearch, 207)

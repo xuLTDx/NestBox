@@ -985,6 +985,15 @@ static void sniffUpTick()
   }
 }
 
+static void otaSlow(const char* what, uint32_t t0, uint32_t limit)
+{
+  uint32_t took = millis() - t0;
+  if (took <= limit) return;
+  char m[48];
+  snprintf(m, sizeof(m), "SLOW ota %s %lus", what, (unsigned long)(took / 1000));
+  otaLog(m);
+}
+
 static void otaTask(void*)
 {
   uint32_t last = 0;
@@ -1030,10 +1039,18 @@ static void otaTask(void*)
         s_busy = false;
       }
     }
+    // PG357 (28.11.2026): a step longer than its normal time -> "SLOW ota <step> <s>s" (not check(): a download
+    // takes minutes, its own OTA-PULL lines tell). sniff: one POST of 1 MB ~22 s at 46 kB/s (J0 27.11.) -> 60 s.
+    uint32_t t0 = millis();
     if (s_wifiSyncReq) { s_wifiSyncReq = false; placesSync(true, true); }   // PG296: even during a paused download
     if (!s_retryAt && !s_staged) placesSync(false);   // PG205: the WiFi list on its own clock; not during a firmware download
+    otaSlow("places", t0, 20000);
+    t0 = millis();
     if (!s_staged || !flashAllowed()) logTick();   // PG49
+    otaSlow("log", t0, 20000);
+    t0 = millis();
     sniffUpTick();                              // PG340
+    otaSlow("sniffup", t0, 60000);
     CellLink* cell = telemetryCellLink();     // p71
     if (cell && !cell->udpDiag) cell->udpDiag = udpDiagNote;
     if (cell && s_dCount && s_token[0] && !telemetryWifiForData() && millis() - s_dAt > 20000) {
