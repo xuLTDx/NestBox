@@ -1454,6 +1454,16 @@ static bool wifiServerBad(const char* by)
   int got = 0;
   static char ans[RECV_BUF_SIZE];
   if (me.fromString(s_cell.ip())) {
+    // PG354 (28.11.2026, Vojtech "354 áno"): the server's name never resolved yet (a start right on a WiFi whose DNS
+    // does not know it) - resolved once through the modem: route + DNS to PPP for the query only, then back. Safe for
+    // the WiFi TCP of a sniff upload: a connected pcb is routed by its own (WiFi) address (source routing hook).
+    IPAddress srv;
+    if (!nbResolve(SERVER_HOST, srv)) {
+      s_cell.makeDefault();
+      nbResolveForget();
+      nbResolve(SERVER_HOST, srv);
+      WifiLink::makeDefault();
+    }
     char pkt[160];
     int n = s_client.eventPacket(EVENT_PING, pkt, sizeof(pkt));
     got = nbUdpProbe((uint32_t)me, SERVER_HOST, SERVER_PORT, pkt, n, ans, sizeof(ans) - 1);
@@ -1463,7 +1473,13 @@ static bool wifiServerBad(const char* by)
   char m[72];
   if (got > 0) snprintf(m, sizeof(m), "NET wifi-noserver modem-ok inet=%d by %s", inet ? 1 : 0, by);
   else snprintf(m, sizeof(m), "NET server-silent both inet=%d by %s - stays on WiFi", inet ? 1 : 0, by);
-  statusLine(m);
+  // PG352 (28.11.2026, Vojtech "352 áno"): the line only when the result changes - at a WiFi that blocks the server
+  // (a hotel) the probe asks every 2 min = ~30 lines per hour before. The serial log keeps every one.
+  static int lastRes = -1;
+  int res = (got > 0 ? 2 : 0) | (inet ? 1 : 0);
+  if (res != lastRes) statusLine(m);
+  else nbout.println(m);
+  lastRes = res;
   if (got <= 0) bothAt = millis();
   return got > 0;
 }

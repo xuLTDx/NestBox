@@ -55,9 +55,21 @@ static bool start(bool active = false)
   return true;
 }
 
+// PG355 (28.11.2026, Vojtech "355 áno"): the driver's counters start from 0 at every restart (every READ into the car
+// = can1Exchange, the speed probe) - they are added up here before the driver goes, so can1Stats() only grows during
+// a boot. Why: "ERR CAN1 overrun" and the sniff-upload diagnostics saw a drop (5 -> 1 = a huge unsigned difference,
+// or the overruns before the restart lost).
+static volatile uint32_t s_sumMissed, s_sumOverrun, s_sumBusErr;
+
 static void stop()
 {
   if (!s_running) return;
+  twai_status_info_t st = {};
+  if (twai_get_status_info(&st) == ESP_OK) {
+    s_sumMissed += st.rx_missed_count;
+    s_sumOverrun += st.rx_overrun_count;
+    s_sumBusErr += st.bus_error_count;
+  }
   s_running = false;
   twai_stop();
   twai_driver_uninstall();
@@ -150,11 +162,10 @@ Can1Stats can1Stats()
   s.frames = s_frames;
   s.lastFrameMs = s_lastMs;
   twai_status_info_t st = {};
-  if (s_running && twai_get_status_info(&st) == ESP_OK) {
-    s.rxMissed = st.rx_missed_count;
-    s.rxOverrun = st.rx_overrun_count;
-    s.busErr = st.bus_error_count;
-  }
+  if (!(s_running && twai_get_status_info(&st) == ESP_OK)) st = {};
+  s.rxMissed = s_sumMissed + st.rx_missed_count;     // PG355: the sum over the boot (see stop())
+  s.rxOverrun = s_sumOverrun + st.rx_overrun_count;
+  s.busErr = s_sumBusErr + st.bus_error_count;
   return s;
 }
 

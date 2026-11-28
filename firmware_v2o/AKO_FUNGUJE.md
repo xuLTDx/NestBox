@@ -4,7 +4,7 @@ Vojtech 24.11.2026: „Ako nechceš si takéto informácie niekde popísať? Čo
 odbočkami, podmienkami + čo máme zistené, čo sa rieši.“ Toto je JEDINÝ popis aktuálneho správania (NAVRH.md = história
 návrhov, LOGIKA.mmd = stav 18.10., zastaraný). Pri každej zmene firmvéru sa upraví TU, v tom istom commite.
 Zdroj: vetva v2o-arduino3, worktree /home/claude/Claude/nestbox_a3, súbory firmware_v2o/nestbox/src/. Riadky = stav 24.11.2026.
-Na J0 beží build Nov 27 2026 14:28:13 (OTA VALID 27.11. 14:35:59, b54; commit 623cc07). Na v2o_a3: build Nov 28 2026 11:57:24.
+Na J0 beží build Nov 27 2026 14:28:13 (OTA VALID 27.11. 14:35:59, b54; commit 623cc07). Na v2o_a3: build Nov 28 2026 12:34:31.
 
 Súvisiace (čítať pred tvrdením):
 - merania (odber, napätia, časy): /home/claude/notes/MERANIA.md
@@ -71,6 +71,7 @@ webStart → wdt. loop(): web, can1Tick, readTick, sniffTick, wifiTick, instTick
   (telemetry.cpp wifiServerBad, netlink.cpp nbUdpProbe). Modem odpovie = cesta cez WiFi zlá -> dáta na modem
   („NET wifi-noserver modem-ok inet=<0/1> by <probe|silent|logins>“, potom „ERR NET wifi-nointernet“). Modem tiež mlčí =
   server dole -> ostane na WiFi, dáta čakajú v rade („NET server-silent both inet=… - stays on WiFi“, platí 2 min).
+  Riadok len pri zmene výsledku (PG352). Meno servera ešte nezistené -> raz cez DNS modemu (PG354).
   inet = TCP 1.1.1.1/8.8.8.8:53 cez WiFi, len informácia. Prečo: WiFi môže mať internet a blokovať náš server (port,
   captive portal, DNS); 15:49:49 b55 „wifi-nointernet“ na hotspote s internetom. NEOVERENÉ na boxe (ping cez PPP pri WiFi).
 - Stavové riadky (PID 0x399 = 921): statusLine()/otaLog() – idú v záznamoch, v DB čitateľné cez fn_db/st.sh.
@@ -120,6 +121,7 @@ zaspal 5 min po stíchnutí CAN s S62 na 13 MB zo 79 MB (12:41:20, 12:58:41, „
 Prázdny otvorený súbor neblokuje (sniffIdleNow, sniff.cpp): posiela sa, keď nie je otvorený súbor ALEBO CAN1 je ticho ≥ 60 s;
 otvorený súbor sa sám nikdy neposiela. Prečo: J0 b50 13:34 po reštarte s tichým CAN S67 s 0 rámcami -> split nikdy -> S62 neodišiel.
 DNS: mená cez lwip_getaddrinfo (netlink.cpp lwipResolve), TLS connect(ip, port, host) - nie Arduino hostByName (PANIC b48, 6a). Nová SD karta (nižšie čísla) → done=0.
+Počítadlá CAN1 (overrun/missed/buserr) = súčet za boot, reštart ovládača (READ, hľadanie rýchlosti) ich už nenuluje (PG355, canbus1.cpp stop()).
 Diagnostika (build 20:53:21, dočasná): „SNIFF-UP S<n> CAN1 ov sd=+a wifi=+b other=+c @<off>“ po každom POST s prírastkom
 CAN1 overrun (SD čítanie / WiFi zápis / zvyšok). Prečo: 27.11. overrun x54/x52/x13 presne v oknách uploadu (can_overrun/ROZBOR.md).
 Počas jazdy sa neposiela (build Nov 28 2026 12:05:02, Vojtech 28.11. „sprav to takto“): jazda = rýchlosť > 5 km/h z CAN (0x38D, čerstvá 5 s), inak z GPS (fix do 10 s) – telemetry.cpp telemetryDriving. Bežiaci motor na mieste neblokuje (na firme stojí, WiFi silná). Rozbehnutý POST (≤ 1 MB) dobehne. Prečo: upload ide s CAN1 overrun (27.11.).
