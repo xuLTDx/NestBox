@@ -122,6 +122,7 @@ otvorený súbor sa sám nikdy neposiela. Prečo: J0 b50 13:34 po reštarte s ti
 DNS: mená cez lwip_getaddrinfo (netlink.cpp lwipResolve), TLS connect(ip, port, host) - nie Arduino hostByName (PANIC b48, 6a). Nová SD karta (nižšie čísla) → done=0.
 Diagnostika (build 20:53:21, dočasná): „SNIFF-UP S<n> CAN1 ov sd=+a wifi=+b other=+c @<off>“ po každom POST s prírastkom
 CAN1 overrun (SD čítanie / WiFi zápis / zvyšok). Prečo: 27.11. overrun x54/x52/x13 presne v oknách uploadu (can_overrun/ROZBOR.md).
+Otvorené (Vojtech 28.11.): ak diagnostika ukáže straty CAN pri uploade počas jazdy -> obmedziť podľa JAZDY (rýchlosť CAN/GPS > ~5 km/h), nie podľa bežiaceho motora (na firme s motorom stojí, WiFi silná). Teraz bez zmeny.
 Server nestbox-ota 2.8.0 (/home/claude/GitHub/NestBox-OTA ota_server.py _sniff_post): /home/nestbox-ota/sniffs/
 <box>_S<n>_<veľkosť>.LOG (.part/ rozpracované) → systemd path unit claude cardata-sniff.path → cardata/receive.py.
 
